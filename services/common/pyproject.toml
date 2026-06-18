@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chatbot-common"
+version = "0.1.0"
+description = "Platform foundations: shared cross-cutting library for the chatbot platform (services/common)."
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "asyncpg>=0.29",
+    "pgvector>=0.2.5",
+    "cryptography>=42.0",
+    "redis>=5.0",
+    "prometheus-client>=0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S", "ASYNC"]
+# S101 (assert) is fine in tests; handled per-file below.
+
+[tool.ruff.lint.per-file-ignores]
+# Tests: asserts are expected; long descriptive names + fixtures push signatures past 100.
+"tests/**" = ["S101", "S105", "S106", "E501"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["common"]
+mypy_path = "src"
+strict = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+# Third-party libs without type stubs / py.typed markers.
+[[tool.mypy.overrides]]
+module = ["asyncpg.*", "pgvector.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: requires a real Postgres via TEST_DATABASE_URL (deselected if unset)",
+]
