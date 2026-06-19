@@ -12,6 +12,7 @@ dependencies = [
     "chatbot-common",
     "fastapi>=0.111",
     "psycopg2-binary>=2.9",
+    "pyjwt>=2.8",
     "redis>=5.0",
     "uvicorn[standard]>=0.29",
 ]

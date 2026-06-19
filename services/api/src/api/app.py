@@ -14,9 +14,10 @@ from common.db import Database
 from common.errors import AppException, InternalServerError, RateLimitError
 from common.health import check_database, check_redis, liveness, metrics_payload, readiness
 from common.logging import get_logger, log_context
-from common.settings import get_settings
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
+
+from api.config import get_api_settings
 
 _log = get_logger(__name__)
 
@@ -24,7 +25,7 @@ _log = get_logger(__name__)
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Connect DB and optional Redis on startup; close on shutdown."""
-    settings = get_settings()
+    settings = get_api_settings()
 
     db = await Database.connect(settings.database_url, statement_cache_size=0)
     app.state.db = db
@@ -62,7 +63,7 @@ def _error_response(exc: AppException, correlation_id: str) -> JSONResponse:
 def create_app() -> FastAPI:
     """Application factory -- called by uvicorn ``--factory``."""
     # Fail-fast: settings validated here; missing/invalid env -> crash before serving.
-    settings = get_settings()
+    settings = get_api_settings()
 
     # Configure structured JSON logging.
     root = get_logger("api")
@@ -102,6 +103,13 @@ def create_app() -> FastAPI:
             extra={"status_code": exc.http_status, "event": "app_error"},
         )
         return _error_response(exc, cid)
+
+    # -- Routers ---------------------------------------------------------------
+    from api.auth.routes import router as auth_router
+    from api.tenants.routes import router as tenants_router
+
+    app.include_router(auth_router)
+    app.include_router(tenants_router)
 
     # -- Routes ----------------------------------------------------------------
     @app.get("/healthz")

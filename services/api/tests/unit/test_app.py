@@ -1,7 +1,7 @@
 """Unit tests for the API application shell.
 
 Uses httpx.AsyncClient with ASGITransport -- no live DB or Redis needed.
-Fakes are injected via app.state after create_app().
+Test doubles are injected via app.state after create_app().
 """
 from __future__ import annotations
 
@@ -11,11 +11,11 @@ from unittest.mock import patch
 from common.errors import NotFoundError
 from httpx import ASGITransport, AsyncClient
 
-# -- Fakes --------------------------------------------------------------------
+# -- Test doubles --------------------------------------------------------------
 
 
-class _FakeDB:
-    """Fake Database whose fetchval can succeed or raise."""
+class _StubDatabase:
+    """Database double whose fetchval can succeed or raise."""
 
     def __init__(self, *, healthy: bool = True) -> None:
         self._healthy = healthy
@@ -29,8 +29,8 @@ class _FakeDB:
         pass
 
 
-class _FakeRedis:
-    """Fake redis.asyncio client."""
+class _StubRedis:
+    """Stub redis.asyncio client."""
 
     def __init__(self, *, healthy: bool = True) -> None:
         self._healthy = healthy
@@ -46,10 +46,10 @@ class _FakeRedis:
 
 # -- Helpers -------------------------------------------------------------------
 
-_FAKE_SETTINGS_ENV = {
+_TEST_SETTINGS_ENV = {
     "DEPLOYMENT_MODE": "saas",
-    "DATABASE_URL": "postgres://fake:5432/fake",
-    "REDIS_URL": "redis://fake:6379",
+    "DATABASE_URL": "postgres://stub-host:5432/appdb",
+    "REDIS_URL": "redis://stub-host:6379",
     "JWT_SECRET": "x" * 48,
     "SECRET_ENCRYPTION_KEY": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
     "SERVICE_NAME": "api",
@@ -64,20 +64,24 @@ def _build_app(
     include_redis: bool = True,
     extra_routes: bool = False,
 ) -> Any:
-    """Create app with fakes injected, bypassing the real lifespan."""
-    with patch.dict("os.environ", _FAKE_SETTINGS_ENV, clear=False):
+    """Create app with test doubles injected, bypassing the real lifespan."""
+    with patch.dict("os.environ", _TEST_SETTINGS_ENV, clear=False):
         from common.settings import get_settings
 
+        from api.config import get_api_settings
+
         get_settings.cache_clear()
+        get_api_settings.cache_clear()
         from api.app import create_app
 
         app = create_app()
         get_settings.cache_clear()
+        get_api_settings.cache_clear()
 
-    # Replace lifespan-provided state with fakes
-    app.state.db = _FakeDB(healthy=db_healthy)
+    # Replace lifespan-provided state with test doubles
+    app.state.db = _StubDatabase(healthy=db_healthy)
     if include_redis:
-        app.state.redis = _FakeRedis(healthy=redis_healthy)
+        app.state.redis = _StubRedis(healthy=redis_healthy)
 
     if extra_routes:
 

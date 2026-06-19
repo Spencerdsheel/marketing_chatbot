@@ -61,7 +61,7 @@ P0 Runnable foundation ─► P1 Auth & tenancy ─► P2 Gateway/public edge �
    Infra track (Nginx, Dockerfiles, CI) — interleaved, lands with P0 and hardened later
 ```
 
-Shortest demoable vertical slice (visitor chats, gets RAG-grounded answers):
+Shortest end-to-end vertical slice (visitor chats, gets RAG-grounded answers):
 `P0 → P1 → P2 → P3 → P4 → P5 → P6 → P10.1`.
 
 ---
@@ -92,7 +92,7 @@ Shortest demoable vertical slice (visitor chats, gets RAG-grounded answers):
 
 **S1.1 — Tenants/users/roles schema + tenant repo** · Haiku · depends: S0.3
 - Migration for `tenants`, `users`, `roles` (4-role model: PLATFORM_ADMIN/CLIENT_ADMIN/CLIENT_AGENT/VISITOR);
-  `PostgresRepository`-based access; seed script creating one platform admin + one demo tenant + one client admin.
+  `PostgresRepository`-based access; seed script creating one platform admin + one initial tenant + one client admin.
 - **Test:** migrate + seed; `psql` shows seeded rows; isolation unit test (tenant A ≠ tenant B) green.
 
 **S1.2 — Admin/agent login → JWT in httpOnly cookie** · Sonnet · depends: S1.1
@@ -301,12 +301,12 @@ Shortest demoable vertical slice (visitor chats, gets RAG-grounded answers):
 **S13.5** conversation analytics dashboards · **S13.6** tenant settings.
 - **Test:** browser walkthrough per screen against the live admin-api.
 
-### Phase 14 — Chat widget (React + Shadow DOM) — tested in browser via demo page
+### Phase 14 — Chat widget (React + Shadow DOM) — tested in browser via a local host page
 
 **S14.1** Shadow-DOM bundle scaffold + script-tag boot + visitor session · Sonnet ·
 **S14.2** chat UI (bubbles, typing, markdown, quick replies) · **S14.3** early lead form · **S14.4** schedule CTA ·
 **S14.5** TTS greeting + accessibility · **S14.6** rate-limit/error UX.
-- **Test:** load a demo HTML page embedding the widget; chat end-to-end against the gateway.
+- **Test:** load a local HTML host page embedding the widget; chat end-to-end against the gateway.
 
 ### Infra track (interleaved)
 
@@ -328,7 +328,7 @@ the human-approved learning loop (**deferred** — see below).
 pgvector search (phase-1 retrieval was keyword overlap); fixed 4-role RBAC + httpOnly cookies + revocation +
 reset + visitor sessions; **turn-count cap + scheduling handoff** (absent in phase 1); full lead pipeline;
 notifications (phase-1 "notify_admin" sent nothing); real job queue (phase-1 used an in-process poller); remove
-hardcoded secrets (`local-pepper`, demo key, admin password returned in API response).
+hardcoded secrets (the phase-1 `local-pepper`, the placeholder client key, admin password returned in API response).
 
 **Deferred to a later phase (your decision):** the human-approved **learning loop** — UnresolvedQuestion →
 AiSuggestion → admin approve/edit → KnowledgeBase → reindex, with TrainingJob + rollback. Slot it after P12 as
