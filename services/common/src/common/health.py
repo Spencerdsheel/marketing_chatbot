@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
@@ -48,6 +48,14 @@ async def check_database(db: Database) -> bool:
     """Readiness check: the database answers ``SELECT 1``."""
     try:
         return bool(await db.fetchval("SELECT 1") == 1)
+    except Exception:
+        return False
+
+
+async def check_redis(client: Any) -> bool:
+    """Readiness check: Redis answers ``PING``."""
+    try:
+        return bool(await client.ping())
     except Exception:
         return False
 

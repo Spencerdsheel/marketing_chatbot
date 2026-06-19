@@ -40,10 +40,16 @@ class Database:
         min_size: int = 1,
         max_size: int = 10,
         init: Callable[[Connection[Any]], Awaitable[None]] | None = None,
+        statement_cache_size: int | None = None,
     ) -> Database:
-        pool = await asyncpg.create_pool(
-            dsn, min_size=min_size, max_size=max_size, init=init
-        )
+        kwargs: dict[str, Any] = {
+            "min_size": min_size,
+            "max_size": max_size,
+            "init": init,
+        }
+        if statement_cache_size is not None:
+            kwargs["statement_cache_size"] = statement_cache_size
+        pool = await asyncpg.create_pool(dsn, **kwargs)
         assert pool is not None  # noqa: S101  # create_pool returns None only without dsn
         return cls(pool)
 

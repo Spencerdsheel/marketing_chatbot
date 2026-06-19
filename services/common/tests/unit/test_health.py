@@ -3,6 +3,7 @@ from prometheus_client import CollectorRegistry, Counter
 
 from common.health import (
     check_database,
+    check_redis,
     liveness,
     metrics_payload,
     readiness,
@@ -64,6 +65,25 @@ async def test_check_database_false_on_bad_value() -> None:
 
 async def test_check_database_false_on_error() -> None:
     assert await check_database(_FakeDB(None, raises=True)) is False  # type: ignore[arg-type]
+
+
+class _FakeRedis:
+    def __init__(self, *, ping_result: bool = True, raises: bool = False) -> None:
+        self._ping_result = ping_result
+        self._raises = raises
+
+    async def ping(self) -> bool:
+        if self._raises:
+            raise ConnectionError("redis down")
+        return self._ping_result
+
+
+async def test_check_redis_true_on_ping() -> None:
+    assert await check_redis(_FakeRedis(ping_result=True)) is True
+
+
+async def test_check_redis_false_on_exception() -> None:
+    assert await check_redis(_FakeRedis(raises=True)) is False
 
 
 def test_metrics_payload_returns_bytes_and_content_type() -> None:
