@@ -95,6 +95,32 @@ class _RecordingDatabase:
 
 
 class _StubRedis:
+    async def get(self, key: str) -> str | None:
+        return None
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
+        pass
+
+    async def ping(self) -> bool:
+        return True
+
+    async def aclose(self) -> None:
+        pass
+
+
+class _BlacklistRedis:
+    """Redis double that can simulate a blacklisted jti."""
+
+    def __init__(self, *, blacklisted_jtis: set[str] | None = None) -> None:
+        self._blacklisted = blacklisted_jtis or set()
+
+    async def get(self, key: str) -> str | None:
+        jti = key.replace("auth:blacklist:", "")
+        return "1" if jti in self._blacklisted else None
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
+        pass
+
     async def ping(self) -> bool:
         return True
 
@@ -299,5 +325,57 @@ async def test_debug_tenants_get_single_no_cookie_returns_401() -> None:
     app = _build_app()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         resp = await c.get("/debug/tenants/some-id")
+    assert resp.status_code == 401
+    assert resp.json()["error_code"] == "UNAUTHENTICATED"
+
+
+# ==============================================================================
+# Blacklisted token (logout)
+# ==============================================================================
+
+
+async def test_blacklisted_jti_returns_401() -> None:
+    """A token whose jti is in the Redis blacklist -> 401 UNAUTHENTICATED."""
+    # Mint a token, decode it to get the jti, then create a Redis double that
+    # reports that jti as blacklisted.
+    token = _mint_cookie(subject="user-logged-out", role=Role.CLIENT_ADMIN)
+    from api.auth.tokens import decode_access_token
+    payload = decode_access_token(token, secret=_TEST_JWT_SECRET)
+    jti = str(payload["jti"])
+
+    redis = _BlacklistRedis(blacklisted_jtis={jti})
+    app = _build_app()
+    app.state.redis = redis
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.get("/auth/me", cookies={"access_token": token})
+    assert resp.status_code == 401
+    assert resp.json()["error_code"] == "UNAUTHENTICATED"
+
+
+async def test_blacklist_check_redis_error_fail_closed() -> None:
+    """When Redis get raises RedisError, /auth/me -> 401 (fail-closed)."""
+    from redis.exceptions import RedisError
+
+    class _FailingRedis:
+        async def get(self, key: str) -> str | None:
+            raise RedisError("connection refused")
+
+        async def set(self, key: str, value: str, ex: int | None = None) -> None:
+            raise RedisError("connection refused")
+
+        async def ping(self) -> bool:
+            return False
+
+        async def aclose(self) -> None:
+            pass
+
+    redis = _FailingRedis()
+    app = _build_app()
+    app.state.redis = redis
+
+    token = _mint_cookie(subject="user-1", role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.get("/auth/me", cookies={"access_token": token})
     assert resp.status_code == 401
     assert resp.json()["error_code"] == "UNAUTHENTICATED"

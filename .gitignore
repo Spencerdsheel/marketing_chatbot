@@ -218,4 +218,5 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Manual
-/first_phase_chatbot
+first_phase_chatbot/
+dev_plan/

@@ -1,9 +1,12 @@
-"""Auth routes -- login endpoint.
+"""Auth routes -- login, logout, and identity endpoints.
 
 POST /auth/login authenticates by email + password and issues an HS256 JWT in
 an httpOnly cookie. The token is NEVER returned in the response body. All
 failure modes (unknown email, wrong password, inactive user) return the same
 401 UNAUTHENTICATED to prevent user enumeration.
+
+POST /auth/logout revokes the token's jti in Redis and clears the cookie.
+Invalid/expired tokens are rejected with 401 (strict).
 """
 from __future__ import annotations
 
@@ -14,9 +17,10 @@ from common.logging import get_logger
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel
 
+from api.auth.blacklist import get_token_blacklist, remaining_ttl
 from api.auth.dependencies import get_current_claims
 from api.auth.repository import get_user_by_email
-from api.auth.tokens import create_access_token
+from api.auth.tokens import create_access_token, decode_access_token
 from api.config import get_api_settings
 
 _log = get_logger(__name__)
@@ -144,3 +148,35 @@ async def me(
         tenant_id=claims.tenant_id,
         project_ids=list(claims.project_ids),
     )
+
+
+@router.post("/logout")
+async def logout(request: Request, response: Response) -> dict[str, str]:
+    """Revoke the current token (blacklist jti in Redis) and clear the cookie.
+
+    Strict: no cookie → 401; invalid/expired token → 401 (no cookie cleared).
+    """
+    settings = get_api_settings()
+    token: str | None = request.cookies.get(settings.cookie_name)
+
+    if token is None:
+        raise AuthenticationError("Authentication is required.")
+
+    # decode_access_token raises AuthenticationError on invalid/expired/tampered.
+    # Do NOT catch it -- let it propagate as 401 (strict).
+    payload = decode_access_token(token, secret=settings.jwt_secret)
+
+    jti = str(payload["jti"])
+    ttl = max(1, int(remaining_ttl(payload.get("exp"))))
+
+    # Revoke -- propagates on RedisError (fail-closed).
+    await get_token_blacklist(request).revoke(jti, ttl)
+
+    response.delete_cookie(
+        key=settings.cookie_name,
+        path="/",
+        samesite=settings.cookie_samesite,
+    )
+
+    _log.info("user logged out", extra={"event": "logout_success"})
+    return {"status": "logged_out"}

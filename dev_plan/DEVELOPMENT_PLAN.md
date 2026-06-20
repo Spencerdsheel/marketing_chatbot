@@ -10,30 +10,38 @@
 
 ## 1. Operating model (how each sprint runs)
 
-A fixed loop per sprint. Roles are split by model on purpose:
+A fixed loop per sprint. **Implementation is done by a Qwen model running in opencode**; Opus plans and
+reviews; the user runs Qwen, tests manually, and owns git.
 
-| Role | Model | Responsibility |
-|------|-------|----------------|
-| **Planner / integrator / reviewer** | **Opus** (this agent) | Loads the service skill; writes the just-in-time **sprint spec** (scope, files, acceptance criteria, the Postman/curl test recipe); dispatches implementation subagents; reviews their diffs; wires the result into the runnable API; hands the user the test recipe. |
-| **Implementer (core/complex)** | **Sonnet** subagent | Builds non-trivial logic TDD: orchestrator pipeline, RAG, LLM provider, auth/crypto flows, gateway security, scheduling/calendar, ingestion. |
-| **Implementer (scaffold/CRUD)** | **Haiku** subagent | Builds from an established pattern: migrations, repositories, CRUD routers, Pydantic schemas, simple unit tests, boilerplate. |
+| Role | Who | Responsibility |
+|------|-----|----------------|
+| **Planner / reviewer / fix-author / integrator** | **Opus** (this agent) | Writes the just-in-time **sprint spec** (`dev_plan/sprints/SX.md`); after Qwen implements, reviews as a **senior tester** (flag-only) — may dispatch a review/test agent whose model is chosen by complexity (Haiku=simple CRUD, Sonnet=auth/RAG/orchestrator/security); reads security-critical files; re-runs the suite via `venv/python.exe`; live-verifies new SQL; authors fix briefs for logic bugs. |
+| **Implementer** | **Qwen** (in opencode) | Reads `dev_plan/QWEN_IMPLEMENTATION_GUIDE.md` + the sprint spec; implements test-first; self-verifies `ruff`/`mypy`/`pytest`; reports. opencode loads `CLAUDE.md` + `.claude/skills/**` natively but does **not** run `.claude/hooks/` — the guide encodes those guardrail rules. |
+| **Manual tester / git owner** | **User** | Runs Qwen, performs the Postman/curl manual test, runs all git. |
 
 **Per-sprint loop:**
-1. **Opus plans** — load the relevant skill(s), write the sprint spec into `dev_plan/sprints/<sprint-id>.md`.
-2. **Implement** — dispatch one or more Sonnet/Haiku subagents (parallel when parts are independent —
-   e.g. three LLM provider impls, or several CRUD endpoints).
-3. **Verify** — run `ruff` + `mypy --strict` + `pytest` (unit + tenant-isolation + RBAC; idempotency for
-   workers). Real output, no claims without evidence.
-4. **Hand off to user** — Opus posts the **Postman/curl recipe**: how to start the stack, the seed data, the
-   exact requests + expected responses. **User tests manually and approves before the next sprint.**
-5. Git stays the user's job — agents never `add`/`commit`/`push`.
+1. **Opus specs** the sprint into `dev_plan/sprints/SX.md`.
+2. **Handoff** — Opus tells the user: *"In opencode, read `dev_plan/QWEN_IMPLEMENTATION_GUIDE.md` then
+   `dev_plan/sprints/SX.md`, and implement."*
+3. **Qwen implements** test-first, self-verifies (`ruff`/`mypy`/`pytest` green via `venv/python.exe`), reports.
+4. **Opus reviews as senior tester** — flag issues/bugs only; re-verify the suite; read critical files;
+   live-check new SQL against the real DB (fake/stub-DB tests miss column drift — see the S1.2 lesson).
+5. **Fix routing** — Opus/its agents may directly apply **trivial mechanical fixes** (lint, formatting, obvious
+   typos); **behavioral / logic / security / tenancy bugs** become a fix brief (`dev_plan/sprints/SX-fix-N.md`)
+   handed to the user → Qwen → re-review.
+6. **User manually tests** (Postman/curl) via the sprint's recipe.
+7. **Opus marks the sprint DONE** and proceeds.
 
 **Definition of Done (every backend sprint):** TDD; `ruff` clean; `mypy --strict` clean; unit + isolation +
-RBAC tests green; the feature is reachable on the **running FastAPI app** and verified via the provided
-Postman/curl recipe; no hardcoded secrets; no silent fallbacks.
+RBAC tests green (+ idempotency for workers); a live/integration check for any new SQL; the feature reachable
+on the **running FastAPI app** and verified via the Postman/curl recipe; no hardcoded secrets; no silent
+fallbacks; no `demo`/`dummy`/`fake` anywhere.
 
-**Multi-agent rule:** when a sprint decomposes into independent parts, Opus dispatches parallel subagents and
-integrates. When parts share state or are sequential, keep it one subagent.
+**Guardrails under opencode:** the `.claude/hooks/` do NOT run for Qwen. Their rules (spec read-only, no
+secrets, git hands-off, no destructive deletes, verify-before-done) are encoded in
+`dev_plan/QWEN_IMPLEMENTATION_GUIDE.md` §2 and enforced by Opus in review; the git rule is additionally a
+project opencode permission. Recommended: extend `opencode.json` to also deny edits to the spec paths and deny
+destructive deletes.
 
 ---
 
