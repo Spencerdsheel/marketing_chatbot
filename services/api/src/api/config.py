@@ -29,6 +29,17 @@ class ApiSettings(Settings):
     # a temporary bridge until Phase 9 email delivery.
     auth_reset_token_log: bool = False
 
+    # Visitor session TTL (default 30 min). Used by the widget admission flow.
+    visitor_session_ttl_seconds: int = 1800
+
+    # Rate limiting: widget admission (by IP + client_key).
+    widget_session_rate_limit_max: int = 30
+    widget_session_rate_limit_window_seconds: int = 60
+
+    # Rate limiting: auth endpoints (login + password-reset request, by IP).
+    auth_rate_limit_max: int = 10
+    auth_rate_limit_window_seconds: int = 60
+
 
 @lru_cache(maxsize=1)
 def get_api_settings() -> ApiSettings:

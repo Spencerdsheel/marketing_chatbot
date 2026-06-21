@@ -23,6 +23,7 @@ from api.auth.password_reset import get_password_reset_store
 from api.auth.repository import get_user_by_email, set_password_hash
 from api.auth.tokens import create_access_token, decode_access_token
 from api.config import get_api_settings
+from api.ratelimit import client_ip, enforce_rate_limit
 
 _log = get_logger(__name__)
 
@@ -53,6 +54,16 @@ class LoginProfile(BaseModel):
 async def login(body: LoginRequest, request: Request, response: Response) -> LoginProfile:
     """Authenticate by email + password; set JWT cookie."""
     settings = get_api_settings()
+
+    # Rate limit by IP before any DB work.
+    await enforce_rate_limit(
+        request,
+        scope="auth_login_ip",
+        identifier=client_ip(request),
+        limit=settings.auth_rate_limit_max,
+        window_seconds=settings.auth_rate_limit_window_seconds,
+    )
+
     db = request.app.state.db
 
     # 1. Resolve identity (unscoped -- pre-auth)
@@ -210,6 +221,16 @@ async def password_reset_request(
     A token is issued (and optionally logged) only for an existing active user.
     """
     settings = get_api_settings()
+
+    # Rate limit by IP before any DB work.
+    await enforce_rate_limit(
+        request,
+        scope="auth_pwreset_ip",
+        identifier=client_ip(request),
+        limit=settings.auth_rate_limit_max,
+        window_seconds=settings.auth_rate_limit_window_seconds,
+    )
+
     db = request.app.state.db
 
     row = await get_user_by_email(db, body.email)

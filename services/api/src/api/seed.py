@@ -141,6 +141,35 @@ async def _seed() -> None:
         if not any([tenant_inserted, pa_inserted, ca_inserted]):
             print("  Nothing inserted (idempotent).")
 
+        # -- Widget admission: backfill client_key + allowed_origins ------------
+        existing_key: str | None = await conn.fetchval(
+            "SELECT client_key FROM tenants WHERE id = $1", actual_tenant_id
+        )
+        if existing_key is None:
+            client_key = f"pk_{secrets.token_urlsafe(24)}"
+            await conn.execute(
+                "UPDATE tenants SET client_key = $1 WHERE id = $2",
+                client_key,
+                actual_tenant_id,
+            )
+        else:
+            client_key = existing_key
+
+        origins_env = os.environ.get("SEED_TENANT_ALLOWED_ORIGINS", "").strip()
+        if origins_env:
+            allowed_origins = [o.strip() for o in origins_env.split(",") if o.strip()]
+            if allowed_origins:
+                await conn.execute(
+                    "UPDATE tenants SET allowed_origins = $1 WHERE id = $2",
+                    allowed_origins,
+                    actual_tenant_id,
+                )
+        else:
+            allowed_origins = []
+
+        print(f"  client_key={client_key}")
+        print(f"  allowed_origins={allowed_origins}")
+
     finally:
         await conn.close()
 

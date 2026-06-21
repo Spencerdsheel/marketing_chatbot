@@ -14,6 +14,7 @@ from common.db import Database
 from common.errors import AppException, InternalServerError, RateLimitError
 from common.health import check_database, check_redis, liveness, metrics_payload, readiness
 from common.logging import get_logger, log_context
+from common.ratelimit import build_rate_limiter
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
@@ -36,6 +37,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         redis_client = from_url(settings.redis_url)
         app.state.redis = redis_client
+
+    app.state.rate_limiter = build_rate_limiter(redis_client)
 
     _log.info("api started", extra={"event": "startup"})
     try:
@@ -106,10 +109,12 @@ def create_app() -> FastAPI:
 
     # -- Routers ---------------------------------------------------------------
     from api.auth.routes import router as auth_router
+    from api.gateway.routes import router as gateway_router
     from api.rbac.routes import router as rbac_router
     from api.tenants.routes import router as tenants_router
 
     app.include_router(auth_router)
+    app.include_router(gateway_router)
     app.include_router(rbac_router)
     app.include_router(tenants_router)
 
