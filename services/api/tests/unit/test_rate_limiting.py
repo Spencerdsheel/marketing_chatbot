@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import patch
 
+from common.cache import InMemoryCache
 from common.crypto import hash_password
 from common.ratelimit import InMemoryRateLimiter, build_rate_limiter
 from httpx import ASGITransport, AsyncClient
@@ -195,6 +196,7 @@ def _build_app(redis: Any = None) -> Any:
 
     app.state.db = _StubDatabase()
     app.state.redis = redis if redis is not None else _StubRedis()
+    app.state.cache = InMemoryCache()
     # Use a fresh in-memory rate limiter per test so counts don't leak.
     app.state.rate_limiter = InMemoryRateLimiter()
     return app

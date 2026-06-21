@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import patch
 
+from common.cache import InMemoryCache
 from common.errors import NotFoundError
 from httpx import ASGITransport, AsyncClient
 
@@ -82,6 +83,8 @@ def _build_app(
     app.state.db = _StubDatabase(healthy=db_healthy)
     if include_redis:
         app.state.redis = _StubRedis(healthy=redis_healthy)
+    app.state.cache = InMemoryCache()
+    app.state.rate_limiter = None
 
     if extra_routes:
 

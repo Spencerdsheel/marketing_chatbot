@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import patch
 
+from common.cache import InMemoryCache
 from common.crypto import hash_password
 from httpx import ASGITransport, AsyncClient
 
@@ -133,6 +134,8 @@ def _build_app() -> Any:
 
     app.state.db = _StubDatabase()
     app.state.redis = _StubRedis()
+    app.state.cache = InMemoryCache()
+    app.state.rate_limiter = None
     return app
 
 

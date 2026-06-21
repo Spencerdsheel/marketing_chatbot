@@ -17,6 +17,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from common.cache import InMemoryCache
 from common.crypto import hash_password, verify_password
 from httpx import ASGITransport, AsyncClient
 from redis.exceptions import RedisError
@@ -154,6 +155,7 @@ def _build_app(
 
     app.state.db = _StubDatabase()
     app.state.redis = redis if redis is not None else _RecordingRedis()
+    app.state.cache = InMemoryCache()
     return app
 
 

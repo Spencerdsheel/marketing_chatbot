@@ -13,6 +13,7 @@ from typing import Any
 from unittest.mock import patch
 
 from common.auth import AuthClaims, Role
+from common.cache import InMemoryCache
 from common.crypto import hash_password
 from httpx import ASGITransport, AsyncClient
 
@@ -164,6 +165,7 @@ def _build_app(db: Any = None) -> Any:
 
     app.state.db = db if db is not None else _StubDatabase()
     app.state.redis = _StubRedis()
+    app.state.cache = InMemoryCache()
     return app
 
 

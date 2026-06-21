@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 from uuid import uuid4
 
+from common.cache import build_cache
 from common.db import Database
 from common.errors import AppException, InternalServerError, RateLimitError
 from common.health import check_database, check_redis, liveness, metrics_payload, readiness
@@ -39,6 +40,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.redis = redis_client
 
     app.state.rate_limiter = build_rate_limiter(redis_client)
+    app.state.cache = build_cache(settings.redis_url)
 
     _log.info("api started", extra={"event": "startup"})
     try:
@@ -73,6 +75,37 @@ def create_app() -> FastAPI:
     root.setLevel(getattr(logging, settings.log_level.upper(), logging.INFO))
 
     app = FastAPI(title="Chatbot API", version="0.1.0", lifespan=_lifespan)
+
+    # -- Edge middleware (security headers + CORS) -- outermost so it wraps
+    #    everything including the correlation-id middleware and error handlers.
+    @app.middleware("http")
+    async def edge_middleware(request: Request, call_next: Any) -> Response:
+        from api.edge import apply_cors_headers, apply_security_headers, is_known_origin
+
+        origin = request.headers.get("origin")
+        allowed = False
+        if origin:
+            db: Database = request.app.state.db
+            cache = getattr(request.app.state, "cache", None)
+            if cache is not None:
+                allowed = await is_known_origin(
+                    db, cache, origin, ttl=settings.cors_origin_cache_ttl_seconds
+                )
+
+        # Preflight short-circuit
+        if request.method == "OPTIONS" and origin is not None:
+            preflight_resp = Response(status_code=204)
+            if allowed:
+                apply_cors_headers(preflight_resp, origin, max_age=settings.cors_preflight_max_age)
+            apply_security_headers(preflight_resp)
+            return preflight_resp
+
+        resp: Response = await call_next(request)
+
+        if origin is not None and allowed:
+            apply_cors_headers(resp, origin, max_age=settings.cors_preflight_max_age)
+        apply_security_headers(resp)
+        return resp
 
     # -- Correlation-ID middleware (also catches unhandled exceptions) ----------
     @app.middleware("http")

@@ -14,6 +14,7 @@ from typing import Any
 from unittest.mock import patch
 
 from common.auth import AuthClaims, Role
+from common.cache import InMemoryCache
 from httpx import ASGITransport, AsyncClient
 
 from api.auth.tokens import create_access_token
@@ -121,6 +122,8 @@ def _build_app() -> Any:
 
     app.state.db = _StubDatabase()
     app.state.redis = _StubRedis()
+    app.state.cache = InMemoryCache()
+    app.state.rate_limiter = None
     return app
 
 

@@ -40,6 +40,12 @@ class ApiSettings(Settings):
     auth_rate_limit_max: int = 10
     auth_rate_limit_window_seconds: int = 60
 
+    # CORS: preflight cache duration (seconds).
+    cors_preflight_max_age: int = 600
+
+    # CORS: origin-allowlist cache TTL (seconds).
+    cors_origin_cache_ttl_seconds: int = 300
+
 
 @lru_cache(maxsize=1)
 def get_api_settings() -> ApiSettings:
