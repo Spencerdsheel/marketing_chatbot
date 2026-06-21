@@ -11,15 +11,16 @@ Invalid/expired tokens are rejected with 401 (strict).
 from __future__ import annotations
 
 from common.auth import AuthClaims, Role
-from common.crypto import verify_password
+from common.crypto import hash_password, verify_password
 from common.errors import AuthenticationError
 from common.logging import get_logger
 from fastapi import APIRouter, Depends, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from api.auth.blacklist import get_token_blacklist, remaining_ttl
 from api.auth.dependencies import get_current_claims
-from api.auth.repository import get_user_by_email
+from api.auth.password_reset import get_password_reset_store
+from api.auth.repository import get_user_by_email, set_password_hash
 from api.auth.tokens import create_access_token, decode_access_token
 from api.config import get_api_settings
 
@@ -180,3 +181,76 @@ async def logout(request: Request, response: Response) -> dict[str, str]:
 
     _log.info("user logged out", extra={"event": "logout_success"})
     return {"status": "logged_out"}
+
+
+# -- Password reset ------------------------------------------------------------
+
+
+class PasswordResetRequest(BaseModel):
+    """Body for POST /auth/password-reset/request."""
+
+    email: str
+
+
+class PasswordResetConfirm(BaseModel):
+    """Body for POST /auth/password-reset/confirm."""
+
+    token: str
+    new_password: str = Field(min_length=12)
+
+
+@router.post("/password-reset/request")
+async def password_reset_request(
+    body: PasswordResetRequest,
+    request: Request,
+) -> dict[str, str]:
+    """Issue a single-use, time-limited password reset token.
+
+    Always returns 200 with the same body to prevent user enumeration.
+    A token is issued (and optionally logged) only for an existing active user.
+    """
+    settings = get_api_settings()
+    db = request.app.state.db
+
+    row = await get_user_by_email(db, body.email)
+
+    if row is not None and row.get("active", True):
+        user_id = str(row["id"])
+        token = await get_password_reset_store(request).issue(
+            user_id, settings.password_reset_ttl_seconds
+        )
+        if settings.auth_reset_token_log:
+            # DEV-ONLY: the token goes in the message because the JSON formatter
+            # drops non-allow-listed extra fields (common.logging keeps secrets
+            # out of logs). Gated behind auth_reset_token_log; OFF in production.
+            _log.warning(
+                "DEV password reset token issued: %s",
+                token,
+                extra={"event": "password_reset_token"},
+            )
+
+    # Always same response -- no enumeration.
+    return {"status": "reset_requested"}
+
+
+@router.post("/password-reset/confirm")
+async def password_reset_confirm(
+    body: PasswordResetConfirm,
+    request: Request,
+) -> dict[str, str]:
+    """Validate a reset token and write a new password hash.
+
+    Single-use: the token is consumed atomically (Redis GETDEL).
+    """
+    db = request.app.state.db
+
+    user_id = await get_password_reset_store(request).consume(body.token)
+    if user_id is None:
+        raise AuthenticationError("Invalid or expired reset token.")
+
+    await set_password_hash(db, user_id, hash_password(body.new_password))
+    _log.info(
+        "password reset completed",
+        extra={"event": "password_reset_success", "user_id": user_id},
+    )
+    return {"status": "password_reset"}

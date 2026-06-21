@@ -28,3 +28,14 @@ async def get_user_by_email(db: Database, email: str) -> Row | None:
     )
     record = await db.fetchrow(sql, email)
     return dict(record) if record is not None else None
+
+
+async def set_password_hash(db: Database, user_id: str, new_hash: str) -> None:
+    """Update a user's password hash. Parameterized; no tenant filter needed
+    (the caller already validated the reset token for this user_id).
+    """
+    await db.execute(
+        "UPDATE users SET password_hash = $1 WHERE id = $2",
+        new_hash,
+        user_id,
+    )

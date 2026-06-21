@@ -20,6 +20,15 @@ class ApiSettings(Settings):
     cookie_name: str = "access_token"
     access_token_ttl_seconds: int = 3600
 
+    # Password reset token TTL (default 30 min).
+    password_reset_ttl_seconds: int = 1800
+
+    # DEV-ONLY: when True, password reset tokens are logged so a developer can
+    # copy-paste them for testing. MUST stay False in production -- a reset
+    # token is a secret (CLAUDE.md S3 "never log secrets/tokens/PII"). This is
+    # a temporary bridge until Phase 9 email delivery.
+    auth_reset_token_log: bool = False
+
 
 @lru_cache(maxsize=1)
 def get_api_settings() -> ApiSettings:

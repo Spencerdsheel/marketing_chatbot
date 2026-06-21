@@ -82,6 +82,15 @@ class _StubDatabase:
 
 
 class _StubRedis:
+    async def get(self, key: str) -> str | None:
+        return None
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
+        pass
+
+    async def getdel(self, key: str) -> str | None:
+        return None
+
     async def ping(self) -> bool:
         return True
 

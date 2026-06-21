@@ -101,6 +101,9 @@ class _StubRedis:
     async def set(self, key: str, value: str, ex: int | None = None) -> None:
         pass
 
+    async def getdel(self, key: str) -> str | None:
+        return None
+
     async def ping(self) -> bool:
         return True
 
@@ -120,6 +123,9 @@ class _BlacklistRedis:
 
     async def set(self, key: str, value: str, ex: int | None = None) -> None:
         pass
+
+    async def getdel(self, key: str) -> str | None:
+        return None
 
     async def ping(self) -> bool:
         return True
@@ -362,6 +368,9 @@ async def test_blacklist_check_redis_error_fail_closed() -> None:
             raise RedisError("connection refused")
 
         async def set(self, key: str, value: str, ex: int | None = None) -> None:
+            raise RedisError("connection refused")
+
+        async def getdel(self, key: str) -> str | None:
             raise RedisError("connection refused")
 
         async def ping(self) -> bool:

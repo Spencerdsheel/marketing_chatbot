@@ -90,6 +90,10 @@ class _RecordingRedis:
             raise RedisError("connection refused")
         self._store[key] = value
 
+    async def getdel(self, key: str) -> str | None:
+        value = self._store.pop(key, None)
+        return value
+
     async def ping(self) -> bool:
         return True
 
