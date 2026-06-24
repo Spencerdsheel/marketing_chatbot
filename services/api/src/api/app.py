@@ -143,11 +143,13 @@ def create_app() -> FastAPI:
     # -- Routers ---------------------------------------------------------------
     from api.auth.routes import router as auth_router
     from api.gateway.routes import router as gateway_router
+    from api.llm.routes import router as llm_router
     from api.rbac.routes import router as rbac_router
     from api.tenants.routes import router as tenants_router
 
     app.include_router(auth_router)
     app.include_router(gateway_router)
+    app.include_router(llm_router)
     app.include_router(rbac_router)
     app.include_router(tenants_router)
 

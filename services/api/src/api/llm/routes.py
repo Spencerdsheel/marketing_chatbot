@@ -1,0 +1,102 @@
+"""Debug LLM routes -- set tenant config and generate completions.
+
+These are TEMPORARY debug endpoints (prefixed ``/debug/llm``) to prove the
+provider boundary. Real admin-facing endpoints land in Phase 12.
+"""
+from __future__ import annotations
+
+from common.auth import AuthClaims, Role
+from common.errors import ValidationError
+from common.logging import get_logger
+from fastapi import APIRouter, Depends, Request
+from pydantic import BaseModel
+
+from api.auth.dependencies import require_roles
+from api.config import get_api_settings
+from api.llm.config_repository import get_llm_config, upsert_llm_config
+from api.llm.factory import provider_for
+from api.llm.provider import ChatMessage
+
+_log = get_logger(__name__)
+
+router = APIRouter(prefix="/debug/llm", tags=["llm"])
+
+
+class LLMConfigRequest(BaseModel):
+    """Body for POST /debug/llm/config."""
+
+    provider: str
+    model: str
+    api_key: str
+    base_url: str | None = None
+
+
+class GenerateRequest(BaseModel):
+    """Body for POST /debug/llm/generate."""
+
+    prompt: str
+
+
+@router.post("/config")
+async def set_llm_config(
+    body: LLMConfigRequest,
+    request: Request,
+    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN)),  # noqa: B008
+) -> dict[str, str]:
+    """Set the calling tenant's LLM provider + model + API key.
+
+    Returns provider + model only; the key is encrypted and never echoed.
+    """
+    await upsert_llm_config(
+        request.app.state.db,
+        claims,
+        provider=body.provider,
+        model=body.model,
+        api_key=body.api_key,
+        base_url=body.base_url,
+    )
+    _log.info(
+        "LLM config updated",
+        extra={
+            "event": "llm_config_set",
+            "provider": body.provider,
+            "model": body.model,
+        },
+    )
+    return {"provider": body.provider, "model": body.model}
+
+
+@router.post("/generate")
+async def generate(
+    body: GenerateRequest,
+    request: Request,
+    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN)),  # noqa: B008
+) -> dict[str, object]:
+    """Generate a completion using the tenant's configured LLM.
+
+    Returns 422 ``LLM_NOT_CONFIGURED`` if the tenant has no config.
+    Returns 502 ``LLM_ERROR`` if the provider call fails.
+    """
+    settings = get_api_settings()
+    db = request.app.state.db
+
+    config = await get_llm_config(db, claims)
+    if config is None:
+        raise ValidationError(
+            "LLM is not configured for this tenant.",
+            code="LLM_NOT_CONFIGURED",
+        )
+
+    provider = provider_for(config)
+    completion = await provider.generate(
+        [ChatMessage("user", body.prompt)],
+        model=config.model,
+        max_tokens=settings.llm_max_tokens,
+    )
+
+    return {
+        "text": completion.text,
+        "model": completion.model,
+        "input_tokens": completion.input_tokens,
+        "output_tokens": completion.output_tokens,
+    }

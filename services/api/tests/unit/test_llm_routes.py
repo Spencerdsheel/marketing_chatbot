@@ -1,0 +1,331 @@
+"""Unit tests for debug LLM routes (POST /debug/llm/config, POST /debug/llm/generate).
+
+Covers:
+- POST /debug/llm/config: CLIENT_ADMIN → 200 (no api_key in response); ciphertext stored;
+  CLIENT_AGENT → 403; no cookie → 401.
+- POST /debug/llm/generate: with stub config + stub provider → 200 {text,...};
+  no config → 422 LLM_NOT_CONFIGURED; CLIENT_AGENT → 403.
+"""
+from __future__ import annotations
+
+from typing import Any
+from unittest.mock import patch
+
+from common.auth import AuthClaims, Role
+from common.cache import InMemoryCache
+from common.crypto import SecretBox
+from httpx import ASGITransport, AsyncClient
+
+from api.auth.tokens import create_access_token
+from api.config import get_api_settings
+from api.llm.provider import ChatMessage, Completion
+
+# -- Constants -----------------------------------------------------------------
+
+_TEST_JWT_SECRET = "x" * 48
+_TENANT_ID = "tenant-abc-123"
+_TEST_ENCRYPTION_KEY = "x" * 48
+
+# -- Test doubles --------------------------------------------------------------
+
+
+class _StubDatabase:
+    """Database double that can return a config row or None."""
+
+    def __init__(self, *, config_row: dict[str, Any] | None = None) -> None:
+        self._config_row = config_row
+        self.last_sql: str = ""
+        self.last_params: tuple[Any, ...] = ()
+
+    async def fetchrow(self, query: str, *args: object) -> dict[str, Any] | None:
+        self.last_sql = query
+        self.last_params = args
+        return self._config_row
+
+    async def execute(self, query: str, *args: object) -> str:
+        self.last_sql = query
+        self.last_params = args
+        return "INSERT 1"
+
+    async def close(self) -> None:
+        pass
+
+
+class _StubRedis:
+    async def get(self, key: str) -> str | None:
+        return None
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
+        pass
+
+    async def getdel(self, key: str) -> str | None:
+        return None
+
+    async def ping(self) -> bool:
+        return True
+
+    async def aclose(self) -> None:
+        pass
+
+    def pipeline(self, transaction: bool = False) -> _StubPipeline:
+        return _StubPipeline()
+
+
+class _StubPipeline:
+    def zremrangebyscore(self, key: str, min_score: float, max_score: float) -> None:
+        pass
+
+    def zadd(self, key: str, mapping: dict[str, float]) -> None:
+        pass
+
+    def zcard(self, key: str) -> None:
+        pass
+
+    def expire(self, key: str, seconds: int) -> None:
+        pass
+
+    async def execute(self) -> list[Any]:
+        return [0, None, 0, True]
+
+    async def zrange(self, key: str, start: int, end: int, withscores: bool = False) -> list:
+        return []
+
+
+class _StubProvider:
+    """Stub LLM provider that returns a canned Completion."""
+
+    def __init__(self, text: str = "Stub response.") -> None:
+        self._text = text
+
+    async def generate(
+        self,
+        messages: list[ChatMessage],
+        *,
+        model: str,
+        max_tokens: int,
+    ) -> Completion:
+        return Completion(
+            text=self._text,
+            model=model,
+            input_tokens=10,
+            output_tokens=5,
+        )
+
+
+# -- Helpers -------------------------------------------------------------------
+
+_TEST_SETTINGS_ENV = {
+    "DEPLOYMENT_MODE": "saas",
+    "DATABASE_URL": "postgres://stub-host:5432/appdb",
+    "REDIS_URL": "redis://stub-host:6379",
+    "JWT_SECRET": _TEST_JWT_SECRET,
+    "SECRET_ENCRYPTION_KEY": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    "SERVICE_NAME": "api",
+    "LOG_LEVEL": "WARNING",
+    "COOKIE_SECURE": "false",
+}
+
+
+def _build_app(db: Any = None) -> Any:
+    """Create app with test doubles."""
+    from common.settings import get_settings
+
+    from api.config import get_api_settings
+
+    get_settings.cache_clear()
+    get_api_settings.cache_clear()
+
+    with patch.dict("os.environ", _TEST_SETTINGS_ENV, clear=False):
+        from api.app import create_app
+
+        app = create_app()
+
+    app.state.db = db if db is not None else _StubDatabase()
+    app.state.redis = _StubRedis()
+    app.state.cache = InMemoryCache()
+    app.state.rate_limiter = None
+    return app
+
+
+def _mint_cookie(
+    *,
+    subject: str = "user-1",
+    role: Role = Role.CLIENT_ADMIN,
+    tenant_id: str | None = _TENANT_ID,
+    ttl_seconds: int = 300,
+    secret: str = _TEST_JWT_SECRET,
+) -> str:
+    claims = AuthClaims(subject=subject, role=role, tenant_id=tenant_id)
+    token, _ = create_access_token(claims, secret=secret, ttl_seconds=ttl_seconds)
+    return token
+
+
+# ==============================================================================
+# POST /debug/llm/config
+# ==============================================================================
+
+
+async def test_llm_config_client_admin_returns_200() -> None:
+    """CLIENT_ADMIN → 200, response has provider+model, no api_key."""
+    db = _StubDatabase()
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/llm/config",
+            json={"provider": "anthropic", "model": "claude-opus-4-8", "api_key": "sk-test-key"},
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["provider"] == "anthropic"
+    assert body["model"] == "claude-opus-4-8"
+    assert "api_key" not in body
+
+    # Verify ciphertext stored (not plaintext)
+    ciphertext = db.last_params[3]
+    assert isinstance(ciphertext, str)
+    assert ciphertext != "sk-test-key"
+    box = SecretBox(get_api_settings().secret_encryption_key)
+    assert box.decrypt_str(ciphertext) == "sk-test-key"
+
+
+async def test_llm_config_openai_with_base_url_returns_200() -> None:
+    """CLIENT_ADMIN with provider=openai + base_url → 200, base_url stored."""
+    db = _StubDatabase()
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/llm/config",
+            json={
+                "provider": "openai",
+                "base_url": "https://opencode.ai/zen/v1",
+                "model": "gpt-4o",
+                "api_key": "sk-zen-key",
+            },
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["provider"] == "openai"
+    assert body["model"] == "gpt-4o"
+    assert "api_key" not in body
+
+    # Verify base_url stored
+    assert db.last_params[4] == "https://opencode.ai/zen/v1"
+    # Verify ciphertext stored (not plaintext)
+    ciphertext = db.last_params[3]
+    assert ciphertext != "sk-zen-key"
+
+
+async def test_llm_config_client_agent_returns_403() -> None:
+    """CLIENT_AGENT → 403."""
+    app = _build_app()
+    token = _mint_cookie(role=Role.CLIENT_AGENT)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/llm/config",
+            json={"provider": "anthropic", "model": "claude-opus-4-8", "api_key": "sk-test-key"},
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 403
+
+
+async def test_llm_config_no_cookie_returns_401() -> None:
+    """No cookie → 401."""
+    app = _build_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/llm/config",
+            json={"provider": "anthropic", "model": "claude-opus-4-8", "api_key": "sk-test-key"},
+        )
+    assert resp.status_code == 401
+
+
+# ==============================================================================
+# POST /debug/llm/generate
+# ==============================================================================
+
+
+async def test_llm_generate_with_config_returns_200() -> None:
+    """With a stub config + stub provider → 200 {text,...}."""
+    ciphertext = SecretBox(get_api_settings().secret_encryption_key).encrypt("sk-test-key")
+    config_row = {
+        "provider": "anthropic",
+        "model": "claude-opus-4-8",
+        "api_key_ciphertext": ciphertext,
+        "base_url": None,
+    }
+    db = _StubDatabase(config_row=config_row)
+    app = _build_app(db=db)
+
+    # Patch provider_for to return a stub
+    with patch("api.llm.routes.provider_for", return_value=_StubProvider("Hello from Claude.")):
+        token = _mint_cookie(role=Role.CLIENT_ADMIN)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/debug/llm/generate",
+                json={"prompt": "Hello"},
+                cookies={"access_token": token},
+            )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["text"] == "Hello from Claude."
+    assert body["model"] == "claude-opus-4-8"
+    assert body["input_tokens"] == 10
+    assert body["output_tokens"] == 5
+
+
+async def test_llm_generate_no_config_returns_422() -> None:
+    """Tenant with no config → 422 LLM_NOT_CONFIGURED."""
+    db = _StubDatabase(config_row=None)
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/llm/generate",
+            json={"prompt": "Hello"},
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 422
+    assert resp.json()["error_code"] == "LLM_NOT_CONFIGURED"
+
+
+async def test_llm_generate_client_agent_returns_403() -> None:
+    """CLIENT_AGENT → 403."""
+    app = _build_app()
+    token = _mint_cookie(role=Role.CLIENT_AGENT)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/llm/generate",
+            json={"prompt": "Hello"},
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 403
+
+
+async def test_llm_generate_openai_with_base_url_returns_200() -> None:
+    """OpenAI config with base_url + stub provider → 200 {text,...}."""
+    ciphertext = SecretBox(get_api_settings().secret_encryption_key).encrypt("sk-zen-key")
+    config_row = {
+        "provider": "openai",
+        "model": "gpt-4o",
+        "api_key_ciphertext": ciphertext,
+        "base_url": "https://opencode.ai/zen/v1",
+    }
+    db = _StubDatabase(config_row=config_row)
+    app = _build_app(db=db)
+
+    with patch("api.llm.routes.provider_for", return_value=_StubProvider("Hello from Zen.")):
+        token = _mint_cookie(role=Role.CLIENT_ADMIN)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/debug/llm/generate",
+                json={"prompt": "Say hello"},
+                cookies={"access_token": token},
+            )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["text"] == "Hello from Zen."
+    assert body["model"] == "gpt-4o"

@@ -46,6 +46,12 @@ class ApiSettings(Settings):
     # CORS: origin-allowlist cache TTL (seconds).
     cors_origin_cache_ttl_seconds: int = 300
 
+    # LLM: default max tokens per completion.
+    llm_max_tokens: int = 1024
+
+    # LLM: default/example model (per-tenant config overrides this).
+    llm_default_model: str = "claude-opus-4-8"
+
 
 @lru_cache(maxsize=1)
 def get_api_settings() -> ApiSettings:
