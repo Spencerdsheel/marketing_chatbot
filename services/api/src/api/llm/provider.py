@@ -10,6 +10,8 @@ from typing import Protocol
 
 from common.errors import AppException
 
+Vector = list[float]
+
 
 @dataclass(frozen=True)
 class ChatMessage:
@@ -34,6 +36,13 @@ class LLMProvider(Protocol):
         model: str,
         max_tokens: int,
     ) -> Completion: ...
+
+    async def embed(
+        self,
+        texts: list[str],
+        *,
+        model: str,
+    ) -> list[Vector]: ...
 
 
 class LLMError(AppException):

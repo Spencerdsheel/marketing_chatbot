@@ -37,6 +37,13 @@ class GenerateRequest(BaseModel):
     prompt: str
 
 
+class EmbedRequest(BaseModel):
+    """Body for POST /debug/llm/embed."""
+
+    texts: list[str]
+    model: str
+
+
 @router.post("/config")
 async def set_llm_config(
     body: LLMConfigRequest,
@@ -99,4 +106,35 @@ async def generate(
         "model": completion.model,
         "input_tokens": completion.input_tokens,
         "output_tokens": completion.output_tokens,
+    }
+
+
+@router.post("/embed")
+async def embed(
+    body: EmbedRequest,
+    request: Request,
+    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN)),  # noqa: B008
+) -> dict[str, object]:
+    """Generate embeddings using the tenant's configured LLM.
+
+    Returns 422 ``LLM_NOT_CONFIGURED`` if the tenant has no config.
+    Returns 502 ``LLM_ERROR`` if the provider does not support embeddings
+    (e.g. Anthropic) or the upstream call fails.
+    """
+    db = request.app.state.db
+
+    config = await get_llm_config(db, claims)
+    if config is None:
+        raise ValidationError(
+            "LLM is not configured for this tenant.",
+            code="LLM_NOT_CONFIGURED",
+        )
+
+    provider = provider_for(config)
+    vectors = await provider.embed(body.texts, model=body.model)
+
+    return {
+        "model": body.model,
+        "count": len(vectors),
+        "dimension": len(vectors[0]) if vectors else 0,
     }

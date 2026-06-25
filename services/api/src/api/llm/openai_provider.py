@@ -8,13 +8,16 @@ from __future__ import annotations
 
 from typing import Any
 
+from common.logging import get_logger
 from openai import APIError
 
-from api.llm.provider import ChatMessage, Completion, LLMError
+from api.llm.provider import ChatMessage, Completion, LLMError, Vector
+
+_log = get_logger(__name__)
 
 
 class OpenAICompatibleProvider:
-    """OpenAI-wire backend for ``LLMProvider.generate``."""
+    """OpenAI-wire backend for ``LLMProvider.generate`` and ``embed``."""
 
     def __init__(
         self,
@@ -43,6 +46,13 @@ class OpenAICompatibleProvider:
                 messages=[{"role": m.role, "content": m.content} for m in messages],
             )
         except APIError as exc:
+            _log.warning(
+                "LLM upstream call failed: provider=openai op=generate"
+                " model=%s status=%s detail=%s",
+                model,
+                getattr(exc, "status_code", None),
+                str(exc),
+            )
             raise LLMError("LLM request failed.") from exc
 
         if not resp.choices:
@@ -57,3 +67,28 @@ class OpenAICompatibleProvider:
             output_tokens=resp.usage.completion_tokens if resp.usage else 0,
             stop_reason=choice.finish_reason,
         )
+
+    async def embed(
+        self,
+        texts: list[str],
+        *,
+        model: str,
+    ) -> list[Vector]:
+        try:
+            resp = await self._client.embeddings.create(
+                model=model,
+                input=texts,
+            )
+        except APIError as exc:
+            _log.warning(
+                "LLM upstream call failed: provider=openai op=embed model=%s status=%s detail=%s",
+                model,
+                getattr(exc, "status_code", None),
+                str(exc),
+            )
+            raise LLMError("LLM request failed.") from exc
+
+        if not resp.data:
+            raise LLMError("LLM request failed.")
+
+        return [d.embedding for d in resp.data]

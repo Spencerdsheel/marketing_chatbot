@@ -3,14 +3,19 @@
 Uses the async ``anthropic`` SDK. Does NOT send ``temperature``, ``top_p``,
 ``top_k``, or ``thinking``/``budget_tokens`` (they return 400 on
 ``claude-opus-4-8``).
+
+Anthropic has no embeddings API -- ``embed`` raises an explicit ``LLMError``.
 """
 from __future__ import annotations
 
 from typing import Any
 
 from anthropic import APIError
+from common.logging import get_logger
 
-from api.llm.provider import ChatMessage, Completion, LLMError
+from api.llm.provider import ChatMessage, Completion, LLMError, Vector
+
+_log = get_logger(__name__)
 
 
 class AnthropicProvider:
@@ -37,6 +42,13 @@ class AnthropicProvider:
                 messages=[{"role": m.role, "content": m.content} for m in messages],
             )
         except APIError as exc:
+            _log.warning(
+                "LLM upstream call failed: provider=anthropic op=generate"
+                " model=%s status=%s detail=%s",
+                model,
+                getattr(exc, "status_code", None),
+                str(exc),
+            )
             raise LLMError("LLM request failed.") from exc
 
         text = "".join(b.text for b in resp.content if b.type == "text")
@@ -46,4 +58,15 @@ class AnthropicProvider:
             input_tokens=resp.usage.input_tokens,
             output_tokens=resp.usage.output_tokens,
             stop_reason=resp.stop_reason,
+        )
+
+    async def embed(
+        self,
+        texts: list[str],
+        *,
+        model: str,
+    ) -> list[Vector]:
+        raise LLMError(
+            "Embeddings are not supported by the Anthropic provider; "
+            "configure an OpenAI-compatible embeddings endpoint.",
         )

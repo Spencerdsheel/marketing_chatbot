@@ -1,10 +1,13 @@
-"""Unit tests for debug LLM routes (POST /debug/llm/config, POST /debug/llm/generate).
+"""Unit tests for debug LLM routes (POST /debug/llm/config, POST /debug/llm/generate,
+POST /debug/llm/embed).
 
 Covers:
 - POST /debug/llm/config: CLIENT_ADMIN → 200 (no api_key in response); ciphertext stored;
   CLIENT_AGENT → 403; no cookie → 401.
 - POST /debug/llm/generate: with stub config + stub provider → 200 {text,...};
   no config → 422 LLM_NOT_CONFIGURED; CLIENT_AGENT → 403.
+- POST /debug/llm/embed: with stub config + stub provider → 200 {model, count, dimension};
+  no config → 422; CLIENT_AGENT → 403; no cookie → 401.
 """
 from __future__ import annotations
 
@@ -18,7 +21,7 @@ from httpx import ASGITransport, AsyncClient
 
 from api.auth.tokens import create_access_token
 from api.config import get_api_settings
-from api.llm.provider import ChatMessage, Completion
+from api.llm.provider import ChatMessage, Completion, Vector
 
 # -- Constants -----------------------------------------------------------------
 
@@ -92,10 +95,15 @@ class _StubPipeline:
 
 
 class _StubProvider:
-    """Stub LLM provider that returns a canned Completion."""
+    """Stub LLM provider that returns a canned Completion and vectors."""
 
-    def __init__(self, text: str = "Stub response.") -> None:
+    def __init__(
+        self,
+        text: str = "Stub response.",
+        vectors: list[Vector] | None = None,
+    ) -> None:
         self._text = text
+        self._vectors = vectors or [[0.1, 0.2, 0.3]]
 
     async def generate(
         self,
@@ -110,6 +118,14 @@ class _StubProvider:
             input_tokens=10,
             output_tokens=5,
         )
+
+    async def embed(
+        self,
+        texts: list[str],
+        *,
+        model: str,
+    ) -> list[Vector]:
+        return self._vectors
 
 
 # -- Helpers -------------------------------------------------------------------
@@ -329,3 +345,78 @@ async def test_llm_generate_openai_with_base_url_returns_200() -> None:
     body = resp.json()
     assert body["text"] == "Hello from Zen."
     assert body["model"] == "gpt-4o"
+
+
+# ==============================================================================
+# POST /debug/llm/embed
+# ==============================================================================
+
+
+async def test_llm_embed_with_config_returns_200() -> None:
+    """With a stub config + stub provider → 200 {model, count, dimension}."""
+    ciphertext = SecretBox(get_api_settings().secret_encryption_key).encrypt("sk-test-key")
+    config_row = {
+        "provider": "openai",
+        "model": "text-embedding-3-small",
+        "api_key_ciphertext": ciphertext,
+        "base_url": None,
+    }
+    db = _StubDatabase(config_row=config_row)
+    app = _build_app(db=db)
+
+    stub_vectors = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+    with patch(
+        "api.llm.routes.provider_for",
+        return_value=_StubProvider(vectors=stub_vectors),
+    ):
+        token = _mint_cookie(role=Role.CLIENT_ADMIN)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/debug/llm/embed",
+                json={"texts": ["hello", "world"], "model": "text-embedding-3-small"},
+                cookies={"access_token": token},
+            )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["model"] == "text-embedding-3-small"
+    assert body["count"] == 2
+    assert body["dimension"] == 3
+
+
+async def test_llm_embed_no_config_returns_422() -> None:
+    """Tenant with no config → 422 LLM_NOT_CONFIGURED."""
+    db = _StubDatabase(config_row=None)
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/llm/embed",
+            json={"texts": ["hello"], "model": "nomic-embed-text"},
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 422
+    assert resp.json()["error_code"] == "LLM_NOT_CONFIGURED"
+
+
+async def test_llm_embed_client_agent_returns_403() -> None:
+    """CLIENT_AGENT → 403."""
+    app = _build_app()
+    token = _mint_cookie(role=Role.CLIENT_AGENT)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/llm/embed",
+            json={"texts": ["hello"], "model": "nomic-embed-text"},
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 403
+
+
+async def test_llm_embed_no_cookie_returns_401() -> None:
+    """No cookie → 401."""
+    app = _build_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/llm/embed",
+            json={"texts": ["hello"], "model": "nomic-embed-text"},
+        )
+    assert resp.status_code == 401
