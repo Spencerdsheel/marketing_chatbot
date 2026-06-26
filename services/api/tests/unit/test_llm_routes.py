@@ -1,5 +1,5 @@
 """Unit tests for debug LLM routes (POST /debug/llm/config, POST /debug/llm/generate,
-POST /debug/llm/embed).
+POST /debug/llm/embed, POST /debug/llm/classify, POST /debug/llm/stream).
 
 Covers:
 - POST /debug/llm/config: CLIENT_ADMIN → 200 (no api_key in response); ciphertext stored;
@@ -8,6 +8,10 @@ Covers:
   no config → 422 LLM_NOT_CONFIGURED; CLIENT_AGENT → 403.
 - POST /debug/llm/embed: with stub config + stub provider → 200 {model, count, dimension};
   no config → 422; CLIENT_AGENT → 403; no cookie → 401.
+- POST /debug/llm/classify: with stub config + stub provider → 200 {label, model};
+  no config → 422; CLIENT_AGENT → 403; no cookie → 401.
+- POST /debug/llm/stream: with stub config + stub provider → 200 streaming text;
+  CLIENT_AGENT → 403; no cookie → 401.
 """
 from __future__ import annotations
 
@@ -21,7 +25,7 @@ from httpx import ASGITransport, AsyncClient
 
 from api.auth.tokens import create_access_token
 from api.config import get_api_settings
-from api.llm.provider import ChatMessage, Completion, Vector
+from api.llm.provider import ChatMessage, Chunk, Completion, Label, Vector
 
 # -- Constants -----------------------------------------------------------------
 
@@ -95,15 +99,19 @@ class _StubPipeline:
 
 
 class _StubProvider:
-    """Stub LLM provider that returns a canned Completion and vectors."""
+    """Stub LLM provider that returns canned Completion, vectors, label, and stream chunks."""
 
     def __init__(
         self,
         text: str = "Stub response.",
         vectors: list[Vector] | None = None,
+        label: Label = "Support",
+        stream_chunks: list[Chunk] | None = None,
     ) -> None:
         self._text = text
         self._vectors = vectors or [[0.1, 0.2, 0.3]]
+        self._label = label
+        self._stream_chunks = stream_chunks or [Chunk("He"), Chunk("llo")]
 
     async def generate(
         self,
@@ -126,6 +134,25 @@ class _StubProvider:
         model: str,
     ) -> list[Vector]:
         return self._vectors
+
+    async def classify(
+        self,
+        text: str,
+        labels: list[str],
+        *,
+        model: str,
+    ) -> Label:
+        return self._label
+
+    async def stream(
+        self,
+        messages: list[ChatMessage],
+        *,
+        model: str,
+        max_tokens: int,
+    ):
+        for chunk in self._stream_chunks:
+            yield chunk
 
 
 # -- Helpers -------------------------------------------------------------------
@@ -418,5 +445,135 @@ async def test_llm_embed_no_cookie_returns_401() -> None:
         resp = await c.post(
             "/debug/llm/embed",
             json={"texts": ["hello"], "model": "nomic-embed-text"},
+        )
+    assert resp.status_code == 401
+
+
+# ==============================================================================
+# POST /debug/llm/classify
+# ==============================================================================
+
+
+async def test_llm_classify_with_config_returns_200() -> None:
+    """With a stub config + stub provider → 200 {label, model}."""
+    ciphertext = SecretBox(get_api_settings().secret_encryption_key).encrypt("sk-test-key")
+    config_row = {
+        "provider": "openai",
+        "model": "gpt-4o",
+        "api_key_ciphertext": ciphertext,
+        "base_url": None,
+    }
+    db = _StubDatabase(config_row=config_row)
+    app = _build_app(db=db)
+
+    with patch(
+        "api.llm.routes.provider_for",
+        return_value=_StubProvider(label="Support"),
+    ):
+        token = _mint_cookie(role=Role.CLIENT_ADMIN)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/debug/llm/classify",
+                json={"text": "I need help", "labels": ["Sales", "Support", "Billing"]},
+                cookies={"access_token": token},
+            )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["label"] == "Support"
+    assert body["model"] == "gpt-4o"
+
+
+async def test_llm_classify_no_config_returns_422() -> None:
+    """Tenant with no config → 422 LLM_NOT_CONFIGURED."""
+    db = _StubDatabase(config_row=None)
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/llm/classify",
+            json={"text": "I need help", "labels": ["Sales", "Support"]},
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 422
+    assert resp.json()["error_code"] == "LLM_NOT_CONFIGURED"
+
+
+async def test_llm_classify_client_agent_returns_403() -> None:
+    """CLIENT_AGENT → 403."""
+    app = _build_app()
+    token = _mint_cookie(role=Role.CLIENT_AGENT)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/llm/classify",
+            json={"text": "I need help", "labels": ["Sales", "Support"]},
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 403
+
+
+async def test_llm_classify_no_cookie_returns_401() -> None:
+    """No cookie → 401."""
+    app = _build_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/llm/classify",
+            json={"text": "I need help", "labels": ["Sales", "Support"]},
+        )
+    assert resp.status_code == 401
+
+
+# ==============================================================================
+# POST /debug/llm/stream
+# ==============================================================================
+
+
+async def test_llm_stream_with_config_returns_200() -> None:
+    """With a stub config + stub provider → 200, body equals joined deltas."""
+    ciphertext = SecretBox(get_api_settings().secret_encryption_key).encrypt("sk-test-key")
+    config_row = {
+        "provider": "openai",
+        "model": "gpt-4o",
+        "api_key_ciphertext": ciphertext,
+        "base_url": None,
+    }
+    db = _StubDatabase(config_row=config_row)
+    app = _build_app(db=db)
+
+    stream_chunks = [Chunk("Hello"), Chunk(" from the bot.")]
+    with patch(
+        "api.llm.routes.provider_for",
+        return_value=_StubProvider(stream_chunks=stream_chunks),
+    ):
+        token = _mint_cookie(role=Role.CLIENT_ADMIN)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/debug/llm/stream",
+                json={"prompt": "Say hello"},
+                cookies={"access_token": token},
+            )
+    assert resp.status_code == 200
+    assert resp.text == "Hello from the bot."
+
+
+async def test_llm_stream_client_agent_returns_403() -> None:
+    """CLIENT_AGENT → 403."""
+    app = _build_app()
+    token = _mint_cookie(role=Role.CLIENT_AGENT)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/llm/stream",
+            json={"prompt": "Say hello"},
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 403
+
+
+async def test_llm_stream_no_cookie_returns_401() -> None:
+    """No cookie → 401."""
+    app = _build_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/llm/stream",
+            json={"prompt": "Say hello"},
         )
     assert resp.status_code == 401

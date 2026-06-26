@@ -1,66 +1,10 @@
 (C:\Projects\chatbot\marketing_chatbot\venv) C:\Projects\chatbot\marketing_chatbot>python -m api.seed
 === Seed summary ===
-  Tenant created: slug=isngs  id=f7da0368f904444fbfbcc8902e460e39
-  Platform admin created: platform-admin@isngs.com
-  Client admin created: admin@isngs.com  tenant=f7da0368f904444fbfbcc8902e460e39
+Tenant created: slug=isngs  id=f7da0368f904444fbfbcc8902e460e39
+Platform admin created: platform-admin@isngs.com
+Client admin created: admin@isngs.com  tenant=f7da0368f904444fbfbcc8902e460e39
 
+python.exe -m uvicorn api.app:create_app --factory --port 8000
 
-  Step 0 — Infra up
-
-  Start Docker Desktop, then:
-  docker compose -f deploy/docker-compose.yml up -d postgres redis
-  docker ps
-  Confirm chatbot-postgres (5432) + chatbot-redis (6379) are Up. Watch for a foreign redis squatting 6379 (bit us in S1.4) — stop it if present.
-
-  Step 1 — Dep + migration 0004
-
-  venv\python.exe -m pip install -e services/api
-  set "DATABASE_URL_DIRECT=postgresql://chatbot:chatbot@localhost:5432/chatbot"
-  cd services\api && ..\..\venv\python.exe -m alembic upgrade head && cd ..\..
-  docker exec -it chatbot-postgres psql -U chatbot -d chatbot -c "\d tenant_llm_configs"
-  Expect alembic 0003 -> 0004 and the table with the provider IN ('anthropic','openai','azure') CHECK.
-
-  Step 2 — Start the API (own window)
-
-  venv\python.exe -m uvicorn api.app:create_app --factory --port 8000
-
-  Step 3 — Log in as CLIENT_ADMIN
-
-  curl -i -c jar.txt -X POST http://localhost:8000/auth/login -H "Content-Type: application/json" -d
-  "{\"email\":\"admin@isngs.com\",\"password\":\"<your-client-admin-password>\"}"
-  → 200 + set-cookie: access_token=...
-
-  Step 4 — 422 BEFORE any config (do this first)
-
-  curl -i -b jar.txt -X POST http://localhost:8000/debug/llm/generate -H "Content-Type: application/json" -d "{\"prompt\":\"Hello\"}"
-  → 422 "error_code":"LLM_NOT_CONFIGURED"
-
-  Step 5 — Set config, verify ciphertext, then generate
-
-  curl -i -b jar.txt -X POST http://localhost:8000/debug/llm/config -H "Content-Type: application/json" -d
-  "{\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-6\",\"api_key\":\"sk-ant-...\"}"
-  → 200 {"provider":"anthropic","model":"claude-sonnet-4-6"} — no api_key in the body.
-  docker exec -it chatbot-postgres psql -U chatbot -d chatbot -c "SELECT provider, model, left(api_key_ciphertext,16) AS ct FROM tenant_llm_configs;"
-  ct must be random base64url, not sk-ant-.
-  curl -i -b jar.txt -X POST http://localhost:8000/debug/llm/generate -H "Content-Type: application/json" -d "{\"prompt\":\"In one sentence, what is ISN
-  GS?\"}"
-  → 200 {"text":"<real Claude answer>","model":"claude-sonnet-4-6","input_tokens":..,"output_tokens":..}
-  (claude-sonnet-4-6 keeps it cheap; claude-opus-4-8 also works.)
-
-  Step 6 — (Optional) 403 for CLIENT_AGENT
-
-  Already covered by automated test; do this only if you want the manual check:
-  docker exec -it chatbot-postgres psql -U chatbot -d chatbot -c "SELECT id FROM tenants LIMIT 1;"
-  venv\python.exe -c "from common.crypto import hash_password; print(hash_password('AgentPass123!'))"
-  docker exec -it chatbot-postgres psql -U chatbot -d chatbot -c "INSERT INTO users (id, tenant_id, email, role, password_hash) VALUES
-  (replace(gen_random_uuid()::text,'-',''), '<tenant-id>', 'agent@isngs.com', 'CLIENT_AGENT', '<hash>');"
-  curl -i -c agentjar.txt -X POST http://localhost:8000/auth/login -H "Content-Type: application/json" -d
-  "{\"email\":\"agent@isngs.com\",\"password\":\"AgentPass123!\"}"
-  curl -i -b agentjar.txt -X POST http://localhost:8000/debug/llm/generate -H "Content-Type: application/json" -d "{\"prompt\":\"Hello\"}"
-  → generate returns 403.
-
-  Reset (to re-run Step 4 later)
-
-  docker exec -it chatbot-postgres psql -U chatbot -d chatbot -c "DELETE FROM tenant_llm_configs;"
-
-  **Pass = ** migration→0004, Step 4 → 422, Step 5 config → 200 (no key echoed) + ciphertext in DB + real completion, optional Step 6 → 403.
+Login (refresh cookie)
+curl -i -c jar.txt -X POST http://localhost:8000/auth/login -H "Content-Type: application/json" -d "{\"email\":\"admin@isngs.com\",\"password\":\"<your-client-admin-password>\"}"

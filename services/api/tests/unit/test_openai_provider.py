@@ -1,4 +1,4 @@
-"""Unit tests for OpenAICompatibleProvider.generate and embed.
+"""Unit tests for OpenAICompatibleProvider.generate, embed, classify, and stream.
 
 Uses a stub client to avoid real network calls. Verifies:
 - Returns Completion with text + usage + finish_reason.
@@ -8,6 +8,8 @@ Uses a stub client to avoid real network calls. Verifies:
 - openai.APIError → LLMError (no fabricated text).
 - embed returns vectors in order; kwargs are exactly {model, input}.
 - Empty embeddings data → LLMError.
+- classify returns canonical-cased label; non-label → LLMError; empty labels → LLMError.
+- stream yields Chunk deltas in order; empty/None deltas skipped.
 - Upstream-error logging emits WARNING with status/detail; api_key never logged.
 """
 from __future__ import annotations
@@ -20,11 +22,15 @@ import pytest
 from openai import APIError
 
 from api.llm.openai_provider import OpenAICompatibleProvider
-from api.llm.provider import ChatMessage, Completion, LLMError
+from api.llm.provider import ChatMessage, Chunk, Completion, LLMError
 
 
 class _StubCompletions:
-    """Stub for ``client.chat.completions`` with an async ``create`` method."""
+    """Stub for ``client.chat.completions`` with an async ``create`` method.
+
+    When ``stream=True`` is passed, returns an async iterator of events instead
+    of a single response.
+    """
 
     def __init__(
         self,
@@ -36,6 +42,7 @@ class _StubCompletions:
         raise_error: Exception | None = None,
         empty_choices: bool = False,
         content_none: bool = False,
+        stream_events: list[SimpleNamespace] | None = None,
     ) -> None:
         self._text = text
         self._prompt_tokens = prompt_tokens
@@ -44,12 +51,15 @@ class _StubCompletions:
         self._raise_error = raise_error
         self._empty_choices = empty_choices
         self._content_none = content_none
+        self._stream_events = stream_events
         self.last_kwargs: dict[str, object] = {}
 
     async def create(self, **kwargs: object) -> SimpleNamespace:
         self.last_kwargs = kwargs
         if self._raise_error is not None:
             raise self._raise_error
+        if kwargs.get("stream"):
+            return _AsyncIterator(self._stream_events or [])
         if self._empty_choices:
             return SimpleNamespace(choices=[], usage=None)
         message = SimpleNamespace(content=None if self._content_none else self._text)
@@ -60,6 +70,24 @@ class _StubCompletions:
                 completion_tokens=self._completion_tokens,
             ),
         )
+
+
+class _AsyncIterator:
+    """Async iterator wrapper around a list of events."""
+
+    def __init__(self, events: list[SimpleNamespace]) -> None:
+        self._events = events
+        self._index = 0
+
+    def __aiter__(self) -> _AsyncIterator:
+        return self
+
+    async def __anext__(self) -> SimpleNamespace:
+        if self._index >= len(self._events):
+            raise StopAsyncIteration
+        event = self._events[self._index]
+        self._index += 1
+        return event
 
 
 class _StubEmbeddings:
@@ -303,4 +331,261 @@ async def test_embed_error_logs_warning_without_api_key(caplog: pytest.LogCaptur
 
     assert any("bad model" in record.message for record in caplog.records)
     assert any("embed" in record.message for record in caplog.records)
+    assert all(sentinel_key not in record.message for record in caplog.records)
+
+
+# -- classify tests ------------------------------------------------------------
+
+
+async def test_classify_returns_canonical_label() -> None:
+    """classify returns the canonical-cased member of labels."""
+    stub = _StubCompletions(text="Support")
+    client = _make_stub_client(completions=stub)
+    provider = OpenAICompatibleProvider(client=client)
+
+    result = await provider.classify(
+        "I need help with my order",
+        labels=["Sales", "Support", "Billing"],
+        model="gpt-4o",
+    )
+
+    assert result == "Support"
+
+
+async def test_classify_matches_case_insensitively() -> None:
+    """classify matches case-insensitively and returns the canonical label."""
+    stub = _StubCompletions(text="support")
+    client = _make_stub_client(completions=stub)
+    provider = OpenAICompatibleProvider(client=client)
+
+    result = await provider.classify(
+        "I need help",
+        labels=["Sales", "Support", "Billing"],
+        model="gpt-4o",
+    )
+
+    assert result == "Support"
+
+
+async def test_classify_non_label_raises_llm_error() -> None:
+    """classify with a reply not in labels → LLMError."""
+    stub = _StubCompletions(text="UnknownCategory")
+    client = _make_stub_client(completions=stub)
+    provider = OpenAICompatibleProvider(client=client)
+
+    with pytest.raises(LLMError):
+        await provider.classify(
+            "I need help",
+            labels=["Sales", "Support", "Billing"],
+            model="gpt-4o",
+        )
+
+
+async def test_classify_empty_labels_raises_llm_error() -> None:
+    """classify with empty labels → LLMError, no client call."""
+    tracking_client = MagicMock()
+    client = MagicMock()
+    client.chat.completions = tracking_client
+    provider = OpenAICompatibleProvider(client=client)
+
+    with pytest.raises(LLMError):
+        await provider.classify(
+            "I need help",
+            labels=[],
+            model="gpt-4o",
+        )
+
+    tracking_client.assert_not_called()
+
+
+async def test_classify_empty_choices_raises_llm_error() -> None:
+    """classify with empty choices → LLMError."""
+    stub = _StubCompletions(empty_choices=True)
+    client = _make_stub_client(completions=stub)
+    provider = OpenAICompatibleProvider(client=client)
+
+    with pytest.raises(LLMError):
+        await provider.classify(
+            "I need help",
+            labels=["Sales", "Support"],
+            model="gpt-4o",
+        )
+
+
+async def test_classify_wraps_api_error_in_llm_error() -> None:
+    """classify APIError → LLMError."""
+    mock_request = MagicMock()
+    api_err = APIError(
+        message="rate limited",
+        request=mock_request,
+        body={"error": "rate_limit"},
+    )
+    stub = _StubCompletions(raise_error=api_err)
+    client = _make_stub_client(completions=stub)
+    provider = OpenAICompatibleProvider(client=client)
+
+    with pytest.raises(LLMError):
+        await provider.classify(
+            "I need help",
+            labels=["Sales", "Support"],
+            model="gpt-4o",
+        )
+
+
+async def test_classify_error_logs_warning_without_api_key(caplog: pytest.LogCaptureFixture) -> None:
+    """classify APIError → WARNING logged; api_key never appears."""
+    sentinel_key = "sk-SECRET-KEY-NEVER-LOG"
+    mock_request = MagicMock()
+    api_err = APIError(
+        message="rate limited",
+        request=mock_request,
+        body={"error": "rate_limit"},
+    )
+    stub = _StubCompletions(raise_error=api_err)
+    client = _make_stub_client(completions=stub)
+    provider = OpenAICompatibleProvider(api_key=sentinel_key, client=client)
+
+    with caplog.at_level(logging.WARNING, logger="api.llm.openai_provider"):
+        with pytest.raises(LLMError):
+            await provider.classify(
+                "I need help",
+                labels=["Sales", "Support"],
+                model="gpt-4o",
+            )
+
+    assert any("classify" in record.message for record in caplog.records)
+    assert all(sentinel_key not in record.message for record in caplog.records)
+
+
+async def test_classify_no_match_logs_warning_without_api_key(caplog: pytest.LogCaptureFixture) -> None:
+    """classify no-match → WARNING logged with reply substring; api_key never appears."""
+    sentinel_key = "sk-SECRET-KEY-NEVER-LOG"
+    stub = _StubCompletions(text="This is a billing question.")
+    client = _make_stub_client(completions=stub)
+    provider = OpenAICompatibleProvider(api_key=sentinel_key, client=client)
+
+    with caplog.at_level(logging.WARNING, logger="api.llm.openai_provider"):
+        with pytest.raises(LLMError):
+            await provider.classify(
+                "I need help",
+                labels=["sales", "support", "billing"],
+                model="gpt-4o",
+            )
+
+    assert any("no matching label" in record.message for record in caplog.records)
+    assert any("billing question" in record.message for record in caplog.records)
+    assert all(sentinel_key not in record.message for record in caplog.records)
+
+
+async def test_classify_no_match_truncates_reply(caplog: pytest.LogCaptureFixture) -> None:
+    """classify no-match → logged reply is truncated to 120 chars, not the full reply."""
+    long_reply = "x" * 200
+    stub = _StubCompletions(text=long_reply)
+    client = _make_stub_client(completions=stub)
+    provider = OpenAICompatibleProvider(client=client)
+
+    with caplog.at_level(logging.WARNING, logger="api.llm.openai_provider"):
+        with pytest.raises(LLMError):
+            await provider.classify(
+                "I need help",
+                labels=["sales", "support", "billing"],
+                model="gpt-4o",
+            )
+
+    assert all("x" * 200 not in record.message for record in caplog.records)
+    assert any("x" * 120 in record.message for record in caplog.records)
+
+
+# -- stream tests --------------------------------------------------------------
+
+
+async def test_stream_yields_chunk_deltas_in_order() -> None:
+    """stream yields Chunk(text=...) for each delta.content."""
+    stream_events = [
+        SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="He"))]),
+        SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="llo"))]),
+        SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=" world"))]),
+    ]
+    stub = _StubCompletions(stream_events=stream_events)
+    client = _make_stub_client(completions=stub)
+    provider = OpenAICompatibleProvider(client=client)
+
+    chunks: list[Chunk] = []
+    async for chunk in provider.stream(
+        [ChatMessage("user", "Hello")],
+        model="gpt-4o",
+        max_tokens=512,
+    ):
+        chunks.append(chunk)
+
+    assert chunks == [Chunk("He"), Chunk("llo"), Chunk(" world")]
+
+
+async def test_stream_skips_none_and_empty_deltas() -> None:
+    """stream skips events where delta.content is None or missing."""
+    stream_events = [
+        SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="Hi"))]),
+        SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=None))]),
+        SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace())]),
+        SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="!"))]),
+    ]
+    stub = _StubCompletions(stream_events=stream_events)
+    client = _make_stub_client(completions=stub)
+    provider = OpenAICompatibleProvider(client=client)
+
+    chunks: list[Chunk] = []
+    async for chunk in provider.stream(
+        [ChatMessage("user", "Hello")],
+        model="gpt-4o",
+        max_tokens=512,
+    ):
+        chunks.append(chunk)
+
+    assert chunks == [Chunk("Hi"), Chunk("!")]
+
+
+async def test_stream_wraps_api_error_in_llm_error() -> None:
+    """stream APIError on open → LLMError."""
+    mock_request = MagicMock()
+    api_err = APIError(
+        message="bad model",
+        request=mock_request,
+        body={"error": "invalid_model"},
+    )
+    stub = _StubCompletions(raise_error=api_err)
+    client = _make_stub_client(completions=stub)
+    provider = OpenAICompatibleProvider(client=client)
+
+    with pytest.raises(LLMError):
+        async for _chunk in provider.stream(
+            [ChatMessage("user", "Hello")],
+            model="bad-model",
+            max_tokens=512,
+        ):
+            pass
+
+
+async def test_stream_error_logs_warning_without_api_key(caplog: pytest.LogCaptureFixture) -> None:
+    """stream APIError → WARNING logged; api_key never appears."""
+    sentinel_key = "sk-SECRET-KEY-NEVER-LOG"
+    mock_request = MagicMock()
+    api_err = APIError(
+        message="bad model",
+        request=mock_request,
+        body={"error": "invalid_model"},
+    )
+    stub = _StubCompletions(raise_error=api_err)
+    client = _make_stub_client(completions=stub)
+    provider = OpenAICompatibleProvider(api_key=sentinel_key, client=client)
+
+    with caplog.at_level(logging.WARNING, logger="api.llm.openai_provider"):
+        with pytest.raises(LLMError):
+            async for _chunk in provider.stream(
+                [ChatMessage("user", "Hello")],
+                model="bad-model",
+                max_tokens=512,
+            ):
+                pass
+
+    assert any("stream" in record.message for record in caplog.records)
     assert all(sentinel_key not in record.message for record in caplog.records)

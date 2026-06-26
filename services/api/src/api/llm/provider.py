@@ -5,11 +5,13 @@ gets an explicit error, never a fabricated answer.
 """
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Protocol
 
 from common.errors import AppException
 
+Label = str
 Vector = list[float]
 
 
@@ -17,6 +19,11 @@ Vector = list[float]
 class ChatMessage:
     role: str
     content: str
+
+
+@dataclass(frozen=True)
+class Chunk:
+    text: str
 
 
 @dataclass(frozen=True)
@@ -43,6 +50,22 @@ class LLMProvider(Protocol):
         *,
         model: str,
     ) -> list[Vector]: ...
+
+    async def classify(
+        self,
+        text: str,
+        labels: list[str],
+        *,
+        model: str,
+    ) -> Label: ...
+
+    def stream(
+        self,
+        messages: list[ChatMessage],
+        *,
+        model: str,
+        max_tokens: int,
+    ) -> AsyncIterator[Chunk]: ...
 
 
 class LLMError(AppException):

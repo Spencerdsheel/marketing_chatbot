@@ -8,18 +8,29 @@ Anthropic has no embeddings API -- ``embed`` raises an explicit ``LLMError``.
 """
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any
 
 from anthropic import APIError
 from common.logging import get_logger
 
-from api.llm.provider import ChatMessage, Completion, LLMError, Vector
+from api.llm.provider import (
+    ChatMessage,
+    Chunk,
+    Completion,
+    Label,
+    LLMError,
+    Vector,
+)
 
 _log = get_logger(__name__)
 
+_CLASSIFY_MAX_TOKENS = 256
+_CLASSIFY_REPLY_LOG_LIMIT = 120
+
 
 class AnthropicProvider:
-    """Anthropic Claude backend for ``LLMProvider.generate``."""
+    """Anthropic Claude backend for ``LLMProvider.generate``, ``classify``, and ``stream``."""
 
     def __init__(self, *, api_key: str | None = None, client: Any | None = None) -> None:
         if client is not None:
@@ -70,3 +81,90 @@ class AnthropicProvider:
             "Embeddings are not supported by the Anthropic provider; "
             "configure an OpenAI-compatible embeddings endpoint.",
         )
+
+    async def classify(
+        self,
+        text: str,
+        labels: list[str],
+        *,
+        model: str,
+    ) -> Label:
+        if not labels:
+            raise LLMError("LLM request failed.")
+
+        labels_str = ", ".join(labels)
+        instruction = (
+            f"Classify the text into exactly one of these labels: {labels_str}. "
+            "Reply with only the label, nothing else."
+        )
+
+        try:
+            resp = await self._client.messages.create(
+                model=model,
+                max_tokens=_CLASSIFY_MAX_TOKENS,
+                system=instruction,
+                messages=[{"role": "user", "content": text}],
+            )
+        except APIError as exc:
+            _log.warning(
+                "LLM upstream call failed: provider=anthropic op=classify"
+                " model=%s status=%s detail=%s",
+                model,
+                getattr(exc, "status_code", None),
+                str(exc),
+            )
+            raise LLMError("LLM request failed.") from exc
+
+        reply = "".join(b.text for b in resp.content if b.type == "text").strip()
+        for label in labels:
+            if reply.lower() == label.lower():
+                return label
+        _log.warning(
+            "LLM classify produced no matching label: provider=%s model=%s labels=%s reply=%r",
+            "anthropic",
+            model,
+            labels,
+            reply[:_CLASSIFY_REPLY_LOG_LIMIT],
+        )
+        raise LLMError("LLM request failed.")
+
+    async def stream(
+        self,
+        messages: list[ChatMessage],
+        *,
+        model: str,
+        max_tokens: int,
+    ) -> AsyncIterator[Chunk]:
+        try:
+            stream = await self._client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                messages=[{"role": m.role, "content": m.content} for m in messages],
+                stream=True,
+            )
+        except APIError as exc:
+            _log.warning(
+                "LLM upstream call failed: provider=anthropic op=stream"
+                " model=%s status=%s detail=%s",
+                model,
+                getattr(exc, "status_code", None),
+                str(exc),
+            )
+            raise LLMError("LLM request failed.") from exc
+
+        try:
+            async for event in stream:
+                if (
+                    getattr(event, "type", None) == "content_block_delta"
+                    and getattr(event.delta, "type", None) == "text_delta"
+                ):
+                    yield Chunk(text=event.delta.text)
+        except APIError as exc:
+            _log.warning(
+                "LLM upstream call failed: provider=anthropic op=stream"
+                " model=%s status=%s detail=%s",
+                model,
+                getattr(exc, "status_code", None),
+                str(exc),
+            )
+            raise LLMError("LLM request failed.") from exc

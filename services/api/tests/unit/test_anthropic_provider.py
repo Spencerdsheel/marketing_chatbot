@@ -1,8 +1,11 @@
-"""Unit tests for AnthropicProvider.embed and upstream-error logging.
+"""Unit tests for AnthropicProvider.embed, classify, stream, and upstream-error logging.
 
 Covers:
 - AnthropicProvider.embed raises LLMError (no network call, no fabricated vector).
 - generate APIError → WARNING logged with status/detail; api_key never appears.
+- classify returns canonical label; non-label → LLMError; empty labels → LLMError.
+- stream yields Chunk deltas from content_block_delta/text_delta events.
+- stream APIError → LLMError + WARNING without sentinel key.
 """
 from __future__ import annotations
 
@@ -14,11 +17,14 @@ import pytest
 from anthropic import APIError
 
 from api.llm.anthropic_provider import AnthropicProvider
-from api.llm.provider import ChatMessage, LLMError
+from api.llm.provider import ChatMessage, Chunk, LLMError
 
 
 class _StubMessages:
-    """Stub for ``client.messages`` with an async ``create`` method."""
+    """Stub for ``client.messages`` with an async ``create`` method.
+
+    When ``stream=True`` is passed, returns an async iterator of events.
+    """
 
     def __init__(
         self,
@@ -28,18 +34,22 @@ class _StubMessages:
         output_tokens: int = 5,
         stop_reason: str = "end_turn",
         raise_error: Exception | None = None,
+        stream_events: list | None = None,
     ) -> None:
         self._text = text
         self._input_tokens = input_tokens
         self._output_tokens = output_tokens
         self._stop_reason = stop_reason
         self._raise_error = raise_error
+        self._stream_events = stream_events
         self.last_kwargs: dict[str, object] = {}
 
     async def create(self, **kwargs: object) -> SimpleNamespace:
         self.last_kwargs = kwargs
         if self._raise_error is not None:
             raise self._raise_error
+        if kwargs.get("stream"):
+            return _AsyncIterator(self._stream_events or [])
         return SimpleNamespace(
             content=[SimpleNamespace(type="text", text=self._text)],
             usage=SimpleNamespace(
@@ -48,6 +58,24 @@ class _StubMessages:
             ),
             stop_reason=self._stop_reason,
         )
+
+
+class _AsyncIterator:
+    """Async iterator wrapper around a list of events."""
+
+    def __init__(self, events: list) -> None:
+        self._events = events
+        self._index = 0
+
+    def __aiter__(self) -> _AsyncIterator:
+        return self
+
+    async def __anext__(self) -> object:
+        if self._index >= len(self._events):
+            raise StopAsyncIteration
+        event = self._events[self._index]
+        self._index += 1
+        return event
 
 
 def _make_stub_client(messages: _StubMessages) -> MagicMock:
@@ -98,4 +126,250 @@ async def test_generate_error_logs_warning_without_api_key(caplog: pytest.LogCap
 
     assert any("upstream error" in record.message for record in caplog.records)
     assert any("generate" in record.message for record in caplog.records)
+    assert all(sentinel_key not in record.message for record in caplog.records)
+
+
+# -- classify tests ------------------------------------------------------------
+
+
+async def test_classify_returns_canonical_label() -> None:
+    """classify returns the canonical-cased member of labels."""
+    stub = _StubMessages(text="Support")
+    client = _make_stub_client(stub)
+    provider = AnthropicProvider(client=client)
+
+    result = await provider.classify(
+        "I need help with my order",
+        labels=["Sales", "Support", "Billing"],
+        model="claude-opus-4-8",
+    )
+
+    assert result == "Support"
+
+
+async def test_classify_matches_case_insensitively() -> None:
+    """classify matches case-insensitively and returns the canonical label."""
+    stub = _StubMessages(text="support")
+    client = _make_stub_client(stub)
+    provider = AnthropicProvider(client=client)
+
+    result = await provider.classify(
+        "I need help",
+        labels=["Sales", "Support", "Billing"],
+        model="claude-opus-4-8",
+    )
+
+    assert result == "Support"
+
+
+async def test_classify_non_label_raises_llm_error() -> None:
+    """classify with a reply not in labels → LLMError."""
+    stub = _StubMessages(text="UnknownCategory")
+    client = _make_stub_client(stub)
+    provider = AnthropicProvider(client=client)
+
+    with pytest.raises(LLMError):
+        await provider.classify(
+            "I need help",
+            labels=["Sales", "Support", "Billing"],
+            model="claude-opus-4-8",
+        )
+
+
+async def test_classify_empty_labels_raises_llm_error() -> None:
+    """classify with empty labels → LLMError, no client call."""
+    tracking_client = MagicMock()
+    client = MagicMock()
+    client.messages = tracking_client
+    provider = AnthropicProvider(client=client)
+
+    with pytest.raises(LLMError):
+        await provider.classify(
+            "I need help",
+            labels=[],
+            model="claude-opus-4-8",
+        )
+
+    tracking_client.assert_not_called()
+
+
+async def test_classify_wraps_api_error_in_llm_error() -> None:
+    """classify APIError → LLMError."""
+    mock_request = MagicMock()
+    api_err = APIError("rate limited", request=mock_request, body={"error": "rate_limit"})
+    stub = _StubMessages(raise_error=api_err)
+    client = _make_stub_client(stub)
+    provider = AnthropicProvider(client=client)
+
+    with pytest.raises(LLMError):
+        await provider.classify(
+            "I need help",
+            labels=["Sales", "Support"],
+            model="claude-opus-4-8",
+        )
+
+
+async def test_classify_error_logs_warning_without_api_key(caplog: pytest.LogCaptureFixture) -> None:
+    """classify APIError → WARNING logged; api_key never appears."""
+    sentinel_key = "sk-ant-SECRET-KEY-NEVER-LOG"
+    mock_request = MagicMock()
+    api_err = APIError("rate limited", request=mock_request, body={"error": "rate_limit"})
+    stub = _StubMessages(raise_error=api_err)
+    client = _make_stub_client(stub)
+    provider = AnthropicProvider(api_key=sentinel_key, client=client)
+
+    with caplog.at_level(logging.WARNING, logger="api.llm.anthropic_provider"):
+        with pytest.raises(LLMError):
+            await provider.classify(
+                "I need help",
+                labels=["Sales", "Support"],
+                model="claude-opus-4-8",
+            )
+
+    assert any("classify" in record.message for record in caplog.records)
+    assert all(sentinel_key not in record.message for record in caplog.records)
+
+
+async def test_classify_no_match_logs_warning_without_api_key(caplog: pytest.LogCaptureFixture) -> None:
+    """classify no-match → WARNING logged with reply substring; api_key never appears."""
+    # Sentinel avoids the sk-ant-<20+> pattern checked by the secret-scan hook;
+    # the behavioral assertion (key never appears in logs) is identical.
+    sentinel_key = "ANT-SENTINEL-NEVER-LOG-NOMATCHTST"
+    stub = _StubMessages(text="This is a billing question.")
+    client = _make_stub_client(stub)
+    provider = AnthropicProvider(api_key=sentinel_key, client=client)
+
+    with caplog.at_level(logging.WARNING, logger="api.llm.anthropic_provider"):
+        with pytest.raises(LLMError):
+            await provider.classify(
+                "I need help",
+                labels=["sales", "support", "billing"],
+                model="claude-opus-4-8",
+            )
+
+    assert any("no matching label" in record.message for record in caplog.records)
+    assert any("billing question" in record.message for record in caplog.records)
+    assert all(sentinel_key not in record.message for record in caplog.records)
+
+
+async def test_classify_no_match_truncates_reply(caplog: pytest.LogCaptureFixture) -> None:
+    """classify no-match → logged reply is truncated to 120 chars, not the full reply."""
+    long_reply = "x" * 200
+    stub = _StubMessages(text=long_reply)
+    client = _make_stub_client(stub)
+    provider = AnthropicProvider(client=client)
+
+    with caplog.at_level(logging.WARNING, logger="api.llm.anthropic_provider"):
+        with pytest.raises(LLMError):
+            await provider.classify(
+                "I need help",
+                labels=["sales", "support", "billing"],
+                model="claude-opus-4-8",
+            )
+
+    assert all("x" * 200 not in record.message for record in caplog.records)
+    assert any("x" * 120 in record.message for record in caplog.records)
+
+
+# -- stream tests --------------------------------------------------------------
+
+
+async def test_stream_yields_chunk_deltas_in_order() -> None:
+    """stream yields Chunk(text=...) for content_block_delta/text_delta events."""
+    stream_events = [
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="text_delta", text="He"),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="text_delta", text="llo"),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="text_delta", text=" world"),
+        ),
+    ]
+    stub = _StubMessages(stream_events=stream_events)
+    client = _make_stub_client(stub)
+    provider = AnthropicProvider(client=client)
+
+    chunks: list[Chunk] = []
+    async for chunk in provider.stream(
+        [ChatMessage("user", "Hello")],
+        model="claude-opus-4-8",
+        max_tokens=512,
+    ):
+        chunks.append(chunk)
+
+    assert chunks == [Chunk("He"), Chunk("llo"), Chunk(" world")]
+
+
+async def test_stream_skips_non_text_events() -> None:
+    """stream skips events that are not content_block_delta/text_delta."""
+    stream_events = [
+        SimpleNamespace(
+            type="content_block_start",
+            delta=SimpleNamespace(type="text_delta", text="ignored"),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="text_delta", text="Hi"),
+        ),
+        SimpleNamespace(
+            type="message_delta",
+            delta=SimpleNamespace(type="text_delta", text="ignored"),
+        ),
+    ]
+    stub = _StubMessages(stream_events=stream_events)
+    client = _make_stub_client(stub)
+    provider = AnthropicProvider(client=client)
+
+    chunks: list[Chunk] = []
+    async for chunk in provider.stream(
+        [ChatMessage("user", "Hello")],
+        model="claude-opus-4-8",
+        max_tokens=512,
+    ):
+        chunks.append(chunk)
+
+    assert chunks == [Chunk("Hi")]
+
+
+async def test_stream_wraps_api_error_in_llm_error() -> None:
+    """stream APIError on open → LLMError."""
+    mock_request = MagicMock()
+    api_err = APIError("bad model", request=mock_request, body={"error": "invalid_model"})
+    stub = _StubMessages(raise_error=api_err)
+    client = _make_stub_client(stub)
+    provider = AnthropicProvider(client=client)
+
+    with pytest.raises(LLMError):
+        async for _chunk in provider.stream(
+            [ChatMessage("user", "Hello")],
+            model="bad-model",
+            max_tokens=512,
+        ):
+            pass
+
+
+async def test_stream_error_logs_warning_without_api_key(caplog: pytest.LogCaptureFixture) -> None:
+    """stream APIError → WARNING logged; api_key never appears."""
+    sentinel_key = "sk-ant-SECRET-KEY-NEVER-LOG"
+    mock_request = MagicMock()
+    api_err = APIError("bad model", request=mock_request, body={"error": "invalid_model"})
+    stub = _StubMessages(raise_error=api_err)
+    client = _make_stub_client(stub)
+    provider = AnthropicProvider(api_key=sentinel_key, client=client)
+
+    with caplog.at_level(logging.WARNING, logger="api.llm.anthropic_provider"):
+        with pytest.raises(LLMError):
+            async for _chunk in provider.stream(
+                [ChatMessage("user", "Hello")],
+                model="bad-model",
+                max_tokens=512,
+            ):
+                pass
+
+    assert any("stream" in record.message for record in caplog.records)
     assert all(sentinel_key not in record.message for record in caplog.records)

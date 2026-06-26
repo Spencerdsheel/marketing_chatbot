@@ -5,10 +5,13 @@ provider boundary. Real admin-facing endpoints land in Phase 12.
 """
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+
 from common.auth import AuthClaims, Role
 from common.errors import ValidationError
 from common.logging import get_logger
 from fastapi import APIRouter, Depends, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from api.auth.dependencies import require_roles
@@ -42,6 +45,19 @@ class EmbedRequest(BaseModel):
 
     texts: list[str]
     model: str
+
+
+class ClassifyRequest(BaseModel):
+    """Body for POST /debug/llm/classify."""
+
+    text: str
+    labels: list[str]
+
+
+class StreamRequest(BaseModel):
+    """Body for POST /debug/llm/stream."""
+
+    prompt: str
 
 
 @router.post("/config")
@@ -138,3 +154,66 @@ async def embed(
         "count": len(vectors),
         "dimension": len(vectors[0]) if vectors else 0,
     }
+
+
+@router.post("/classify")
+async def classify(
+    body: ClassifyRequest,
+    request: Request,
+    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN)),  # noqa: B008
+) -> dict[str, str]:
+    """Classify text using the tenant's configured LLM.
+
+    Returns 422 ``LLM_NOT_CONFIGURED`` if the tenant has no config.
+    Returns 502 ``LLM_ERROR`` if the provider fails or the reply is not
+    one of the provided labels.
+    """
+    db = request.app.state.db
+
+    config = await get_llm_config(db, claims)
+    if config is None:
+        raise ValidationError(
+            "LLM is not configured for this tenant.",
+            code="LLM_NOT_CONFIGURED",
+        )
+
+    provider = provider_for(config)
+    label = await provider.classify(body.text, body.labels, model=config.model)
+
+    return {"label": label, "model": config.model}
+
+
+@router.post("/stream")
+async def stream(
+    body: StreamRequest,
+    request: Request,
+    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN)),  # noqa: B008
+) -> StreamingResponse:
+    """Stream a completion using the tenant's configured LLM.
+
+    Returns 422 ``LLM_NOT_CONFIGURED`` if the tenant has no config.
+    Returns 502 ``LLM_ERROR`` if the provider call fails.
+    Response is plain concatenated text deltas (not SSE).
+    """
+    settings = get_api_settings()
+    db = request.app.state.db
+
+    config = await get_llm_config(db, claims)
+    if config is None:
+        raise ValidationError(
+            "LLM is not configured for this tenant.",
+            code="LLM_NOT_CONFIGURED",
+        )
+
+    provider = provider_for(config)
+    stream_iter = provider.stream(
+        [ChatMessage("user", body.prompt)],
+        model=config.model,
+        max_tokens=settings.llm_max_tokens,
+    )
+
+    async def _yield_text() -> AsyncIterator[str]:
+        async for chunk in stream_iter:
+            yield chunk.text
+
+    return StreamingResponse(_yield_text(), media_type="text/plain")
