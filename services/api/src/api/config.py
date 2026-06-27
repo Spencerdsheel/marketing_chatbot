@@ -52,6 +52,12 @@ class ApiSettings(Settings):
     # LLM: default/example model (per-tenant config overrides this).
     llm_default_model: str = "claude-opus-4-8"
 
+    # LLM: bounded retries (SDK exp-backoff + jitter, transient failures only).
+    llm_max_retries: int = 2
+
+    # LLM: per-call timeout in seconds (applied by the SDK).
+    llm_timeout_seconds: float = 30.0
+
 
 @lru_cache(maxsize=1)
 def get_api_settings() -> ApiSettings:

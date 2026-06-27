@@ -35,13 +35,20 @@ class OpenAICompatibleProvider:
         *,
         api_key: str | None = None,
         base_url: str | None = None,
+        max_retries: int = 2,
+        timeout: float = 30.0,
         client: Any | None = None,
     ) -> None:
         if client is not None:
             self._client = client
         else:
             from openai import AsyncOpenAI
-            self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+            self._client = AsyncOpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                max_retries=max_retries,
+                timeout=timeout,
+            )
 
     async def generate(
         self,

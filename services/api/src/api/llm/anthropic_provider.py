@@ -32,12 +32,23 @@ _CLASSIFY_REPLY_LOG_LIMIT = 120
 class AnthropicProvider:
     """Anthropic Claude backend for ``LLMProvider.generate``, ``classify``, and ``stream``."""
 
-    def __init__(self, *, api_key: str | None = None, client: Any | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        max_retries: int = 2,
+        timeout: float = 30.0,
+        client: Any | None = None,
+    ) -> None:
         if client is not None:
             self._client = client
         else:
             from anthropic import AsyncAnthropic
-            self._client = AsyncAnthropic(api_key=api_key)
+            self._client = AsyncAnthropic(
+                api_key=api_key,
+                max_retries=max_retries,
+                timeout=timeout,
+            )
 
     async def generate(
         self,

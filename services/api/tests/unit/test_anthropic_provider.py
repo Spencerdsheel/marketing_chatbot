@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from anthropic import APIError
@@ -373,3 +373,22 @@ async def test_stream_error_logs_warning_without_api_key(caplog: pytest.LogCaptu
 
     assert any("stream" in record.message for record in caplog.records)
     assert all(sentinel_key not in record.message for record in caplog.records)
+
+
+# -- SDK construction: max_retries + timeout -----------------------------------
+
+
+async def test_anthropic_forwards_max_retries_and_timeout() -> None:
+    """When no client= is injected, AsyncAnthropic is built with max_retries + timeout."""
+    with patch("anthropic.AsyncAnthropic") as MockAnthropic:
+        MockAnthropic.return_value = MagicMock()
+        AnthropicProvider(
+            api_key="sk-ant-key",
+            max_retries=3,
+            timeout=20.0,
+        )
+        MockAnthropic.assert_called_once_with(
+            api_key="sk-ant-key",
+            max_retries=3,
+            timeout=20.0,
+        )

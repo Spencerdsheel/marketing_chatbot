@@ -21,6 +21,7 @@ class LLMConfig:
     model: str
     api_key: str  # DECRYPTED
     base_url: str | None = None
+    api_version: str | None = None
 
 
 async def get_llm_config(db: Database, claims: AuthClaims) -> LLMConfig | None:
@@ -33,7 +34,7 @@ async def get_llm_config(db: Database, claims: AuthClaims) -> LLMConfig | None:
         raise ValidationError("LLM config is tenant-scoped.")
 
     row = await db.fetchrow(
-        "SELECT provider, model, api_key_ciphertext, base_url "
+        "SELECT provider, model, api_key_ciphertext, base_url, api_version "
         "FROM tenant_llm_configs WHERE tenant_id = $1",
         claims.tenant_id,
     )
@@ -47,6 +48,7 @@ async def get_llm_config(db: Database, claims: AuthClaims) -> LLMConfig | None:
         model=str(row["model"]),
         api_key=api_key,
         base_url=str(row["base_url"]) if row["base_url"] is not None else None,
+        api_version=str(row["api_version"]) if row["api_version"] is not None else None,
     )
 
 
@@ -58,6 +60,7 @@ async def upsert_llm_config(
     model: str,
     api_key: str,
     base_url: str | None = None,
+    api_version: str | None = None,
 ) -> None:
     """Insert or update the tenant's LLM config, encrypting the API key.
 
@@ -71,14 +74,15 @@ async def upsert_llm_config(
 
     await db.execute(
         "INSERT INTO tenant_llm_configs "
-        "(tenant_id, provider, model, api_key_ciphertext, base_url) "
-        "VALUES ($1, $2, $3, $4, $5) "
+        "(tenant_id, provider, model, api_key_ciphertext, base_url, api_version) "
+        "VALUES ($1, $2, $3, $4, $5, $6) "
         "ON CONFLICT (tenant_id) DO UPDATE SET "
         "provider = $2, model = $3, api_key_ciphertext = $4, "
-        "base_url = $5, updated_at = now()",
+        "base_url = $5, api_version = $6, updated_at = now()",
         claims.tenant_id,
         provider,
         model,
         ciphertext,
         base_url,
+        api_version,
     )

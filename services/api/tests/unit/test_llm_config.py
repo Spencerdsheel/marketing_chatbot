@@ -117,6 +117,7 @@ async def test_get_llm_config_returns_base_url() -> None:
         "model": "gpt-4o",
         "api_key_ciphertext": SecretBox(get_api_settings().secret_encryption_key).encrypt("sk-key"),
         "base_url": "https://opencode.ai/zen/v1",
+        "api_version": None,
     }
     db = _RecordingDatabase(rows=[row])
     claims = _claims("tenant-a", Role.CLIENT_ADMIN)
@@ -135,6 +136,7 @@ async def test_get_llm_config_base_url_none_when_null() -> None:
         "model": "claude-opus-4-8",
         "api_key_ciphertext": SecretBox(get_api_settings().secret_encryption_key).encrypt("sk-key"),
         "base_url": None,
+        "api_version": None,
     }
     db = _RecordingDatabase(rows=[row])
     claims = _claims("tenant-a", Role.CLIENT_ADMIN)
@@ -155,6 +157,7 @@ async def test_get_llm_config_filters_by_tenant_id() -> None:
         "model": "claude-opus-4-8",
         "api_key_ciphertext": SecretBox(get_api_settings().secret_encryption_key).encrypt("sk-key"),
         "base_url": None,
+        "api_version": None,
     }
     db = _RecordingDatabase(rows=[row])
     claims = _claims("tenant-a", Role.CLIENT_ADMIN)
@@ -202,3 +205,75 @@ async def test_platform_admin_rejected_on_upsert() -> None:
 
     with pytest.raises(ValidationError):
         await upsert_llm_config(db, claims, provider="anthropic", model="claude-opus-4-8", api_key="sk-key")
+
+
+# -- api_version round-trips through upsert → get --------------------------------
+
+
+async def test_api_version_round_trips() -> None:
+    """api_version stored via upsert and returned via get_llm_config."""
+    db = _RecordingDatabase()
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    await upsert_llm_config(
+        db, claims,
+        provider="azure",
+        model="my-deployment",
+        api_key="sk-key",
+        base_url="https://my-resource.openai.azure.com",
+        api_version="2024-02-01",
+    )
+
+    assert db.last_params[5] == "2024-02-01"
+
+
+async def test_omitted_api_version_is_none() -> None:
+    """Omitted api_version → None in params."""
+    db = _RecordingDatabase()
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    await upsert_llm_config(
+        db, claims,
+        provider="anthropic",
+        model="claude-opus-4-8",
+        api_key="sk-key",
+    )
+
+    assert db.last_params[5] is None
+
+
+async def test_get_llm_config_returns_api_version() -> None:
+    """get_llm_config returns api_version when present."""
+    row = {
+        "provider": "azure",
+        "model": "my-deployment",
+        "api_key_ciphertext": SecretBox(get_api_settings().secret_encryption_key).encrypt("sk-key"),
+        "base_url": "https://my-resource.openai.azure.com",
+        "api_version": "2024-02-01",
+    }
+    db = _RecordingDatabase(rows=[row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    config = await get_llm_config(db, claims)
+
+    assert config is not None
+    assert config.provider == "azure"
+    assert config.api_version == "2024-02-01"
+
+
+async def test_get_llm_config_api_version_none_when_null() -> None:
+    """get_llm_config returns api_version=None when column is NULL."""
+    row = {
+        "provider": "openai",
+        "model": "gpt-4o",
+        "api_key_ciphertext": SecretBox(get_api_settings().secret_encryption_key).encrypt("sk-key"),
+        "base_url": None,
+        "api_version": None,
+    }
+    db = _RecordingDatabase(rows=[row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    config = await get_llm_config(db, claims)
+
+    assert config is not None
+    assert config.api_version is None

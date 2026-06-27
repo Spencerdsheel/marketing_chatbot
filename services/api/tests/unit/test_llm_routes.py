@@ -260,6 +260,37 @@ async def test_llm_config_openai_with_base_url_returns_200() -> None:
     # Verify ciphertext stored (not plaintext)
     ciphertext = db.last_params[3]
     assert ciphertext != "sk-zen-key"
+    # Verify api_version stored (6th param)
+    assert db.last_params[5] is None
+
+
+async def test_llm_config_azure_with_api_version_returns_200() -> None:
+    """CLIENT_ADMIN with provider=azure + api_version → 200, api_version stored."""
+    db = _StubDatabase()
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/llm/config",
+            json={
+                "provider": "azure",
+                "base_url": "https://my-resource.openai.azure.com",
+                "api_version": "2024-02-01",
+                "model": "my-deployment",
+                "api_key": "sk-azure-key",
+            },
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["provider"] == "azure"
+    assert body["model"] == "my-deployment"
+    assert "api_key" not in body
+
+    # Verify api_version stored (6th param)
+    assert db.last_params[5] == "2024-02-01"
+    # Verify base_url stored (5th param)
+    assert db.last_params[4] == "https://my-resource.openai.azure.com"
 
 
 async def test_llm_config_client_agent_returns_403() -> None:
@@ -299,6 +330,7 @@ async def test_llm_generate_with_config_returns_200() -> None:
         "model": "claude-opus-4-8",
         "api_key_ciphertext": ciphertext,
         "base_url": None,
+        "api_version": None,
     }
     db = _StubDatabase(config_row=config_row)
     app = _build_app(db=db)
@@ -356,6 +388,7 @@ async def test_llm_generate_openai_with_base_url_returns_200() -> None:
         "model": "gpt-4o",
         "api_key_ciphertext": ciphertext,
         "base_url": "https://opencode.ai/zen/v1",
+        "api_version": None,
     }
     db = _StubDatabase(config_row=config_row)
     app = _build_app(db=db)
@@ -387,6 +420,7 @@ async def test_llm_embed_with_config_returns_200() -> None:
         "model": "text-embedding-3-small",
         "api_key_ciphertext": ciphertext,
         "base_url": None,
+        "api_version": None,
     }
     db = _StubDatabase(config_row=config_row)
     app = _build_app(db=db)
@@ -462,6 +496,7 @@ async def test_llm_classify_with_config_returns_200() -> None:
         "model": "gpt-4o",
         "api_key_ciphertext": ciphertext,
         "base_url": None,
+        "api_version": None,
     }
     db = _StubDatabase(config_row=config_row)
     app = _build_app(db=db)
@@ -535,6 +570,7 @@ async def test_llm_stream_with_config_returns_200() -> None:
         "model": "gpt-4o",
         "api_key_ciphertext": ciphertext,
         "base_url": None,
+        "api_version": None,
     }
     db = _StubDatabase(config_row=config_row)
     app = _build_app(db=db)

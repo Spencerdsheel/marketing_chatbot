@@ -32,6 +32,7 @@ class LLMConfigRequest(BaseModel):
     model: str
     api_key: str
     base_url: str | None = None
+    api_version: str | None = None
 
 
 class GenerateRequest(BaseModel):
@@ -77,6 +78,7 @@ async def set_llm_config(
         model=body.model,
         api_key=body.api_key,
         base_url=body.base_url,
+        api_version=body.api_version,
     )
     _log.info(
         "LLM config updated",

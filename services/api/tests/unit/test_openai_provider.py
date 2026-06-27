@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from openai import APIError
@@ -589,3 +589,24 @@ async def test_stream_error_logs_warning_without_api_key(caplog: pytest.LogCaptu
 
     assert any("stream" in record.message for record in caplog.records)
     assert all(sentinel_key not in record.message for record in caplog.records)
+
+
+# -- SDK construction: max_retries + timeout -----------------------------------
+
+
+async def test_openai_forwards_max_retries_and_timeout() -> None:
+    """When no client= is injected, AsyncOpenAI is built with max_retries + timeout."""
+    with patch("openai.AsyncOpenAI") as MockOpenAI:
+        MockOpenAI.return_value = MagicMock()
+        OpenAICompatibleProvider(
+            api_key="sk-test-key",
+            base_url="https://example.com/v1",
+            max_retries=5,
+            timeout=45.0,
+        )
+        MockOpenAI.assert_called_once_with(
+            api_key="sk-test-key",
+            base_url="https://example.com/v1",
+            max_retries=5,
+            timeout=45.0,
+        )
