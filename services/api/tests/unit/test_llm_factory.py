@@ -1,12 +1,13 @@
 """Unit tests for the LLM provider factory.
 
 Covers:
-- openai config (with base_url) → OpenAICompatibleProvider with base_url threaded.
-- anthropic config → AnthropicProvider.
-- azure config (with base_url + api_version) → AzureOpenAIProvider.
+- openai config (with base_url) → MeteredProvider wrapping OpenAICompatibleProvider.
+- anthropic config → MeteredProvider wrapping AnthropicProvider.
+- azure config (with base_url + api_version) → MeteredProvider wrapping AzureOpenAIProvider.
 - azure missing api_version → LLMError.
 - azure missing base_url → LLMError.
 - factory threads max_retries and timeout from settings into provider constructors.
+- factory returns MeteredProvider for all valid configs.
 """
 from __future__ import annotations
 
@@ -18,12 +19,19 @@ from api.llm.anthropic_provider import AnthropicProvider
 from api.llm.azure_provider import AzureOpenAIProvider
 from api.llm.config_repository import LLMConfig
 from api.llm.factory import provider_for
+from api.llm.metered_provider import MeteredProvider
 from api.llm.openai_provider import OpenAICompatibleProvider
 from api.llm.provider import LLMError
 
 
-def test_openai_config_yields_openai_provider() -> None:
-    """provider='openai' with base_url → OpenAICompatibleProvider."""
+def _mock_settings() -> object:
+    """Return a mock settings object with default resilience values."""
+    m: object = object()
+    return m
+
+
+def test_openai_config_yields_metered_openai_provider() -> None:
+    """provider='openai' → MeteredProvider wrapping OpenAICompatibleProvider."""
     config = LLMConfig(
         provider="openai",
         model="gpt-4o",
@@ -34,11 +42,12 @@ def test_openai_config_yields_openai_provider() -> None:
         mock_settings.return_value.llm_max_retries = 2
         mock_settings.return_value.llm_timeout_seconds = 30.0
         provider = provider_for(config)
-    assert isinstance(provider, OpenAICompatibleProvider)
+    assert isinstance(provider, MeteredProvider)
+    assert isinstance(provider._delegate, OpenAICompatibleProvider)
 
 
 def test_openai_config_without_base_url() -> None:
-    """provider='openai' without base_url → OpenAICompatibleProvider (None base_url)."""
+    """provider='openai' without base_url → MeteredProvider (None base_url)."""
     config = LLMConfig(
         provider="openai",
         model="gpt-4o",
@@ -48,11 +57,12 @@ def test_openai_config_without_base_url() -> None:
         mock_settings.return_value.llm_max_retries = 2
         mock_settings.return_value.llm_timeout_seconds = 30.0
         provider = provider_for(config)
-    assert isinstance(provider, OpenAICompatibleProvider)
+    assert isinstance(provider, MeteredProvider)
+    assert isinstance(provider._delegate, OpenAICompatibleProvider)
 
 
-def test_anthropic_config_yields_anthropic_provider() -> None:
-    """provider='anthropic' → AnthropicProvider."""
+def test_anthropic_config_yields_metered_anthropic_provider() -> None:
+    """provider='anthropic' → MeteredProvider wrapping AnthropicProvider."""
     config = LLMConfig(
         provider="anthropic",
         model="claude-opus-4-8",
@@ -62,11 +72,12 @@ def test_anthropic_config_yields_anthropic_provider() -> None:
         mock_settings.return_value.llm_max_retries = 2
         mock_settings.return_value.llm_timeout_seconds = 30.0
         provider = provider_for(config)
-    assert isinstance(provider, AnthropicProvider)
+    assert isinstance(provider, MeteredProvider)
+    assert isinstance(provider._delegate, AnthropicProvider)
 
 
-def test_azure_config_yields_azure_provider() -> None:
-    """provider='azure' with base_url + api_version → AzureOpenAIProvider."""
+def test_azure_config_yields_metered_azure_provider() -> None:
+    """provider='azure' → MeteredProvider wrapping AzureOpenAIProvider."""
     config = LLMConfig(
         provider="azure",
         model="my-deployment",
@@ -78,7 +89,8 @@ def test_azure_config_yields_azure_provider() -> None:
         mock_settings.return_value.llm_max_retries = 2
         mock_settings.return_value.llm_timeout_seconds = 30.0
         provider = provider_for(config)
-    assert isinstance(provider, AzureOpenAIProvider)
+    assert isinstance(provider, MeteredProvider)
+    assert isinstance(provider._delegate, AzureOpenAIProvider)
 
 
 def test_azure_missing_api_version_raises() -> None:
@@ -103,6 +115,23 @@ def test_azure_missing_base_url_raises() -> None:
     )
     with pytest.raises(LLMError):
         provider_for(config)
+
+
+def test_factory_returns_metered_provider() -> None:
+    """Any valid config → MeteredProvider."""
+    for provider_name, config in [
+        ("openai", LLMConfig(provider="openai", model="gpt-4o", api_key="sk-key")),
+        ("anthropic", LLMConfig(provider="anthropic", model="claude-opus-4-8", api_key="sk-key")),
+        ("azure", LLMConfig(
+            provider="azure", model="dep", api_key="sk-key",
+            base_url="https://x.openai.azure.com", api_version="2024-02-01",
+        )),
+    ]:
+        with patch("api.llm.factory.get_api_settings") as mock_settings:
+            mock_settings.return_value.llm_max_retries = 2
+            mock_settings.return_value.llm_timeout_seconds = 30.0
+            provider = provider_for(config)
+        assert isinstance(provider, MeteredProvider), f"Failed for {provider_name}"
 
 
 def test_factory_threads_retries_and_timeout_to_openai() -> None:
