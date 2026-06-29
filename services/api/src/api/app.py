@@ -4,6 +4,7 @@ Boot via ``uvicorn api.app:create_app --factory``.
 """
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -24,12 +25,26 @@ from api.config import get_api_settings
 _log = get_logger(__name__)
 
 
+async def _init_db_connection(conn: Any) -> None:
+    """Register a jsonb codec so Python dict/list round-trips to/from jsonb columns."""
+    await conn.set_type_codec(
+        "jsonb",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Connect DB and optional Redis on startup; close on shutdown."""
     settings = get_api_settings()
 
-    db = await Database.connect(settings.database_url, statement_cache_size=0)
+    db = await Database.connect(
+        settings.database_url,
+        statement_cache_size=0,
+        init=_init_db_connection,
+    )
     app.state.db = db
 
     redis_client: Any = None
@@ -142,12 +157,14 @@ def create_app() -> FastAPI:
 
     # -- Routers ---------------------------------------------------------------
     from api.auth.routes import router as auth_router
+    from api.conversation_store.routes import router as conversation_router
     from api.gateway.routes import router as gateway_router
     from api.llm.routes import router as llm_router
     from api.rbac.routes import router as rbac_router
     from api.tenants.routes import router as tenants_router
 
     app.include_router(auth_router)
+    app.include_router(conversation_router)
     app.include_router(gateway_router)
     app.include_router(llm_router)
     app.include_router(rbac_router)
