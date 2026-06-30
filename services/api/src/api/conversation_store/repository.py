@@ -134,7 +134,7 @@ async def append_message(
         "(message_id, tenant_id, conversation_id, role, content, "
         " intent, confidence, tokens) "
         "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
-        "ON CONFLICT (message_id) DO NOTHING",
+        "ON CONFLICT (tenant_id, conversation_id, message_id) DO NOTHING",
         message_id,
         claims.tenant_id,
         conversation_id,
@@ -213,3 +213,119 @@ async def get_messages(
         )
         for r in rows
     ]
+
+
+def _estimate_tokens(content: str) -> int:
+    """Estimate token count from content length (~4 chars/token).
+
+    Returns at least 1 so empty content still counts.
+    """
+    return max(1, len(content) // 4)
+
+
+async def get_window(
+    db: Database,
+    claims: AuthClaims,
+    conversation_id: str,
+    *,
+    limit: int | None = None,
+    token_budget: int | None = None,
+) -> list[Message]:
+    """Fetch the most recent messages within a count or token budget.
+
+    Exactly one of ``limit`` or ``token_budget`` must be provided and ≥1.
+    Returns messages in chronological order (oldest→newest).
+
+    Token accounting uses the stored ``tokens`` column when present, else
+    estimates via ``max(1, len(content) // 4)``.
+    """
+    # Validate exactly-one-mode + positivity
+    if (limit is None and token_budget is None) or (limit is not None and token_budget is not None):
+        raise ValidationError(
+            "Provide exactly one of limit or token_budget.",
+            code="INVALID_WINDOW_ARGS",
+        )
+    if limit is not None and limit < 1:
+        raise ValidationError(
+            "limit must be ≥ 1.",
+            code="INVALID_WINDOW_ARGS",
+        )
+    if token_budget is not None and token_budget < 1:
+        raise ValidationError(
+            "token_budget must be ≥ 1.",
+            code="INVALID_WINDOW_ARGS",
+        )
+
+    _reject_global(claims)
+    await _verify_conversation_visible(db, claims, conversation_id)
+
+    # Build SQL positionally — NEVER a hardcoded index.
+    params: list[Any] = [claims.tenant_id, conversation_id]
+    where = "WHERE tenant_id = $1 AND conversation_id = $2"
+    if claims.role == Role.VISITOR:
+        params.append(claims.subject)
+        where += f" AND visitor_id = ${len(params)}"
+
+    base = (
+        "SELECT message_id, role, content, intent, confidence, tokens, "
+        "created_at "
+        "FROM messages " + where + " "
+        "ORDER BY created_at DESC, message_id DESC"
+    )
+
+    if limit is not None:
+        params.append(limit)
+        sql = base + f" LIMIT ${len(params)}"
+        rows = await db.fetch(sql, *params)
+        msgs = [
+            Message(
+                message_id=str(r["message_id"]),
+                role=str(r["role"]),
+                content=str(r["content"]),
+                intent=r["intent"],
+                confidence=r["confidence"],
+                tokens=r["tokens"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+        msgs.reverse()
+        return msgs
+
+    # token_budget mode: fetch with a safety cap, then trim in Python.
+    assert token_budget is not None  # noqa: S101 — validated above; type narrowing
+    _SAFETY_CAP = 500
+    params.append(_SAFETY_CAP)
+    sql = base + f" LIMIT ${len(params)}"
+    rows = await db.fetch(sql, *params)
+
+    msgs = [
+        Message(
+            message_id=str(r["message_id"]),
+            role=str(r["role"]),
+            content=str(r["content"]),
+            intent=r["intent"],
+            confidence=r["confidence"],
+            tokens=r["tokens"],
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+
+    # Walk newest→oldest (already in that order), accumulate tokens.
+    kept: list[Message] = []
+    running = 0
+    for m in msgs:
+        tok = m.tokens if m.tokens is not None else _estimate_tokens(m.content)
+        if running + tok <= token_budget:
+            running += tok
+            kept.append(m)
+        elif not kept:
+            # ≥1 rule: always include the most recent message.
+            kept.append(m)
+            break
+        else:
+            break
+
+    kept.reverse()
+    return kept

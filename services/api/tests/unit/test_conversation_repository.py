@@ -23,6 +23,7 @@ from api.conversation_store.repository import (
     create_conversation,
     get_conversation,
     get_messages,
+    get_window,
 )
 
 
@@ -272,7 +273,9 @@ async def test_append_message_inserts_with_tenant_id() -> None:
 
 
 async def test_append_message_idempotent_with_supplied_id() -> None:
-    """append_message with message_id: INSERT contains ON CONFLICT (message_id) DO NOTHING."""
+    """append_message with message_id: INSERT contains the composite ON CONFLICT
+    target (tenant_id, conversation_id, message_id) DO NOTHING, scoping
+    idempotency to the conversation (not globally across tenants/conversations)."""
     conv_row = {
         "conversation_id": "conv-1",
         "status": "active",
@@ -290,8 +293,7 @@ async def test_append_message_idempotent_with_supplied_id() -> None:
     )
 
     assert msg_id == "m-1"
-    assert "ON CONFLICT" in db.last_sql.upper()
-    assert "message_id" in db.last_sql
+    assert "ON CONFLICT (tenant_id, conversation_id, message_id) DO NOTHING" in db.last_sql
 
 
 async def test_append_message_not_visible_raises_not_found() -> None:
@@ -363,3 +365,165 @@ async def test_platform_admin_rejected_on_append() -> None:
 
     with pytest.raises(ValidationError):
         await append_message(db, claims, "conv-1", role="user", content="Hello")
+
+
+# -- get_window ----------------------------------------------------------------
+
+
+def _msg_row(message_id: str, role: str, content: str, tokens: int | None, ts: datetime) -> dict[str, Any]:
+    return {
+        "message_id": message_id,
+        "role": role,
+        "content": content,
+        "intent": None,
+        "confidence": None,
+        "tokens": tokens,
+        "created_at": ts,
+    }
+
+
+async def test_get_window_limit_returns_last_n_chronological() -> None:
+    """get_window(limit=3) returns 3 messages oldest→newest."""
+    now = datetime.now(UTC)
+    rows = [
+        _msg_row("m5", "user", "five", None, now),
+        _msg_row("m4", "bot", "four", None, now),
+        _msg_row("m3", "user", "three", None, now),
+    ]
+    db = _RecordingDatabase(rows=rows)
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    msgs = await get_window(db, claims, "conv-1", limit=3)
+
+    assert len(msgs) == 3
+    # Reversed from newest-first → oldest→newest
+    assert msgs[0].content == "three"
+    assert msgs[1].content == "four"
+    assert msgs[2].content == "five"
+    # Assert ORDER BY ... DESC ... LIMIT $3
+    assert "ORDER BY created_at DESC, message_id DESC" in db.last_sql
+    assert "LIMIT $3" in db.last_sql
+
+
+async def test_get_window_visitor_param_numbering() -> None:
+    """VISITOR get_window(limit=2): visitor_id = $3 AND LIMIT $4."""
+    now = datetime.now(UTC)
+    rows = [
+        _msg_row("m2", "bot", "two", None, now),
+        _msg_row("m1", "user", "one", None, now),
+    ]
+    db = _RecordingDatabase(rows=rows)
+    claims = _claims("tenant-a", Role.VISITOR, subject="visitor-xyz")
+
+    msgs = await get_window(db, claims, "conv-1", limit=2)
+
+    assert len(msgs) == 2
+    assert "visitor_id = $3" in db.last_sql
+    assert "LIMIT $4" in db.last_sql
+    assert db.last_params == ("tenant-a", "conv-1", "visitor-xyz", 2)
+
+
+async def test_get_window_token_budget_with_stored_tokens() -> None:
+    """token_budget includes messages that fit, newest-first, ≥1 always."""
+    now = datetime.now(UTC)
+    # newest first: m5(20tok), m4(15tok), m3(10tok), m2(5tok), m1(3tok)
+    rows = [
+        _msg_row("m5", "user", "five", 20, now),
+        _msg_row("m4", "bot", "four", 15, now),
+        _msg_row("m3", "user", "three", 10, now),
+        _msg_row("m2", "bot", "two", 5, now),
+        _msg_row("m1", "user", "one", 3, now),
+    ]
+    db = _RecordingDatabase(rows=rows)
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    # Budget 18: m5(20) exceeds alone → return just m5 (≥1 rule)
+    msgs = await get_window(db, claims, "conv-1", token_budget=18)
+    assert len(msgs) == 1
+    assert msgs[0].message_id == "m5"
+
+    # Budget 30: m5(20)+m4(15)=35 > 30, so just m5
+    msgs = await get_window(db, claims, "conv-1", token_budget=30)
+    assert len(msgs) == 1
+    assert msgs[0].message_id == "m5"
+
+    # Budget 35: m5(20)+m4(15)=35 fits → return [m4, m5] chronological
+    msgs = await get_window(db, claims, "conv-1", token_budget=35)
+    assert len(msgs) == 2
+    assert msgs[0].message_id == "m4"
+    assert msgs[1].message_id == "m5"
+
+
+async def test_get_window_token_budget_null_tokens_estimate() -> None:
+    """token_budget with tokens=None uses len(content)//4 estimate."""
+    now = datetime.now(UTC)
+    # "hello world" = 11 chars → 11//4 = 2 tokens
+    # "short" = 5 chars → 5//4 = 1 token
+    rows = [
+        _msg_row("m2", "user", "hello world", None, now),  # est 2
+        _msg_row("m1", "bot", "short", None, now),  # est 1
+    ]
+    db = _RecordingDatabase(rows=rows)
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    # Budget 1: m2(est 2) exceeds → return just m2 (≥1 rule)
+    msgs = await get_window(db, claims, "conv-1", token_budget=1)
+    assert len(msgs) == 1
+    assert msgs[0].message_id == "m2"
+
+    # Budget 3: m2(2)+m1(1)=3 fits → return [m1, m2] chronological
+    msgs = await get_window(db, claims, "conv-1", token_budget=3)
+    assert len(msgs) == 2
+    assert msgs[0].message_id == "m1"
+    assert msgs[1].message_id == "m2"
+
+
+async def test_get_window_exactly_one_mode_validation() -> None:
+    """Neither or both → ValidationError INVALID_WINDOW_ARGS."""
+    db = _RecordingDatabase()
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    with pytest.raises(ValidationError) as exc_info:
+        await get_window(db, claims, "conv-1")
+    assert exc_info.value.code == "INVALID_WINDOW_ARGS"
+
+    with pytest.raises(ValidationError) as exc_info:
+        await get_window(db, claims, "conv-1", limit=2, token_budget=10)
+    assert exc_info.value.code == "INVALID_WINDOW_ARGS"
+
+
+async def test_get_window_invalid_limit_or_budget() -> None:
+    """limit=0 or negative → ValidationError."""
+    db = _RecordingDatabase()
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    with pytest.raises(ValidationError) as exc_info:
+        await get_window(db, claims, "conv-1", limit=0)
+    assert exc_info.value.code == "INVALID_WINDOW_ARGS"
+
+    with pytest.raises(ValidationError) as exc_info:
+        await get_window(db, claims, "conv-1", limit=-1)
+    assert exc_info.value.code == "INVALID_WINDOW_ARGS"
+
+    with pytest.raises(ValidationError) as exc_info:
+        await get_window(db, claims, "conv-1", token_budget=0)
+    assert exc_info.value.code == "INVALID_WINDOW_ARGS"
+
+
+async def test_get_window_not_visible_raises_not_found() -> None:
+    """get_window: if conversation not visible → NotFoundError."""
+    db = _RecordingDatabase(rows=[])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    with pytest.raises(NotFoundError) as exc_info:
+        await get_window(db, claims, "conv-other", limit=5)
+    assert exc_info.value.code == "CONVERSATION_NOT_FOUND"
+
+
+async def test_get_window_global_caller_rejected() -> None:
+    """PLATFORM_ADMIN → ValidationError on get_window."""
+    db = _RecordingDatabase()
+    claims = _claims(None, Role.PLATFORM_ADMIN)
+
+    with pytest.raises(ValidationError):
+        await get_window(db, claims, "conv-1", limit=5)

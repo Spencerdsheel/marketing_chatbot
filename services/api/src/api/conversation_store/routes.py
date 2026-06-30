@@ -10,7 +10,7 @@ from datetime import datetime
 
 from common.auth import AuthClaims, Role
 from common.logging import get_logger
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
 
 from api.auth.dependencies import require_roles
@@ -19,6 +19,7 @@ from api.conversation_store.repository import (
     create_conversation,
     get_conversation,
     get_messages,
+    get_window,
 )
 
 _log = get_logger(__name__)
@@ -41,7 +42,7 @@ class AppendMessageRequest(BaseModel):
     message_id: str | None = None
 
 
-@router.post("/")
+@router.post("")
 async def create_conv(
     body: CreateConversationRequest,
     request: Request,
@@ -133,5 +134,43 @@ async def get_conv(
                 "created_at": _iso(m.created_at),
             }
             for m in messages
+        ],
+    }
+
+
+@router.get("/{conversation_id}/window")
+async def get_conv_window(
+    conversation_id: str,
+    request: Request,
+    limit: int | None = Query(default=None),
+    token_budget: int | None = Query(default=None),
+    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN)),  # noqa: B008
+) -> dict[str, object]:
+    """Fetch a windowed slice of conversation history.
+
+    Provide exactly one of ``limit`` (last-N) or ``token_budget``.
+    Returns 404 ``CONVERSATION_NOT_FOUND`` if absent or not visible.
+    Response does NOT include ``tenant_id``.
+    """
+    db = request.app.state.db
+
+    msgs = await get_window(
+        db, claims, conversation_id, limit=limit, token_budget=token_budget,
+    )
+
+    return {
+        "conversation_id": conversation_id,
+        "count": len(msgs),
+        "messages": [
+            {
+                "message_id": m.message_id,
+                "role": m.role,
+                "content": m.content,
+                "intent": m.intent,
+                "confidence": m.confidence,
+                "tokens": m.tokens,
+                "created_at": _iso(m.created_at),
+            }
+            for m in msgs
         ],
     }

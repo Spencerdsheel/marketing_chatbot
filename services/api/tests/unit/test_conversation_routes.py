@@ -156,7 +156,7 @@ async def test_create_conversation_returns_200() -> None:
     token = _mint_cookie(role=Role.CLIENT_ADMIN)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         resp = await c.post(
-            "/debug/conversations/",
+            "/debug/conversations",
             json={"channel": "widget"},
             cookies={"access_token": token},
         )
@@ -172,7 +172,7 @@ async def test_create_conversation_client_agent_returns_403() -> None:
     token = _mint_cookie(role=Role.CLIENT_AGENT)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         resp = await c.post(
-            "/debug/conversations/",
+            "/debug/conversations",
             json={"channel": "widget"},
             cookies={"access_token": token},
         )
@@ -184,7 +184,7 @@ async def test_create_conversation_no_cookie_returns_401() -> None:
     app = _build_app()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         resp = await c.post(
-            "/debug/conversations/",
+            "/debug/conversations",
             json={"channel": "widget"},
         )
     assert resp.status_code == 401
@@ -295,3 +295,146 @@ async def test_get_conversation_not_found_returns_404() -> None:
         )
     assert resp.status_code == 404
     assert resp.json()["error_code"] == "CONVERSATION_NOT_FOUND"
+
+
+async def test_create_no_trailing_slash_returns_200() -> None:
+    """POST /debug/conversations (no trailing slash) → 200, not 307."""
+    db = _StubDatabase()
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/conversations",
+            json={"channel": "widget"},
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "conversation_id" in body
+    assert body["status"] == "active"
+
+
+# ==============================================================================
+# GET /debug/conversations/{id}/window
+# ==============================================================================
+
+
+async def test_window_by_limit_returns_200() -> None:
+    """GET /{id}/window?limit=2 → 200 {conversation_id, count, messages}."""
+    now = datetime.now(UTC).isoformat()
+    conv_row = {
+        "conversation_id": "conv-1",
+        "status": "active",
+        "channel": "widget",
+        "visitor_id": None,
+        "started_at": now,
+        "ended_at": None,
+        "metadata": {},
+    }
+    message_rows = [
+        {
+            "message_id": "msg-2",
+            "role": "bot",
+            "content": "Hello back",
+            "intent": None,
+            "confidence": None,
+            "tokens": None,
+            "created_at": now,
+        },
+        {
+            "message_id": "msg-1",
+            "role": "user",
+            "content": "Hello",
+            "intent": None,
+            "confidence": None,
+            "tokens": None,
+            "created_at": now,
+        },
+    ]
+    db = _StubDatabase(conv_row=conv_row, message_rows=message_rows)
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.get(
+            "/debug/conversations/conv-1/window?limit=2",
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["conversation_id"] == "conv-1"
+    assert body["count"] == 2
+    assert len(body["messages"]) == 2
+    assert "tenant_id" not in body
+
+
+async def test_window_by_token_budget_returns_200() -> None:
+    """GET /{id}/window?token_budget=50 → 200."""
+    now = datetime.now(UTC).isoformat()
+    conv_row = {
+        "conversation_id": "conv-1",
+        "status": "active",
+        "channel": "widget",
+        "visitor_id": None,
+        "started_at": now,
+        "ended_at": None,
+        "metadata": {},
+    }
+    message_rows = [
+        {
+            "message_id": "msg-1",
+            "role": "user",
+            "content": "Hello",
+            "intent": None,
+            "confidence": None,
+            "tokens": 5,
+            "created_at": now,
+        },
+    ]
+    db = _StubDatabase(conv_row=conv_row, message_rows=message_rows)
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.get(
+            "/debug/conversations/conv-1/window?token_budget=50",
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count"] >= 1
+
+
+async def test_window_neither_param_returns_422() -> None:
+    """GET /{id}/window with neither limit nor token_budget → 422 INVALID_WINDOW_ARGS."""
+    conv_row = {"conversation_id": "conv-1", "status": "active"}
+    db = _StubDatabase(conv_row=conv_row)
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.get(
+            "/debug/conversations/conv-1/window",
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 422
+    assert resp.json()["error_code"] == "INVALID_WINDOW_ARGS"
+
+
+async def test_window_client_agent_returns_403() -> None:
+    """CLIENT_AGENT → 403 on window."""
+    app = _build_app()
+    token = _mint_cookie(role=Role.CLIENT_AGENT)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.get(
+            "/debug/conversations/conv-1/window?limit=2",
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 403
+
+
+async def test_window_no_cookie_returns_401() -> None:
+    """No cookie → 401."""
+    app = _build_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.get(
+            "/debug/conversations/conv-1/window?limit=2",
+        )
+    assert resp.status_code == 401
