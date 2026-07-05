@@ -9,12 +9,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from common.auth import AuthClaims, Role
 from common.db import Database
 from common.errors import NotFoundError, ValidationError
+
+from api.config import get_api_settings
+from api.llm.provider import ChatMessage
+
+if TYPE_CHECKING:
+    from api.llm.provider import LLMProvider
 
 
 @dataclass(frozen=True)
@@ -26,6 +32,8 @@ class Conversation:
     started_at: datetime
     ended_at: datetime | None
     metadata: dict[str, Any]
+    summary: str | None
+    summary_message_count: int
 
 
 @dataclass(frozen=True)
@@ -161,7 +169,7 @@ async def get_conversation(
     # ruff: noqa: S608
     sql = (
         "SELECT conversation_id, status, channel, visitor_id, "
-        "started_at, ended_at, metadata "
+        "started_at, ended_at, metadata, summary, summary_message_count "
         "FROM conversations "
         "WHERE tenant_id = $1 AND conversation_id = $2" + extra
     )
@@ -177,6 +185,8 @@ async def get_conversation(
         started_at=row["started_at"],
         ended_at=row["ended_at"],
         metadata=row["metadata"] or {},
+        summary=row["summary"],
+        summary_message_count=int(row["summary_message_count"]),
     )
 
 
@@ -329,3 +339,221 @@ async def get_window(
 
     kept.reverse()
     return kept
+
+
+_SUMMARY_SYSTEM_PROMPT = (
+    "You maintain a concise running summary of an ongoing chat for context. "
+    "Combine the existing summary and the new messages into an updated summary "
+    "that preserves key facts, the visitor's questions/intent, and any "
+    "commitments. Reply with only the summary."
+)
+
+
+def _build_summary_prompt(
+    existing_summary: str | None, folded: list[Message],
+) -> list[ChatMessage]:
+    """Build the [system, user] prompt for a summary roll (decision 5)."""
+    lines = [f"{m.role}: {m.content}" for m in folded]
+    user_parts = [
+        f"Existing summary:\n{existing_summary or '(none yet)'}",
+        "New messages to fold in:\n" + "\n".join(lines),
+    ]
+    return [
+        ChatMessage("system", _SUMMARY_SYSTEM_PROMPT),
+        ChatMessage("user", "\n\n".join(user_parts)),
+    ]
+
+
+async def roll_summary(
+    db: Database,
+    claims: AuthClaims,
+    conversation_id: str,
+    *,
+    provider: LLMProvider,
+    model: str,
+    keep_recent: int,
+) -> bool:
+    """Fold older messages into the running summary via the injected provider.
+
+    Folds ``messages[summary_message_count : new_count]`` where
+    ``new_count = max(0, total - keep_recent)``. If that slice is empty, this
+    is a no-op (returns ``False``, provider not called, no UPDATE).
+
+    No silent fallback: if ``provider.generate`` raises, the exception
+    propagates and neither the summary nor the watermark is updated.
+
+    Raises ``ValidationError`` (``INVALID_SUMMARY_ARGS``) if ``keep_recent`` <
+    0, ``ValidationError`` for global callers, and ``NotFoundError`` if the
+    conversation is not visible to the caller.
+    """
+    if keep_recent < 0:
+        raise ValidationError(
+            "keep_recent must be >= 0.",
+            code="INVALID_SUMMARY_ARGS",
+        )
+
+    _reject_global(claims)
+
+    conv = await get_conversation(db, claims, conversation_id)
+    if conv is None:
+        raise NotFoundError(
+            "Conversation not found.",
+            code="CONVERSATION_NOT_FOUND",
+        )
+
+    messages = await get_messages(db, claims, conversation_id)
+    total = len(messages)
+    new_count = max(0, total - keep_recent)
+
+    folded = messages[conv.summary_message_count : new_count]
+    if not folded:
+        return False
+
+    prompt = _build_summary_prompt(conv.summary, folded)
+    settings = get_api_settings()
+    completion = await provider.generate(
+        prompt, model=model, max_tokens=settings.llm_max_tokens,
+    )
+    new_summary = completion.text
+
+    extra, extra_params = _scope_filter(claims)
+    # Parameterized SQL; `extra` is a safe constant clause from _scope_filter.
+    # Build positionally — NEVER a hardcoded index.
+    params: list[Any] = [new_summary, new_count, claims.tenant_id, conversation_id]
+    sql = (
+        "UPDATE conversations SET summary = $1, summary_message_count = $2 "
+        "WHERE tenant_id = $3 AND conversation_id = $4"
+    )
+    if extra:
+        # Re-number the VISITOR clause's placeholder to follow the SET params.
+        sql += f" AND visitor_id = ${len(params) + 1}"
+        params.extend(extra_params)
+
+    await db.execute(sql, *params)
+    return True
+
+
+async def get_working_memory(
+    db: Database,
+    claims: AuthClaims,
+    conversation_id: str,
+    *,
+    keep_recent: int,
+) -> dict[str, Any]:
+    """Return ``{summary, summary_message_count, messages}`` for the conversation.
+
+    ``messages`` is the last ``keep_recent`` chronological messages (reuses
+    ``get_window``). The summary covers older turns; the window covers the
+    recent tail. Raises ``ValidationError`` (``INVALID_SUMMARY_ARGS``) if
+    ``keep_recent`` < 1, ``ValidationError`` for global callers, and
+    ``NotFoundError`` if the conversation is not visible to the caller.
+    """
+    if keep_recent < 1:
+        raise ValidationError(
+            "keep_recent must be >= 1.",
+            code="INVALID_SUMMARY_ARGS",
+        )
+
+    _reject_global(claims)
+
+    conv = await get_conversation(db, claims, conversation_id)
+    if conv is None:
+        raise NotFoundError(
+            "Conversation not found.",
+            code="CONVERSATION_NOT_FOUND",
+        )
+
+    msgs = await get_window(db, claims, conversation_id, limit=keep_recent)
+
+    return {
+        "summary": conv.summary,
+        "summary_message_count": conv.summary_message_count,
+        "messages": msgs,
+    }
+
+
+async def export_conversation(
+    db: Database, claims: AuthClaims, conversation_id: str,
+) -> dict[str, Any]:
+    """Export a full tenant-scoped transcript (data portability).
+
+    Returns the conversation + its messages with ``tenant_id`` stripped.
+    Raises ``NotFoundError`` if not visible.
+    """
+    _reject_global(claims)
+
+    conv = await get_conversation(db, claims, conversation_id)
+    if conv is None:
+        raise NotFoundError(
+            "Conversation not found.",
+            code="CONVERSATION_NOT_FOUND",
+        )
+
+    msgs = await get_messages(db, claims, conversation_id)
+
+    return {
+        "conversation_id": conv.conversation_id,
+        "status": conv.status,
+        "channel": conv.channel,
+        "started_at": conv.started_at,
+        "ended_at": conv.ended_at,
+        "summary": conv.summary,
+        "summary_message_count": conv.summary_message_count,
+        "messages": [
+            {
+                "message_id": m.message_id,
+                "role": m.role,
+                "content": m.content,
+                "intent": m.intent,
+                "confidence": m.confidence,
+                "tokens": m.tokens,
+                "created_at": m.created_at,
+            }
+            for m in msgs
+        ],
+    }
+
+
+async def delete_conversation(
+    db: Database, claims: AuthClaims, conversation_id: str,
+) -> bool:
+    """Delete a conversation (right-to-erasure; messages cascade).
+
+    Verifies visibility BEFORE issuing the DELETE.
+    Raises ``NotFoundError`` if not visible.
+    Returns ``True`` on success.
+    """
+    _reject_global(claims)
+    await _verify_conversation_visible(db, claims, conversation_id)
+
+    # Build positionally — NEVER a hardcoded index.
+    params: list[Any] = [claims.tenant_id, conversation_id]
+    sql = "DELETE FROM conversations WHERE tenant_id = $1 AND conversation_id = $2"
+    if claims.role == Role.VISITOR:
+        params.append(claims.subject)
+        sql += f" AND visitor_id = ${len(params)}"
+
+    await db.execute(sql, *params)
+    return True
+
+
+async def purge_expired(
+    db: Database, claims: AuthClaims, *, before: datetime,
+) -> int:
+    """Purge ended conversations older than ``before``.
+
+    Returns the number of conversations deleted.
+    """
+    _reject_global(claims)
+
+    status = await db.execute(
+        "DELETE FROM conversations "
+        "WHERE tenant_id = $1 AND ended_at IS NOT NULL AND ended_at < $2",
+        claims.tenant_id,
+        before,
+    )
+    # asyncpg returns "DELETE <n>" as the status string.
+    parts = status.split()
+    if len(parts) == 2 and parts[0].upper() == "DELETE":
+        return int(parts[1])
+    return 0

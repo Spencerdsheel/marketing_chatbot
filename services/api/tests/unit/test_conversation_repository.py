@@ -21,10 +21,16 @@ from common.errors import NotFoundError, ValidationError
 from api.conversation_store.repository import (
     append_message,
     create_conversation,
+    delete_conversation,
+    export_conversation,
     get_conversation,
     get_messages,
     get_window,
+    get_working_memory,
+    purge_expired,
+    roll_summary,
 )
+from api.llm.provider import ChatMessage, Completion, LLMError
 
 
 class _RecordingDatabase:
@@ -116,6 +122,8 @@ async def test_get_conversation_filters_by_tenant_id() -> None:
         "started_at": datetime.now(UTC),
         "ended_at": None,
         "metadata": {},
+        "summary": None,
+        "summary_message_count": 0,
     }
     db = _RecordingDatabase(rows=[row])
     claims = _claims("tenant-a", Role.CLIENT_ADMIN)
@@ -138,6 +146,8 @@ async def test_get_conversation_visitor_scopes_by_visitor_id() -> None:
         "started_at": datetime.now(UTC),
         "ended_at": None,
         "metadata": {},
+        "summary": None,
+        "summary_message_count": 0,
     }
     db = _RecordingDatabase(rows=[row])
     claims = _claims("tenant-a", Role.VISITOR, subject="visitor-xyz")
@@ -159,6 +169,8 @@ async def test_get_conversation_client_admin_does_not_scope_visitor_id() -> None
         "started_at": datetime.now(UTC),
         "ended_at": None,
         "metadata": {},
+        "summary": None,
+        "summary_message_count": 0,
     }
     db = _RecordingDatabase(rows=[row])
     claims = _claims("tenant-a", Role.CLIENT_ADMIN)
@@ -222,6 +234,8 @@ async def test_get_messages_visitor_scopes_by_visitor_id() -> None:
         "started_at": datetime.now(UTC),
         "ended_at": None,
         "metadata": {},
+        "summary": None,
+        "summary_message_count": 0,
     }
     db = _RecordingDatabase(rows=[conv_row])
     claims = _claims("tenant-a", Role.VISITOR, subject="visitor-xyz")
@@ -260,6 +274,8 @@ async def test_append_message_inserts_with_tenant_id() -> None:
         "started_at": datetime.now(UTC),
         "ended_at": None,
         "metadata": {},
+        "summary": None,
+        "summary_message_count": 0,
     }
     db = _RecordingDatabase(rows=[conv_row])
     claims = _claims("tenant-a", Role.CLIENT_ADMIN)
@@ -284,6 +300,8 @@ async def test_append_message_idempotent_with_supplied_id() -> None:
         "started_at": datetime.now(UTC),
         "ended_at": None,
         "metadata": {},
+        "summary": None,
+        "summary_message_count": 0,
     }
     db = _RecordingDatabase(rows=[conv_row])
     claims = _claims("tenant-a", Role.CLIENT_ADMIN)
@@ -317,6 +335,8 @@ async def test_append_message_visitor_scopes_by_visitor_id() -> None:
         "started_at": datetime.now(UTC),
         "ended_at": None,
         "metadata": {},
+        "summary": None,
+        "summary_message_count": 0,
     }
     db = _RecordingDatabase(rows=[conv_row])
     claims = _claims("tenant-a", Role.VISITOR, subject="visitor-xyz")
@@ -527,3 +547,463 @@ async def test_get_window_global_caller_rejected() -> None:
 
     with pytest.raises(ValidationError):
         await get_window(db, claims, "conv-1", limit=5)
+
+
+# -- roll_summary / get_working_memory ------------------------------------------
+
+
+class _StubProvider:
+    """Stub LLMProvider.generate -- records the messages it was called with."""
+
+    def __init__(
+        self, *, text: str = "Summary text.", error: LLMError | None = None,
+    ) -> None:
+        self._text = text
+        self._error = error
+        self.calls: list[dict[str, Any]] = []
+
+    async def generate(
+        self, messages: list[ChatMessage], *, model: str, max_tokens: int,
+    ) -> Completion:
+        self.calls.append({"messages": messages, "model": model, "max_tokens": max_tokens})
+        if self._error is not None:
+            raise self._error
+        return Completion(text=self._text, model=model, input_tokens=1, output_tokens=1)
+
+
+class _SequencedDatabase:
+    """Database double that serves canned responses for a sequence of calls.
+
+    ``fetchrow_results`` is consumed in order by successive ``fetchrow`` calls
+    (visibility check, then conversation row, etc). ``fetch_results`` likewise
+    for ``fetch`` calls (e.g. all messages, then the window query).
+    ``execute_status`` can be overridden to return a custom status string.
+    """
+
+    def __init__(
+        self,
+        *,
+        fetchrow_results: list[dict[str, Any] | None] | None = None,
+        fetch_results: list[list[dict[str, Any]]] | None = None,
+        execute_status: str = "UPDATE 1",
+    ) -> None:
+        self._fetchrow_results = list(fetchrow_results or [])
+        self._fetch_results = list(fetch_results or [])
+        self._execute_status = execute_status
+        self.all_sql: list[str] = []
+        self.all_params: list[tuple[Any, ...]] = []
+        self.execute_calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
+        self.all_sql.append(query)
+        self.all_params.append(args)
+        if not self._fetchrow_results:
+            return None
+        return self._fetchrow_results.pop(0)
+
+    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        self.all_sql.append(query)
+        self.all_params.append(args)
+        if not self._fetch_results:
+            return []
+        return self._fetch_results.pop(0)
+
+    async def execute(self, query: str, *args: Any) -> str:
+        self.all_sql.append(query)
+        self.all_params.append(args)
+        self.execute_calls.append((query, args))
+        return self._execute_status
+
+    async def close(self) -> None:
+        pass
+
+
+def _visible_row() -> dict[str, Any]:
+    return {"conversation_id": "conv-1"}
+
+
+def _conv_row(
+    *, summary: str | None = None, summary_message_count: int = 0,
+) -> dict[str, Any]:
+    return {
+        "conversation_id": "conv-1",
+        "status": "active",
+        "channel": "widget",
+        "visitor_id": None,
+        "started_at": datetime.now(UTC),
+        "ended_at": None,
+        "metadata": {},
+        "summary": summary,
+        "summary_message_count": summary_message_count,
+    }
+
+
+def _all_msg_rows(n: int) -> list[dict[str, Any]]:
+    """n chronological messages m1..mn, oldest first."""
+    now = datetime.now(UTC)
+    return [
+        _msg_row(f"m{i}", "user" if i % 2 else "bot", f"content-{i}", None, now)
+        for i in range(1, n + 1)
+    ]
+
+
+async def test_roll_summary_folds_messages_into_prompt_and_updates() -> None:
+    """roll_summary folds messages[summary_message_count : total-keep_recent],
+    calls the provider, and UPDATEs with the returned summary + new watermark.
+    The folded messages' content appears in the prompt passed to the provider."""
+    db = _SequencedDatabase(
+        fetchrow_results=[_conv_row(summary=None, summary_message_count=0), _visible_row()],
+        fetch_results=[_all_msg_rows(6)],
+    )
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+    provider = _StubProvider(text="Rolled summary.")
+
+    rolled = await roll_summary(
+        db, claims, "conv-1", provider=provider, model="claude-opus-4-8", keep_recent=2,
+    )
+
+    assert rolled is True
+    assert len(provider.calls) == 1
+    prompt_messages = provider.calls[0]["messages"]
+    full_prompt = " ".join(m.content for m in prompt_messages)
+    # messages[0:4] = m1..m4 folded (m5, m6 are the kept recent tail)
+    for i in range(1, 5):
+        assert f"content-{i}" in full_prompt
+    for i in range(5, 7):
+        assert f"content-{i}" not in full_prompt
+
+    assert len(db.execute_calls) == 1
+    update_sql, update_params = db.execute_calls[0]
+    assert "UPDATE conversations" in update_sql
+    assert "Rolled summary." in update_params
+    assert 4 in update_params
+    # Guard: conversations table has no updated_at column — must never appear in SET.
+    assert "updated_at" not in update_sql
+
+
+async def test_roll_summary_no_op_when_nothing_new_to_fold() -> None:
+    """total - keep_recent <= summary_message_count → no-op, provider not called,
+    no UPDATE issued."""
+    db = _SequencedDatabase(
+        fetchrow_results=[_conv_row(summary="Old summary.", summary_message_count=4), _visible_row()],
+        fetch_results=[_all_msg_rows(6)],
+    )
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+    provider = _StubProvider()
+
+    rolled = await roll_summary(
+        db, claims, "conv-1", provider=provider, model="claude-opus-4-8", keep_recent=2,
+    )
+
+    assert rolled is False
+    assert provider.calls == []
+    assert db.execute_calls == []
+
+
+async def test_roll_summary_llm_error_propagates_no_update() -> None:
+    """Provider raises LLMError → roll_summary propagates it; no UPDATE issued;
+    watermark/summary untouched (no silent fallback)."""
+    db = _SequencedDatabase(
+        fetchrow_results=[_conv_row(summary=None, summary_message_count=0), _visible_row()],
+        fetch_results=[_all_msg_rows(6)],
+    )
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+    provider = _StubProvider(error=LLMError("upstream failed"))
+
+    with pytest.raises(LLMError):
+        await roll_summary(
+            db, claims, "conv-1", provider=provider, model="claude-opus-4-8", keep_recent=2,
+        )
+
+    assert len(provider.calls) == 1
+    assert db.execute_calls == []
+
+
+async def test_roll_summary_invalid_keep_recent_raises_validation_error() -> None:
+    """keep_recent < 0 → ValidationError INVALID_SUMMARY_ARGS."""
+    db = _SequencedDatabase()
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+    provider = _StubProvider()
+
+    with pytest.raises(ValidationError) as exc_info:
+        await roll_summary(
+            db, claims, "conv-1", provider=provider, model="claude-opus-4-8", keep_recent=-1,
+        )
+    assert exc_info.value.code == "INVALID_SUMMARY_ARGS"
+    assert provider.calls == []
+
+
+async def test_roll_summary_global_caller_rejected() -> None:
+    """PLATFORM_ADMIN → ValidationError on roll_summary."""
+    db = _SequencedDatabase()
+    claims = _claims(None, Role.PLATFORM_ADMIN)
+    provider = _StubProvider()
+
+    with pytest.raises(ValidationError):
+        await roll_summary(
+            db, claims, "conv-1", provider=provider, model="claude-opus-4-8", keep_recent=2,
+        )
+
+
+async def test_roll_summary_not_visible_raises_not_found() -> None:
+    """Conversation not visible → NotFoundError; provider not called."""
+    db = _SequencedDatabase(fetchrow_results=[None])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+    provider = _StubProvider()
+
+    with pytest.raises(NotFoundError) as exc_info:
+        await roll_summary(
+            db, claims, "conv-1", provider=provider, model="claude-opus-4-8", keep_recent=2,
+        )
+    assert exc_info.value.code == "CONVERSATION_NOT_FOUND"
+    assert provider.calls == []
+
+
+async def test_roll_summary_update_does_not_reference_updated_at() -> None:
+    """roll_summary UPDATE must NOT reference updated_at — the conversations table
+    has no such column (only started_at / ended_at). Regression guard for the
+    asyncpg.UndefinedColumnError that was triggered by POST /debug/conversations/{id}/summary.
+    Also asserts that summary=$1, new_count=$2, tenant_id=$3, conversation_id=$4 are bound."""
+    db = _SequencedDatabase(
+        fetchrow_results=[_conv_row(summary=None, summary_message_count=0), _visible_row()],
+        fetch_results=[_all_msg_rows(6)],
+    )
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+    provider = _StubProvider(text="Guard summary.")
+
+    rolled = await roll_summary(
+        db, claims, "conv-1", provider=provider, model="claude-opus-4-8", keep_recent=2,
+    )
+
+    assert rolled is True
+    update_sql, update_params = db.execute_calls[0]
+    # Negative guard: must never reference the non-existent column.
+    assert "updated_at" not in update_sql
+    # Positive guard: key fields are bound in positional order.
+    assert update_params[0] == "Guard summary."  # summary = $1
+    assert update_params[1] == 4                  # summary_message_count = $2 (6 total - 2 kept)
+    assert update_params[2] == "tenant-a"         # tenant_id = $3
+    assert update_params[3] == "conv-1"           # conversation_id = $4
+
+
+async def test_roll_summary_visitor_update_placeholder_numbering() -> None:
+    """VISITOR-scoped UPDATE: placeholders numbered by position, never hardcoded.
+    Expected param order: summary, new_count, tenant_id, conversation_id, visitor_id."""
+    db = _SequencedDatabase(
+        fetchrow_results=[_conv_row(summary=None, summary_message_count=0), _visible_row()],
+        fetch_results=[_all_msg_rows(6)],
+    )
+    claims = _claims("tenant-a", Role.VISITOR, subject="visitor-xyz")
+    provider = _StubProvider(text="Rolled summary.")
+
+    rolled = await roll_summary(
+        db, claims, "conv-1", provider=provider, model="claude-opus-4-8", keep_recent=2,
+    )
+
+    assert rolled is True
+    update_sql, update_params = db.execute_calls[0]
+    assert "visitor_id = $5" in update_sql
+    assert update_params == ("Rolled summary.", 4, "tenant-a", "conv-1", "visitor-xyz")
+
+
+async def test_get_working_memory_returns_summary_and_messages() -> None:
+    """get_working_memory returns {summary, summary_message_count, messages} where
+    messages = get_window(limit=keep_recent) (last keep_recent, chronological)."""
+    db = _SequencedDatabase(
+        fetchrow_results=[
+            _conv_row(summary="Existing summary.", summary_message_count=4),
+            _visible_row(),
+        ],
+        fetch_results=[_all_msg_rows(2)[::-1]],  # newest-first as get_window's SELECT expects
+    )
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    result = await get_working_memory(db, claims, "conv-1", keep_recent=2)
+
+    assert result["summary"] == "Existing summary."
+    assert result["summary_message_count"] == 4
+    assert len(result["messages"]) == 2
+
+
+async def test_get_working_memory_invalid_keep_recent_raises_validation_error() -> None:
+    """keep_recent < 1 → ValidationError INVALID_SUMMARY_ARGS."""
+    db = _SequencedDatabase()
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    with pytest.raises(ValidationError) as exc_info:
+        await get_working_memory(db, claims, "conv-1", keep_recent=0)
+    assert exc_info.value.code == "INVALID_SUMMARY_ARGS"
+
+
+async def test_get_working_memory_not_visible_raises_not_found() -> None:
+    """Conversation not visible → NotFoundError."""
+    db = _SequencedDatabase(fetchrow_results=[None])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    with pytest.raises(NotFoundError):
+        await get_working_memory(db, claims, "conv-1", keep_recent=2)
+
+
+async def test_get_working_memory_global_caller_rejected() -> None:
+    """PLATFORM_ADMIN → ValidationError on get_working_memory."""
+    db = _SequencedDatabase()
+    claims = _claims(None, Role.PLATFORM_ADMIN)
+
+    with pytest.raises(ValidationError):
+        await get_working_memory(db, claims, "conv-1", keep_recent=2)
+
+
+async def test_get_working_memory_visitor_scoped() -> None:
+    """VISITOR caller: visibility check scopes by visitor_id."""
+    db = _SequencedDatabase(
+        fetchrow_results=[
+            _conv_row(summary=None, summary_message_count=0),
+            _visible_row(),
+        ],
+        fetch_results=[[]],
+    )
+    claims = _claims("tenant-a", Role.VISITOR, subject="visitor-xyz")
+
+    result = await get_working_memory(db, claims, "conv-1", keep_recent=2)
+
+    assert result["summary"] is None
+    assert "visitor_id = $3" in db.all_sql[0]
+
+
+# -- export_conversation -------------------------------------------------------
+
+
+async def test_export_conversation_returns_transcript() -> None:
+    """export_conversation returns the transcript with messages + summary, no tenant_id."""
+    db = _SequencedDatabase(
+        fetchrow_results=[
+            _conv_row(summary="Summary.", summary_message_count=2),  # get_conversation
+            _visible_row(),  # get_messages visibility check
+        ],
+        fetch_results=[
+            [
+                _msg_row("m1", "user", "Hello", 5, datetime.now(UTC)),
+                _msg_row("m2", "bot", "Hi there", 3, datetime.now(UTC)),
+            ],
+        ],
+    )
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    transcript = await export_conversation(db, claims, "conv-1")
+
+    assert transcript["conversation_id"] == "conv-1"
+    assert transcript["status"] == "active"
+    assert transcript["summary"] == "Summary."
+    assert len(transcript["messages"]) == 2
+    assert "tenant_id" not in transcript
+
+
+async def test_export_conversation_not_visible_raises_not_found() -> None:
+    """export_conversation: not visible → NotFoundError."""
+    db = _SequencedDatabase(fetchrow_results=[None])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    with pytest.raises(NotFoundError) as exc_info:
+        await export_conversation(db, claims, "conv-other")
+    assert exc_info.value.code == "CONVERSATION_NOT_FOUND"
+
+
+async def test_export_conversation_global_caller_rejected() -> None:
+    """PLATFORM_ADMIN → ValidationError on export_conversation."""
+    db = _SequencedDatabase()
+    claims = _claims(None, Role.PLATFORM_ADMIN)
+
+    with pytest.raises(ValidationError):
+        await export_conversation(db, claims, "conv-1")
+
+
+# -- delete_conversation -------------------------------------------------------
+
+
+async def test_delete_conversation_issues_tenant_scoped_delete() -> None:
+    """delete_conversation: DELETE WHERE tenant_id=$1 AND conversation_id=$2."""
+    db = _SequencedDatabase(
+        fetchrow_results=[_visible_row()],
+    )
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    result = await delete_conversation(db, claims, "conv-1")
+
+    assert result is True
+    # First call is visibility check (fetchrow), second is DELETE (execute)
+    assert "DELETE FROM conversations" in db.all_sql[1]
+    assert "tenant_id = $1" in db.all_sql[1]
+    assert "conversation_id = $2" in db.all_sql[1]
+    assert db.all_params[1] == ("tenant-a", "conv-1")
+
+
+async def test_delete_conversation_visitor_scopes_by_visitor_id() -> None:
+    """delete_conversation: VISITOR adds AND visitor_id = $3."""
+    db = _SequencedDatabase(
+        fetchrow_results=[_visible_row()],
+    )
+    claims = _claims("tenant-a", Role.VISITOR, subject="visitor-xyz")
+
+    await delete_conversation(db, claims, "conv-1")
+
+    assert "visitor_id = $3" in db.all_sql[1]
+    assert db.all_params[1] == ("tenant-a", "conv-1", "visitor-xyz")
+
+
+async def test_delete_conversation_not_visible_raises_not_found() -> None:
+    """delete_conversation: not visible → NotFoundError."""
+    db = _SequencedDatabase(fetchrow_results=[None])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    with pytest.raises(NotFoundError) as exc_info:
+        await delete_conversation(db, claims, "conv-other")
+    assert exc_info.value.code == "CONVERSATION_NOT_FOUND"
+
+
+async def test_delete_conversation_global_caller_rejected() -> None:
+    """PLATFORM_ADMIN → ValidationError on delete_conversation."""
+    db = _SequencedDatabase()
+    claims = _claims(None, Role.PLATFORM_ADMIN)
+
+    with pytest.raises(ValidationError):
+        await delete_conversation(db, claims, "conv-1")
+
+
+# -- purge_expired -------------------------------------------------------------
+
+
+async def test_purge_expired_issues_tenant_scoped_delete() -> None:
+    """purge_expired: DELETE WHERE tenant_id=$1 AND ended_at IS NOT NULL AND ended_at < $2."""
+    db = _SequencedDatabase()
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+    before = datetime(2025, 1, 1, tzinfo=UTC)
+
+    await purge_expired(db, claims, before=before)
+
+    # _SequencedDatabase.execute always returns "UPDATE 1", so count will be 0
+    # but we can still verify the SQL and params are correct.
+    assert "DELETE FROM conversations" in db.all_sql[0]
+    assert "tenant_id = $1" in db.all_sql[0]
+    assert "ended_at IS NOT NULL" in db.all_sql[0]
+    assert "ended_at < $2" in db.all_sql[0]
+    assert db.all_params[0] == ("tenant-a", before)
+
+
+async def test_purge_expired_global_caller_rejected() -> None:
+    """PLATFORM_ADMIN → ValidationError on purge_expired."""
+    db = _SequencedDatabase()
+    claims = _claims(None, Role.PLATFORM_ADMIN)
+
+    with pytest.raises(ValidationError):
+        await purge_expired(db, claims, before=datetime.now(UTC))
+
+
+async def test_purge_expired_parses_delete_count() -> None:
+    """purge_expired parses the "DELETE 3" status string and returns 3."""
+    db = _SequencedDatabase(execute_status="DELETE 3")
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+    before = datetime(2025, 1, 1, tzinfo=UTC)
+
+    count = await purge_expired(db, claims, before=before)
+
+    assert count == 3

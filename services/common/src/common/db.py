@@ -6,6 +6,7 @@ mode) sits in front in deployment; here we manage an asyncpg pool.
 """
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, cast
@@ -16,6 +17,22 @@ if TYPE_CHECKING:
     from asyncpg import Connection, Pool, Record
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+async def _register_jsonb_codec(conn: Any) -> None:
+    """Register a jsonb codec so Python dict/list round-trips to/from jsonb columns.
+
+    Applied to every new asyncpg connection by default so no caller can forget it.
+    This prevents the class of bug where a Celery worker (or any non-API entrypoint)
+    opens a DB connection without the codec and then crashes when writing a dict to a
+    jsonb column.
+    """
+    await conn.set_type_codec(
+        "jsonb",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
 
 
 def safe_identifier(name: str) -> str:
@@ -42,10 +59,19 @@ class Database:
         init: Callable[[Connection[Any]], Awaitable[None]] | None = None,
         statement_cache_size: int | None = None,
     ) -> Database:
+        # Always register the jsonb codec first; compose with any caller-provided init
+        # so that no entrypoint (API, Celery worker, scripts) can forget it.
+        caller_init = init
+
+        async def _composed_init(conn: Connection[Any]) -> None:
+            await _register_jsonb_codec(conn)
+            if caller_init is not None:
+                await caller_init(conn)
+
         kwargs: dict[str, Any] = {
             "min_size": min_size,
             "max_size": max_size,
-            "init": init,
+            "init": _composed_init,
         }
         if statement_cache_size is not None:
             kwargs["statement_cache_size"] = statement_cache_size

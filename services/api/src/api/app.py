@@ -4,7 +4,6 @@ Boot via ``uvicorn api.app:create_app --factory``.
 """
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -20,30 +19,29 @@ from common.ratelimit import build_rate_limiter
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from api.config import get_api_settings
+from api.config import ApiSettings, get_api_settings
 
 _log = get_logger(__name__)
 
 
-async def _init_db_connection(conn: Any) -> None:
-    """Register a jsonb codec so Python dict/list round-trips to/from jsonb columns."""
-    await conn.set_type_codec(
-        "jsonb",
-        encoder=json.dumps,
-        decoder=json.loads,
-        schema="pg_catalog",
-    )
+def _validate_runtime_config(settings: ApiSettings) -> None:
+    """Fail fast on missing conditional infra config (CLAUDE.md §config)."""
+    if settings.storage_backend.lower() == "local" and not settings.storage_local_root:
+        raise RuntimeError(
+            "STORAGE_BACKEND=local requires STORAGE_LOCAL_ROOT to be set. "
+            "Set it in .env (repo root) or the environment. See deploy/.env.example."
+        )
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Connect DB and optional Redis on startup; close on shutdown."""
     settings = get_api_settings()
+    _validate_runtime_config(settings)
 
     db = await Database.connect(
         settings.database_url,
         statement_cache_size=0,
-        init=_init_db_connection,
     )
     app.state.db = db
 
@@ -51,7 +49,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     if settings.redis_url:
         from redis.asyncio import from_url
 
-        redis_client = from_url(settings.redis_url)
+        redis_client = from_url(settings.redis_url)  # type: ignore[no-untyped-call]
         app.state.redis = redis_client
 
     app.state.rate_limiter = build_rate_limiter(redis_client)
@@ -159,15 +157,19 @@ def create_app() -> FastAPI:
     from api.auth.routes import router as auth_router
     from api.conversation_store.routes import router as conversation_router
     from api.gateway.routes import router as gateway_router
+    from api.ingestion.routes import router as ingestion_router
     from api.llm.routes import router as llm_router
     from api.rbac.routes import router as rbac_router
+    from api.tasks.routes import router as tasks_router
     from api.tenants.routes import router as tenants_router
 
     app.include_router(auth_router)
     app.include_router(conversation_router)
     app.include_router(gateway_router)
+    app.include_router(ingestion_router)
     app.include_router(llm_router)
     app.include_router(rbac_router)
+    app.include_router(tasks_router)
     app.include_router(tenants_router)
 
     # -- Routes ----------------------------------------------------------------

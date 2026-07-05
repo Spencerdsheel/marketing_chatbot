@@ -58,6 +58,24 @@ class ApiSettings(Settings):
     # LLM: per-call timeout in seconds (applied by the SDK).
     llm_timeout_seconds: float = 30.0
 
+    # Celery broker + result backend.
+    # Resolution order (per decision 2 in S5.1):
+    #   1. CELERY_BROKER_URL / CELERY_RESULT_BACKEND (explicit overrides)
+    #   2. REDIS_URL (reuses the existing Redis for rate-limit/blacklist)
+    # If neither resolves to a non-None value at startup, celery_app raises (fail-fast).
+    celery_broker_url: str | None = None
+    celery_result_backend: str | None = None
+
+    # Document ingestion / object storage (S5.2).
+    # storage_backend: which driver to use. Currently only "local" is supported;
+    #   S3/GCS drivers slot in here later.
+    # storage_local_root: required when storage_backend="local". If unset the
+    #   LocalStorageProvider raises at construction time (fail-fast, CLAUDE.md §3).
+    # ingestion_max_upload_bytes: maximum accepted upload size (default 10 MiB).
+    storage_backend: str = "local"
+    storage_local_root: str | None = None
+    ingestion_max_upload_bytes: int = 10_485_760
+
 
 @lru_cache(maxsize=1)
 def get_api_settings() -> ApiSettings:

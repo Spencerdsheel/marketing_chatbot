@@ -11,8 +11,9 @@ import contextlib
 import datetime as _dt
 import json
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextvars import ContextVar, Token
+from types import TracebackType
 from typing import Any
 
 # Request-scoped context. None means "not set" → omitted from the log line.
@@ -36,6 +37,46 @@ _ALLOWED_EXTRA = frozenset(
 _RESERVED = frozenset(
     vars(logging.LogRecord("", 0, "", 0, "", (), None)).keys()
 ) | {"message", "asctime", "taskName"}
+
+
+class _SafeLogger(logging.Logger):
+    """Logger subclass that strips reserved/non-allowlisted keys from ``extra``
+    **before** ``makeRecord`` runs, so stdlib's KeyError can never fire.
+
+    Why a Logger subclass rather than a LoggerAdapter:
+    - ``isinstance(get_logger(name), logging.Logger)`` stays True (existing tests
+      rely on this and callers may depend on the type).
+    - ``logging.getLogger(name)`` returns the same instance when called later
+      (the registry owns the object, not us), so caplog-based tests that attach
+      a handler by name work without any extra wiring.
+    - The fix is surgically close to the crash site (makeRecord), not scattered
+      across every adapter wrapper.
+    """
+
+    def makeRecord(
+        self,
+        name: str,
+        level: int,
+        fn: str,
+        lno: int,
+        msg: object,
+        args: tuple[object, ...] | Mapping[str, object],
+        exc_info: tuple[type[BaseException], BaseException, TracebackType | None]
+        | tuple[None, None, None]
+        | None,
+        func: str | None = None,
+        extra: Mapping[str, object] | None = None,
+        sinfo: str | None = None,
+    ) -> logging.LogRecord:
+        # Strip any key that is either reserved (already on LogRecord) or not
+        # in the explicit allowlist.  This is defense-in-depth: the JsonFormatter
+        # allowlist also filters, but filtering here prevents the crash.
+        safe_extra: dict[str, object] | None = (
+            {k: v for k, v in extra.items() if k in _ALLOWED_EXTRA} if extra else None
+        )
+        return super().makeRecord(
+            name, level, fn, lno, msg, args, exc_info, func, safe_extra, sinfo
+        )
 
 
 class JsonFormatter(logging.Formatter):
@@ -63,8 +104,22 @@ class JsonFormatter(logging.Formatter):
 
 
 def get_logger(name: str) -> logging.Logger:
-    """Return a logger that emits JSON to stderr. Idempotent (no duplicate handlers)."""
-    logger = logging.getLogger(name)
+    """Return a ``_SafeLogger`` that emits JSON to stderr. Idempotent.
+
+    Registers ``_SafeLogger`` as the logger class only for the duration of the
+    ``getLogger`` call so we don't globally hijack every logger created by
+    third-party libraries.
+    """
+    prev_class = logging.getLoggerClass()
+    logging.setLoggerClass(_SafeLogger)
+    try:
+        logger = logging.getLogger(name)
+    finally:
+        logging.setLoggerClass(prev_class)
+    # If the logger already existed (e.g. root or previously created) and is not
+    # a _SafeLogger, upgrade it in-place so the extra-sanitisation still applies.
+    if not isinstance(logger, _SafeLogger):
+        logger.__class__ = _SafeLogger
     if not any(getattr(h, "_chatbot_json", False) for h in logger.handlers):
         handler = logging.StreamHandler()
         handler.setFormatter(JsonFormatter())

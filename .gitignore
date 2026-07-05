@@ -221,3 +221,12 @@ __marimo__/
 first_phase_chatbot/
 dev_plan/
 rough.txt
+celerybeat-schedule.bak
+celerybeat-schedule.dat
+celerybeat-schedule.dir
+sample.docx
+sample.png
+sample.txt
+
+# Local dev data (storage root for document ingestion; never commit uploads)
+.devdata/

@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import patch
 
+import pytest
 from common.cache import InMemoryCache
 from common.errors import NotFoundError
 from httpx import ASGITransport, AsyncClient
@@ -207,3 +208,41 @@ async def test_unhandled_exception_returns_500_without_leak() -> None:
     assert body["error_code"] == "INTERNAL_ERROR"
     assert "kaboom" not in body["message"]
     assert "correlation_id" in body
+
+
+# -- _validate_runtime_config --------------------------------------------------
+
+
+def _make_settings(**overrides: object) -> Any:
+    """Return a minimal ApiSettings-like stub for _validate_runtime_config tests."""
+    from unittest.mock import MagicMock
+
+    stub = MagicMock()
+    stub.storage_backend = overrides.get("storage_backend", "local")
+    stub.storage_local_root = overrides.get("storage_local_root", None)
+    return stub
+
+
+def test_validate_runtime_config_raises_when_local_and_root_unset() -> None:
+    """local backend + no STORAGE_LOCAL_ROOT → RuntimeError naming the var."""
+    from api.app import _validate_runtime_config
+
+    stub = _make_settings(storage_backend="local", storage_local_root=None)
+    with pytest.raises(RuntimeError, match="STORAGE_LOCAL_ROOT"):
+        _validate_runtime_config(stub)
+
+
+def test_validate_runtime_config_passes_when_local_and_root_set() -> None:
+    """local backend + root provided → no exception."""
+    from api.app import _validate_runtime_config
+
+    stub = _make_settings(storage_backend="local", storage_local_root="/some/path")
+    _validate_runtime_config(stub)  # must not raise
+
+
+def test_validate_runtime_config_passes_when_backend_not_local() -> None:
+    """Non-local backend without root → no exception (root is not required)."""
+    from api.app import _validate_runtime_config
+
+    stub = _make_settings(storage_backend="s3", storage_local_root=None)
+    _validate_runtime_config(stub)  # must not raise

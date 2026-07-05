@@ -19,6 +19,8 @@ from common.cache import InMemoryCache
 from httpx import ASGITransport, AsyncClient
 
 from api.auth.tokens import create_access_token
+from api.llm.config_repository import LLMConfig
+from api.llm.provider import ChatMessage, Completion, LLMError
 
 # -- Constants -----------------------------------------------------------------
 
@@ -251,6 +253,8 @@ async def test_get_conversation_returns_200_with_messages() -> None:
         "started_at": now,
         "ended_at": None,
         "metadata": {},
+        "summary": None,
+        "summary_message_count": 0,
     }
     message_rows = [
         {
@@ -330,6 +334,8 @@ async def test_window_by_limit_returns_200() -> None:
         "started_at": now,
         "ended_at": None,
         "metadata": {},
+        "summary": None,
+        "summary_message_count": 0,
     }
     message_rows = [
         {
@@ -378,6 +384,8 @@ async def test_window_by_token_budget_returns_200() -> None:
         "started_at": now,
         "ended_at": None,
         "metadata": {},
+        "summary": None,
+        "summary_message_count": 0,
     }
     message_rows = [
         {
@@ -438,3 +446,404 @@ async def test_window_no_cookie_returns_401() -> None:
             "/debug/conversations/conv-1/window?limit=2",
         )
     assert resp.status_code == 401
+
+
+# ==============================================================================
+# POST /debug/conversations/{id}/summary, GET /debug/conversations/{id}/working-memory
+# ==============================================================================
+
+
+class _SequencedStubDatabase:
+    """Database double for the summary/working-memory routes: serves canned
+    fetchrow/fetch results in call order, records UPDATE/execute calls."""
+
+    def __init__(
+        self,
+        *,
+        fetchrow_results: list[dict[str, Any] | None] | None = None,
+        fetch_results: list[list[dict[str, Any]]] | None = None,
+    ) -> None:
+        self._fetchrow_results = list(fetchrow_results or [])
+        self._fetch_results = list(fetch_results or [])
+        self.execute_calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def fetchrow(self, query: str, *args: object) -> dict[str, Any] | None:
+        if not self._fetchrow_results:
+            return None
+        return self._fetchrow_results.pop(0)
+
+    async def fetch(self, query: str, *args: object) -> list[dict[str, Any]]:
+        if not self._fetch_results:
+            return []
+        return self._fetch_results.pop(0)
+
+    async def execute(self, query: str, *args: object) -> str:
+        self.execute_calls.append((query, args))
+        return "UPDATE 1"
+
+    async def close(self) -> None:
+        pass
+
+
+class _StubSummaryProvider:
+    """Stub LLMProvider.generate for the summary route tests."""
+
+    def __init__(self, *, text: str = "Rolled summary.", error: LLMError | None = None) -> None:
+        self._text = text
+        self._error = error
+
+    async def generate(
+        self, messages: list[ChatMessage], *, model: str, max_tokens: int,
+    ) -> Completion:
+        if self._error is not None:
+            raise self._error
+        return Completion(text=self._text, model=model, input_tokens=1, output_tokens=1)
+
+
+def _summary_conv_row(
+    *, summary: str | None = None, summary_message_count: int = 0,
+) -> dict[str, Any]:
+    now = datetime.now(UTC).isoformat()
+    return {
+        "conversation_id": "conv-1",
+        "status": "active",
+        "channel": "widget",
+        "visitor_id": None,
+        "started_at": now,
+        "ended_at": None,
+        "metadata": {},
+        "summary": summary,
+        "summary_message_count": summary_message_count,
+    }
+
+
+def _summary_msg_rows(n: int) -> list[dict[str, Any]]:
+    now = datetime.now(UTC).isoformat()
+    return [
+        {
+            "message_id": f"m{i}",
+            "role": "user" if i % 2 else "bot",
+            "content": f"content-{i}",
+            "intent": None,
+            "confidence": None,
+            "tokens": None,
+            "created_at": now,
+        }
+        for i in range(1, n + 1)
+    ]
+
+
+_STUB_LLM_CONFIG = LLMConfig(
+    provider="anthropic", model="claude-opus-4-8", api_key="sk-test-key",
+)
+
+
+async def test_summary_post_returns_200_rolled() -> None:
+    """POST /{id}/summary with a stub config + patched provider_for → 200 {rolled: true}."""
+    db = _SequencedStubDatabase(
+        fetchrow_results=[
+            _summary_conv_row(summary=None, summary_message_count=0),
+            {"conversation_id": "conv-1"},
+        ],
+        fetch_results=[_summary_msg_rows(6)],
+    )
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+
+    with (
+        patch("api.conversation_store.routes.get_llm_config", return_value=_STUB_LLM_CONFIG),
+        patch(
+            "api.conversation_store.routes.provider_for",
+            return_value=_StubSummaryProvider(text="Rolled summary."),
+        ),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/debug/conversations/conv-1/summary",
+                json={"keep_recent": 2},
+                cookies={"access_token": token},
+            )
+    assert resp.status_code == 200
+    assert resp.json() == {"rolled": True}
+
+
+async def test_summary_post_no_llm_config_returns_422() -> None:
+    """No tenant LLM config → 422 LLM_NOT_CONFIGURED; provider never resolved."""
+    db = _SequencedStubDatabase()
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+
+    with patch("api.conversation_store.routes.get_llm_config", return_value=None):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/debug/conversations/conv-1/summary",
+                json={"keep_recent": 2},
+                cookies={"access_token": token},
+            )
+    assert resp.status_code == 422
+    assert resp.json()["error_code"] == "LLM_NOT_CONFIGURED"
+
+
+async def test_summary_post_provider_error_returns_502_no_summary_written() -> None:
+    """Provider raises LLMError → 502 LLM_ERROR; no UPDATE issued."""
+    db = _SequencedStubDatabase(
+        fetchrow_results=[
+            _summary_conv_row(summary=None, summary_message_count=0),
+            {"conversation_id": "conv-1"},
+        ],
+        fetch_results=[_summary_msg_rows(6)],
+    )
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+
+    with (
+        patch("api.conversation_store.routes.get_llm_config", return_value=_STUB_LLM_CONFIG),
+        patch(
+            "api.conversation_store.routes.provider_for",
+            return_value=_StubSummaryProvider(error=LLMError("upstream failed")),
+        ),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/debug/conversations/conv-1/summary",
+                json={"keep_recent": 2},
+                cookies={"access_token": token},
+            )
+    assert resp.status_code == 502
+    assert resp.json()["error_code"] == "LLM_ERROR"
+    assert db.execute_calls == []
+
+
+async def test_summary_post_client_agent_returns_403() -> None:
+    """CLIENT_AGENT → 403 on summary POST."""
+    app = _build_app()
+    token = _mint_cookie(role=Role.CLIENT_AGENT)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/conversations/conv-1/summary",
+            json={"keep_recent": 2},
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 403
+
+
+async def test_summary_post_no_cookie_returns_401() -> None:
+    """No cookie → 401."""
+    app = _build_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/conversations/conv-1/summary",
+            json={"keep_recent": 2},
+        )
+    assert resp.status_code == 401
+
+
+async def test_working_memory_get_returns_200_no_tenant_id() -> None:
+    """GET /{id}/working-memory?keep_recent=3 → 200 with summary + ≤3 messages,
+    no tenant_id in the response body."""
+    db = _SequencedStubDatabase(
+        fetchrow_results=[
+            _summary_conv_row(summary="Existing summary.", summary_message_count=4),
+            {"conversation_id": "conv-1"},
+        ],
+        fetch_results=[_summary_msg_rows(2)[::-1]],
+    )
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.get(
+            "/debug/conversations/conv-1/working-memory?keep_recent=3",
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["conversation_id"] == "conv-1"
+    assert body["summary"] == "Existing summary."
+    assert body["summary_message_count"] == 4
+    assert len(body["messages"]) <= 3
+    assert "tenant_id" not in body
+
+
+async def test_working_memory_get_client_agent_returns_403() -> None:
+    """CLIENT_AGENT → 403 on working-memory GET."""
+    app = _build_app()
+    token = _mint_cookie(role=Role.CLIENT_AGENT)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.get(
+            "/debug/conversations/conv-1/working-memory?keep_recent=3",
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 403
+
+
+async def test_working_memory_get_no_cookie_returns_401() -> None:
+    """No cookie → 401."""
+    app = _build_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.get(
+            "/debug/conversations/conv-1/working-memory?keep_recent=3",
+        )
+    assert resp.status_code == 401
+
+
+# ==============================================================================
+# GET /debug/conversations/{id}/export
+# ==============================================================================
+
+
+async def test_export_returns_200_transcript_no_tenant_id() -> None:
+    """GET /{id}/export → 200 transcript (no tenant_id)."""
+    now = datetime.now(UTC).isoformat()
+    conv_row = {
+        "conversation_id": "conv-1",
+        "status": "active",
+        "channel": "widget",
+        "visitor_id": None,
+        "started_at": now,
+        "ended_at": None,
+        "metadata": {},
+        "summary": "Summary.",
+        "summary_message_count": 2,
+    }
+    message_rows = [
+        {
+            "message_id": "msg-1",
+            "role": "user",
+            "content": "Hello",
+            "intent": None,
+            "confidence": None,
+            "tokens": None,
+            "created_at": now,
+        },
+    ]
+    db = _StubDatabase(conv_row=conv_row, message_rows=message_rows)
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.get(
+            "/debug/conversations/conv-1/export",
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["conversation_id"] == "conv-1"
+    assert body["summary"] == "Summary."
+    assert len(body["messages"]) == 1
+    assert "tenant_id" not in body
+
+
+async def test_export_not_found_returns_404() -> None:
+    """GET /{id}/export for missing conversation → 404."""
+    db = _StubDatabase(conv_row=None)
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.get(
+            "/debug/conversations/nonexistent/export",
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 404
+    assert resp.json()["error_code"] == "CONVERSATION_NOT_FOUND"
+
+
+# ==============================================================================
+# DELETE /debug/conversations/{id}
+# ==============================================================================
+
+
+async def test_delete_returns_200() -> None:
+    """DELETE /{id} → 200 {"deleted": true}."""
+    db = _StubDatabase(conv_row={"conversation_id": "conv-1", "status": "active"})
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.delete(
+            "/debug/conversations/conv-1",
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {"deleted": True}
+
+
+async def test_delete_not_found_returns_404() -> None:
+    """DELETE /{id} for missing conversation → 404."""
+    db = _StubDatabase(conv_row=None)
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.delete(
+            "/debug/conversations/nonexistent",
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 404
+    assert resp.json()["error_code"] == "CONVERSATION_NOT_FOUND"
+
+
+async def test_delete_client_agent_returns_403() -> None:
+    """CLIENT_AGENT → 403 on DELETE."""
+    app = _build_app()
+    token = _mint_cookie(role=Role.CLIENT_AGENT)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.delete(
+            "/debug/conversations/conv-1",
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 403
+
+
+async def test_delete_no_cookie_returns_401() -> None:
+    """No cookie → 401."""
+    app = _build_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.delete(
+            "/debug/conversations/conv-1",
+        )
+    assert resp.status_code == 401
+
+
+# ==============================================================================
+# POST /debug/conversations/purge
+# ==============================================================================
+
+
+async def test_purge_returns_200() -> None:
+    """POST /purge {before} → 200 {"purged": n}."""
+    db = _StubDatabase()
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/conversations/purge",
+            json={"before": "2025-01-01T00:00:00Z"},
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 200
+    assert "purged" in resp.json()
+
+
+async def test_purge_client_agent_returns_403() -> None:
+    """CLIENT_AGENT → 403 on purge."""
+    app = _build_app()
+    token = _mint_cookie(role=Role.CLIENT_AGENT)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/conversations/purge",
+            json={"before": "2025-01-01T00:00:00Z"},
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 403
+
+
+async def test_purge_invalid_before_returns_422() -> None:
+    """POST /purge with invalid before → 422."""
+    db = _StubDatabase()
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/conversations/purge",
+            json={"before": "not-a-datetime"},
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 422
