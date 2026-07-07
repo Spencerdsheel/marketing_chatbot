@@ -468,3 +468,197 @@ async def test_create_run_global_caller_raises() -> None:
         db = _StubDatabase()
         with pytest.raises(ValidationError):
             await create_run(db, _global_claims(), doc_id="doc1")  # type: ignore[arg-type]
+
+
+# ==============================================================================
+# S5.3: replace_chunks (knowledge_chunks)
+# ==============================================================================
+
+
+class _ChunkRecordingDatabase:
+    """Stub DB that records SQL statements and stores chunks in memory."""
+
+    def __init__(self) -> None:
+        self.executions: list[tuple[str, tuple[Any, ...]]] = []
+        # chunks keyed by (tenant_id, chunk_id)
+        self._chunks: dict[tuple[str, str], dict[str, Any]] = {}
+        # runs keyed by (tenant_id, run_id)
+        self._runs: dict[tuple[str, str], dict[str, Any]] = {}
+
+    async def execute(self, query: str, *args: Any) -> str:
+        self.executions.append((query, args))
+        q = query.strip().upper()
+        if q.startswith("DELETE FROM KNOWLEDGE_CHUNKS"):
+            tenant_id, doc_id = args[0], args[1]
+            to_remove = [
+                k for k, v in self._chunks.items()
+                if k[0] == tenant_id and v.get("doc_id") == doc_id
+            ]
+            for k in to_remove:
+                del self._chunks[k]
+            return f"DELETE {len(to_remove)}"
+        if q.startswith("INSERT INTO KNOWLEDGE_CHUNKS"):
+            tenant_id, doc_id, chunk_id, content, embedding, metadata = args
+            self._chunks[(tenant_id, chunk_id)] = {
+                "tenant_id": tenant_id,
+                "doc_id": doc_id,
+                "chunk_id": chunk_id,
+                "content": content,
+                "embedding": embedding,
+                "metadata": metadata,
+            }
+            return "INSERT 0 1"
+        if q.startswith("UPDATE INGESTION_RUNS"):
+            tenant_id, run_id = str(args[-2]), str(args[-1])
+            key = (tenant_id, run_id)
+            if key not in self._runs:
+                return "UPDATE 0"
+            updated = dict(self._runs[key])
+            updated["status"] = args[0]
+            self._runs[key] = updated
+            return "UPDATE 1"
+        return "OK"
+
+    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
+        return None
+
+    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        return []
+
+    async def fetchval(self, query: str, *args: Any) -> Any:
+        return None
+
+    async def close(self) -> None:
+        pass
+
+
+async def test_replace_chunks_issues_delete_then_inserts() -> None:
+    """replace_chunks issues DELETE then one INSERT per chunk with deterministic chunk_ids."""
+    _reset_modules()
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.ingestion.repository import ChunkRow, replace_chunks
+
+        db = _ChunkRecordingDatabase()
+        claims = _admin_claims("tenant-alpha")
+
+        rows = [
+            ChunkRow(
+                chunk_id="doc1-0000",
+                content="First chunk.",
+                embedding=[0.1, 0.2, 0.3],
+                metadata={"chunk_index": 0, "content_len": 12},
+            ),
+            ChunkRow(
+                chunk_id="doc1-0001",
+                content="Second chunk.",
+                embedding=[0.4, 0.5, 0.6],
+                metadata={"chunk_index": 1, "content_len": 13},
+            ),
+        ]
+        await replace_chunks(db, claims, "doc1", rows)  # type: ignore[arg-type]
+
+    # First execution must be the DELETE scoped to the tenant + doc.
+    stmts = [e[0].strip().upper() for e in db.executions]
+    assert stmts[0].startswith("DELETE FROM KNOWLEDGE_CHUNKS")
+    delete_args = db.executions[0][1]
+    assert delete_args[0] == "tenant-alpha"
+    assert delete_args[1] == "doc1"
+
+    # Then one INSERT per row.
+    inserts = [e for e in db.executions if e[0].strip().upper().startswith("INSERT INTO KNOWLEDGE_CHUNKS")]
+    assert len(inserts) == 2
+
+    # Verify deterministic chunk_ids are passed as the 3rd positional arg.
+    insert_chunk_ids = [e[1][2] for e in inserts]
+    assert insert_chunk_ids == ["doc1-0000", "doc1-0001"]
+
+    # Verify embedding list is passed as the 5th positional arg.
+    assert inserts[0][1][4] == [0.1, 0.2, 0.3]
+    assert inserts[1][1][4] == [0.4, 0.5, 0.6]
+
+
+async def test_replace_chunks_cross_tenant_isolation() -> None:
+    """Tenant A's replace_chunks never touches tenant B's chunks."""
+    _reset_modules()
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.ingestion.repository import ChunkRow, replace_chunks
+
+        db = _ChunkRecordingDatabase()
+        # Pre-seed tenant B's chunk
+        db._chunks[("tenant-beta", "doc1-0000")] = {
+            "tenant_id": "tenant-beta",
+            "doc_id": "doc1",
+            "chunk_id": "doc1-0000",
+            "content": "Beta content.",
+            "embedding": [1.0],
+            "metadata": {},
+        }
+
+        claims_alpha = _admin_claims("tenant-alpha")
+        rows = [
+            ChunkRow(
+                chunk_id="doc1-0000",
+                content="Alpha content.",
+                embedding=[0.1],
+                metadata={"chunk_index": 0, "content_len": 14},
+            )
+        ]
+        await replace_chunks(db, claims_alpha, "doc1", rows)  # type: ignore[arg-type]
+
+    # Tenant beta's chunk must still be present.
+    assert ("tenant-beta", "doc1-0000") in db._chunks, (
+        "tenant beta's chunk was incorrectly deleted by tenant alpha's replace_chunks"
+    )
+    # Tenant alpha's chunk is inserted.
+    assert ("tenant-alpha", "doc1-0000") in db._chunks
+
+
+async def test_replace_chunks_global_caller_raises() -> None:
+    """replace_chunks with PLATFORM_ADMIN claims raises ValidationError."""
+    _reset_modules()
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.ingestion.repository import replace_chunks
+
+        db = _ChunkRecordingDatabase()
+        with pytest.raises(ValidationError):
+            await replace_chunks(db, _global_claims(), "doc1", [])  # type: ignore[arg-type]
+
+
+async def test_update_run_with_chunks_out_binds_value() -> None:
+    """update_run accepts chunks_out and includes it in the SQL params."""
+    _reset_modules()
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.ingestion.repository import update_run
+
+        db = _ChunkRecordingDatabase()
+        # Seed a run so the stub returns UPDATE 1.
+        db._runs[("tenant-alpha", "run-x")] = {
+            "run_id": "run-x",
+            "doc_id": "doc-x",
+            "status": "running",
+            "chars_out": None,
+            "errors": None,
+            "started_at": _NOW,
+            "finished_at": None,
+            "duration_ms": None,
+            "chunks_out": None,
+        }
+        claims = _admin_claims("tenant-alpha")
+        await update_run(  # type: ignore[arg-type]
+            db,
+            claims,
+            "run-x",
+            status="succeeded",
+            chars_out=500,
+            chunks_out=5,
+            duration_ms=200,
+        )
+
+    # Find the UPDATE INGESTION_RUNS execution and check chunks_out appears in args.
+    updates = [
+        e for e in db.executions
+        if e[0].strip().upper().startswith("UPDATE INGESTION_RUNS")
+    ]
+    assert updates, "Expected at least one UPDATE INGESTION_RUNS"
+    all_args = updates[0][1]
+    assert 5 in all_args, f"chunks_out=5 not found in SQL params: {all_args}"

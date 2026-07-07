@@ -613,3 +613,75 @@ async def test_llm_stream_no_cookie_returns_401() -> None:
             json={"prompt": "Say hello"},
         )
     assert resp.status_code == 401
+
+
+# ==============================================================================
+# S5.3: POST /debug/llm/config — embedding_model stored and echoed, api_key not
+# ==============================================================================
+
+
+async def test_llm_config_stores_and_echoes_embedding_model() -> None:
+    """embedding_model is stored (7th param) and echoed in the response."""
+    db = _StubDatabase()
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/llm/config",
+            json={
+                "provider": "openai",
+                "base_url": "http://localhost:11434/v1",
+                "model": "qwen:0.5b",
+                "api_key": "ollama",
+                "embedding_model": "nomic-embed-text",
+            },
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["embedding_model"] == "nomic-embed-text"
+    assert "api_key" not in body
+
+    # 7th SQL param must be embedding_model.
+    assert db.last_params[6] == "nomic-embed-text"
+
+
+async def test_llm_config_without_embedding_model_no_field_in_response() -> None:
+    """When embedding_model is omitted, the response does not echo it (None → absent)."""
+    db = _StubDatabase()
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/llm/config",
+            json={"provider": "anthropic", "model": "claude-opus-4-8", "api_key": "sk-key"},
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    # api_key must never appear.
+    assert "api_key" not in body
+    # embedding_model not sent → not in response.
+    assert "embedding_model" not in body
+
+
+async def test_llm_config_api_key_never_echoed_even_with_embedding_model() -> None:
+    """api_key is never present in the response body regardless of other fields."""
+    db = _StubDatabase()
+    app = _build_app(db=db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/llm/config",
+            json={
+                "provider": "openai",
+                "model": "text-embedding-3-small",
+                "api_key": "sk-very-secret",
+                "embedding_model": "text-embedding-3-small",
+            },
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "api_key" not in body
+    assert "sk-very-secret" not in str(body)

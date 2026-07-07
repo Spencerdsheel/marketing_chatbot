@@ -14,6 +14,12 @@ Data model (migration 0010):
   UNIQUE (tenant_id, content_hash).
 - ``ingestion_runs(tenant_id PK, run_id PK, doc_id, status, chars_out, errors
   jsonb, started_at, finished_at, duration_ms)``.
+
+Data model (migration 0011):
+- ``knowledge_chunks(tenant_id PK, doc_id, chunk_id PK, content, embedding
+  vector(768), metadata jsonb, created_at)`` FK → knowledge_docs ON DELETE CASCADE.
+- ``ingestion_runs.chunks_out integer`` — number of chunks written.
+- ``tenant_llm_configs.embedding_model text`` — per-tenant embedding model.
 """
 from __future__ import annotations
 
@@ -29,6 +35,21 @@ from common.errors import NotFoundError, ValidationError  # noqa: F401
 # ---------------------------------------------------------------------------
 # Domain objects
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ChunkRow:
+    """A single knowledge chunk ready for insertion into ``knowledge_chunks``.
+
+    ``embedding`` is a plain Python ``list[float]`` — the pgvector codec on the
+    asyncpg connection (registered via ``register_vector_init``) handles the
+    wire encoding. ``metadata`` is a plain dict (→ jsonb via the default codec).
+    """
+
+    chunk_id: str
+    content: str
+    embedding: list[float]
+    metadata: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -248,6 +269,7 @@ async def update_run(
     errors: list[Any] | dict[str, Any] | None = None,
     duration_ms: int | None = None,
     finished_at: datetime | None = None,
+    chunks_out: int | None = None,
 ) -> None:
     """Update a run's fields (status, optional result columns).
 
@@ -281,6 +303,10 @@ async def update_run(
         if status in ("succeeded", "failed"):
             set_clauses.append("finished_at = now()")
 
+    if chunks_out is not None:
+        params.append(chunks_out)
+        set_clauses.append(f"chunks_out = ${len(params)}")
+
     params.append(claims.tenant_id)
     params.append(run_id)
     where_idx_tenant = len(params) - 1
@@ -301,6 +327,54 @@ async def update_run(
         raise NotFoundError(
             "Ingestion run not found.",
             code="RUN_NOT_FOUND",
+        )
+
+
+async def replace_chunks(
+    db: Database,
+    claims: AuthClaims,
+    doc_id: str,
+    rows: list[ChunkRow],
+) -> None:
+    """Replace all chunks for ``(tenant_id, doc_id)`` with ``rows`` — idempotent.
+
+    Implements S5.3 decision 5: DELETE existing chunks for the doc, then INSERT
+    the new set. This is safe for Celery retries because re-running always
+    produces the same final set of rows (same deterministic chunk_ids + content).
+    A re-parse that produces a *different chunk count* leaves no stale chunks.
+
+    ``_reject_global`` is called first; VISITOR never reaches ingestion.
+
+    Transaction note: ``common.db.Database`` does not expose a transaction
+    helper. We issue DELETE then one INSERT per chunk sequentially. asyncpg
+    auto-wraps each ``pool.execute`` in a single-statement transaction, so
+    partial failure on an INSERT is retryable via Celery (the next retry starts
+    fresh with DELETE again). This is documented explicitly per the spec.
+    """
+    _reject_global(claims)
+
+    # Step 1 — delete all existing chunks for this (tenant, doc) pair.
+    params: list[Any] = [claims.tenant_id, doc_id]
+    await db.execute(
+        "DELETE FROM knowledge_chunks WHERE tenant_id = $1 AND doc_id = $2",
+        *params,
+    )
+
+    # Step 2 — insert each chunk.
+    for row in rows:
+        insert_params: list[Any] = [
+            claims.tenant_id,
+            doc_id,
+            row.chunk_id,
+            row.content,
+            row.embedding,  # list[float] → vector via pgvector codec
+            row.metadata,   # dict → jsonb via default codec
+        ]
+        await db.execute(
+            "INSERT INTO knowledge_chunks "
+            "(tenant_id, doc_id, chunk_id, content, embedding, metadata) "
+            "VALUES ($1, $2, $3, $4, $5, $6)",
+            *insert_params,
         )
 
 

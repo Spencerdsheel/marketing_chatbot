@@ -33,6 +33,7 @@ class LLMConfigRequest(BaseModel):
     api_key: str
     base_url: str | None = None
     api_version: str | None = None
+    embedding_model: str | None = None
 
 
 class GenerateRequest(BaseModel):
@@ -66,7 +67,7 @@ async def set_llm_config(
     body: LLMConfigRequest,
     request: Request,
     claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN)),  # noqa: B008
-) -> dict[str, str]:
+) -> dict[str, str | None]:
     """Set the calling tenant's LLM provider + model + API key.
 
     Returns provider + model only; the key is encrypted and never echoed.
@@ -79,6 +80,7 @@ async def set_llm_config(
         api_key=body.api_key,
         base_url=body.base_url,
         api_version=body.api_version,
+        embedding_model=body.embedding_model,
     )
     _log.info(
         "LLM config updated",
@@ -88,7 +90,13 @@ async def set_llm_config(
             "model": body.model,
         },
     )
-    return {"provider": body.provider, "model": body.model}
+    response: dict[str, str | None] = {
+        "provider": body.provider,
+        "model": body.model,
+    }
+    if body.embedding_model is not None:
+        response["embedding_model"] = body.embedding_model
+    return response
 
 
 @router.post("/generate")

@@ -246,3 +246,54 @@ def test_validate_runtime_config_passes_when_backend_not_local() -> None:
 
     stub = _make_settings(storage_backend="s3", storage_local_root=None)
     _validate_runtime_config(stub)  # must not raise
+
+
+# -- _lifespan: pgvector codec wiring (S6.1 decision 1) -------------------------
+
+
+async def test_lifespan_database_connect_called_with_register_vector_init() -> None:
+    """``_lifespan`` must connect the app DB with ``init=register_vector_init``.
+
+    Without this, ``app.state.db`` only has the jsonb codec; binding a query
+    embedding (``list[float]``) as ``$1`` for the RAG search endpoint fails at
+    runtime against a live DB (the S5.2/S5.3 codec lesson, now at the HTTP
+    layer -- S6.1 decision 1). Stub tests can't catch a missing codec directly,
+    so this test instead asserts the wiring: ``Database.connect`` is invoked
+    with the correct ``init`` callback.
+    """
+    from common.settings import get_settings
+
+    from api.config import get_api_settings
+
+    get_settings.cache_clear()
+    get_api_settings.cache_clear()
+
+    with patch.dict("os.environ", _TEST_SETTINGS_ENV, clear=False):
+        from api.app import _lifespan, create_app
+
+        app = create_app()
+        get_settings.cache_clear()
+        get_api_settings.cache_clear()
+
+    connect_kwargs: list[dict[str, Any]] = []
+
+    class _StubDb:
+        async def close(self) -> None:
+            pass
+
+    async def _stub_connect(dsn: str, **kwargs: Any) -> Any:
+        connect_kwargs.append(kwargs)
+        return _StubDb()
+
+    with patch("api.app.Database.connect", side_effect=_stub_connect):
+        async with _lifespan(app):
+            pass
+
+    assert connect_kwargs, "Database.connect must have been called"
+
+    from common.pgvector import register_vector_init
+
+    assert connect_kwargs[0].get("init") is register_vector_init, (
+        "app.state.db must be connected with init=register_vector_init "
+        "(S6.1 decision 1 -- the app-db codec wiring)"
+    )

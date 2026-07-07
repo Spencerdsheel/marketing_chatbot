@@ -15,6 +15,7 @@ from common.db import Database
 from common.errors import AppException, InternalServerError, RateLimitError
 from common.health import check_database, check_redis, liveness, metrics_payload, readiness
 from common.logging import get_logger, log_context
+from common.pgvector import register_vector_init
 from common.ratelimit import build_rate_limiter
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
@@ -39,9 +40,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_api_settings()
     _validate_runtime_config(settings)
 
+    # S6.1 decision 1: register the pgvector codec alongside the default jsonb
+    # codec so app.state.db round-trips list[float] <-> vector (needed to bind
+    # a query embedding as $1 for RAG search), not just dict <-> jsonb.
     db = await Database.connect(
         settings.database_url,
         statement_cache_size=0,
+        init=register_vector_init,
     )
     app.state.db = db
 
@@ -159,6 +164,7 @@ def create_app() -> FastAPI:
     from api.gateway.routes import router as gateway_router
     from api.ingestion.routes import router as ingestion_router
     from api.llm.routes import router as llm_router
+    from api.rag.routes import router as rag_router
     from api.rbac.routes import router as rbac_router
     from api.tasks.routes import router as tasks_router
     from api.tenants.routes import router as tenants_router
@@ -168,6 +174,7 @@ def create_app() -> FastAPI:
     app.include_router(gateway_router)
     app.include_router(ingestion_router)
     app.include_router(llm_router)
+    app.include_router(rag_router)
     app.include_router(rbac_router)
     app.include_router(tasks_router)
     app.include_router(tenants_router)

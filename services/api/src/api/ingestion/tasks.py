@@ -1,15 +1,18 @@
 """Celery task: ingestion.ingest_document.
 
-This task implements S5.2 decision 6:
+This task implements S5.2 decision 6 (preserved) and S5.3 decisions 3, 5, 6:
   1. Mark run ``running``.
   2. Load raw bytes from storage.
   3. Parse to text.
   4. Store ``parsed.txt`` in storage.
-  5. On success  → run ``succeeded`` (chars_out, duration_ms) + doc ``parsed``.
-  6. On parse/validation error (deterministic) → run ``failed`` (errors recorded)
+  5. Resolve embedding config; chunk + embed + store chunks (S5.3).
+  6. On success  → run ``succeeded`` (chars_out, chunks_out, duration_ms) + doc ``parsed``.
+  7. On parse/validation error (deterministic) → run ``failed`` (errors recorded)
      + doc ``failed``. Do NOT raise; do NOT retry — the file will never parse.
-  7. On transient infra error (storage/DB) → let it propagate so Celery retries
-     with backoff (S5.1 ``acks_late``). Never swallow.
+  8. On ``EMBEDDING_NOT_CONFIGURED`` / ``EMBEDDING_DIM_MISMATCH`` (deterministic) →
+     run ``failed`` + doc ``failed``. Do NOT raise; do NOT retry.
+  9. On transient infra error (storage/DB, or ``LLMError`` from embed) → let it
+     propagate so Celery retries with backoff (S5.1 ``acks_late``). Never swallow.
 
 Worker tenant context (decision 1):
   The upload route passes ``tenant_id`` — which came from the admin JWT — as an
@@ -22,6 +25,11 @@ correlation_id (decision 2):
   ``apply_async`` at enqueue time, before the base ``_CorrelationTask.__call__``
   can consume it. Omitting it makes ``.delay(correlation_id=...)`` raise
   ``TypeError`` at enqueue — the same bug caught in S5.1.
+
+pgvector codec (S5.3 decision 3):
+  ``Database.connect(...)`` now passes ``init=register_vector_init`` so that both
+  the default jsonb codec AND the pgvector vector codec are registered on every
+  connection. Without this, writing a ``vector(768)`` column raises at runtime.
 """
 from __future__ import annotations
 
@@ -32,10 +40,14 @@ from common.auth import AuthClaims, Role
 from common.db import Database
 from common.errors import ValidationError
 from common.logging import get_logger
+from common.pgvector import register_vector_init
 
 from api.ingestion import repository as repo
+from api.ingestion.chunker import chunk_text
 from api.ingestion.parsers import parse
 from api.ingestion.storage import StorageProvider, get_storage
+from api.llm.config_repository import get_llm_config
+from api.llm.factory import provider_for
 from api.tasks.celery_app import _CorrelationTask, celery_app
 
 _log = get_logger(__name__)
@@ -107,7 +119,13 @@ async def _run(
     from api.config import get_api_settings  # noqa: PLC0415
 
     settings = get_api_settings()
-    db = await Database.connect(settings.database_url, statement_cache_size=0)
+    # S5.3 decision 3: register the pgvector codec alongside the default jsonb
+    # codec so that list[float] → vector column writes succeed at runtime.
+    db = await Database.connect(
+        settings.database_url,
+        statement_cache_size=0,
+        init=register_vector_init,
+    )
     try:
         return await _execute(task, db, claims, doc_id, run_id, storage)
     finally:
@@ -122,7 +140,10 @@ async def _execute(
     run_id: str,
     storage: StorageProvider,
 ) -> dict[str, object]:
-    """Core parse-and-record logic, given an open DB connection."""
+    """Core parse-chunk-embed-store logic, given an open DB connection."""
+    from api.config import get_api_settings  # noqa: PLC0415
+
+    settings = get_api_settings()
 
     _log.info(
         "ingest_document started",
@@ -183,9 +204,128 @@ async def _execute(
         )
         return {"doc_id": doc_id, "run_id": run_id, "status": "failed"}
 
-    # Step 6 — success path.
+    # -----------------------------------------------------------------------
+    # S5.3: chunk → embed → store
+    # -----------------------------------------------------------------------
+
+    # Step 6 — resolve tenant embedding config.
+    config = await get_llm_config(db, claims)
+    if config is None or not config.embedding_model:
+        # Deterministic failure: no embedding model configured.
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        error_entry = {
+            "code": "EMBEDDING_NOT_CONFIGURED",
+            "message": "No embedding model is configured for this tenant.",
+        }
+        await repo.update_run(
+            db,
+            claims,
+            run_id,
+            status="failed",
+            errors=error_entry,
+            duration_ms=duration_ms,
+        )
+        await repo.update_doc_status(db, claims, doc_id, "failed")
+        _log.warning(
+            "ingest_document embedding not configured",
+            extra={
+                "task": "ingestion.ingest_document",
+                "event": "task_embedding_not_configured",
+                "doc_id": doc_id,
+                "run_id": run_id,
+            },
+        )
+        return {"doc_id": doc_id, "run_id": run_id, "status": "failed"}
+
+    # Step 7 — chunk the parsed text.
+    chunks = chunk_text(
+        parsed_text,
+        max_chars=settings.chunk_max_chars,
+        overlap=settings.chunk_overlap_chars,
+    )
+
+    if not chunks:
+        # Empty text after parsing: succeed with chunks_out=0.
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        chars_out = len(parsed_text)
+        await repo.update_run(
+            db,
+            claims,
+            run_id,
+            status="succeeded",
+            chars_out=chars_out,
+            chunks_out=0,
+            duration_ms=duration_ms,
+        )
+        await repo.update_doc_status(db, claims, doc_id, "parsed")
+        _log.info(
+            "ingest_document succeeded (no chunks)",
+            extra={
+                "task": "ingestion.ingest_document",
+                "event": "task_completed",
+                "doc_id": doc_id,
+                "run_id": run_id,
+                "chars_out": chars_out,
+                "chunks_out": 0,
+                "duration_ms": duration_ms,
+            },
+        )
+        return {"doc_id": doc_id, "run_id": run_id, "status": "succeeded"}
+
+    # Step 8 — embed chunks.  LLMError propagates (transient/retryable).
+    llm_provider = provider_for(config)
+    vectors = await llm_provider.embed(chunks, model=config.embedding_model)
+
+    # Step 9 — validate every vector dimension.
+    for i, vec in enumerate(vectors):
+        if len(vec) != settings.embedding_dimension:
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            error_entry = {
+                "code": "EMBEDDING_DIM_MISMATCH",
+                "message": (
+                    f"Vector {i} has dimension {len(vec)}, "
+                    f"expected {settings.embedding_dimension}."
+                ),
+            }
+            await repo.update_run(
+                db,
+                claims,
+                run_id,
+                status="failed",
+                errors=error_entry,
+                duration_ms=duration_ms,
+            )
+            await repo.update_doc_status(db, claims, doc_id, "failed")
+            _log.warning(
+                "ingest_document embedding dimension mismatch",
+                extra={
+                    "task": "ingestion.ingest_document",
+                    "event": "task_embedding_dim_mismatch",
+                    "doc_id": doc_id,
+                    "run_id": run_id,
+                    "vector_index": i,
+                    "got": len(vec),
+                    "expected": settings.embedding_dimension,
+                },
+            )
+            return {"doc_id": doc_id, "run_id": run_id, "status": "failed"}
+
+    # Step 10 — idempotent replace chunks in the DB.
+    chunk_rows = [
+        repo.ChunkRow(
+            chunk_id=f"{doc_id}-{i:04d}",
+            content=chunk,
+            embedding=list(vectors[i]),
+            metadata={"chunk_index": i, "content_len": len(chunk)},
+        )
+        for i, chunk in enumerate(chunks)
+    ]
+    await repo.replace_chunks(db, claims, doc_id, chunk_rows)
+
+    # Step 11 — success.
     duration_ms = int((time.monotonic() - t0) * 1000)
     chars_out = len(parsed_text)
+    chunks_out = len(chunks)
 
     await repo.update_run(
         db,
@@ -193,6 +333,7 @@ async def _execute(
         run_id,
         status="succeeded",
         chars_out=chars_out,
+        chunks_out=chunks_out,
         duration_ms=duration_ms,
     )
     await repo.update_doc_status(db, claims, doc_id, "parsed")
@@ -205,6 +346,7 @@ async def _execute(
             "doc_id": doc_id,
             "run_id": run_id,
             "chars_out": chars_out,
+            "chunks_out": chunks_out,
             "duration_ms": duration_ms,
         },
     )

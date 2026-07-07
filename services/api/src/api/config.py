@@ -76,6 +76,23 @@ class ApiSettings(Settings):
     storage_local_root: str | None = None
     ingestion_max_upload_bytes: int = 10_485_760
 
+    # Embedding / chunking (S5.3).
+    # embedding_dimension: must match the vector(N) column in knowledge_chunks.
+    #   Changing this requires a new migration + full re-embed.
+    # chunk_max_chars: maximum characters per text chunk before overflow.
+    # chunk_overlap_chars: trailing chars of the previous chunk prepended to
+    #   the next chunk as sentence-boundary context.
+    embedding_dimension: int = 768
+    chunk_max_chars: int = 1000
+    chunk_overlap_chars: int = 150
+
+    # RAG retrieval (S6.1).
+    # rag_default_top_k: used when the caller does not specify k.
+    # rag_max_top_k: hard upper bound k is clamped to -- an unbounded/huge k
+    #   from the request must not run against the DB.
+    rag_default_top_k: int = 5
+    rag_max_top_k: int = 20
+
 
 @lru_cache(maxsize=1)
 def get_api_settings() -> ApiSettings:

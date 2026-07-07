@@ -277,3 +277,105 @@ async def test_get_llm_config_api_version_none_when_null() -> None:
 
     assert config is not None
     assert config.api_version is None
+
+
+# ==============================================================================
+# S5.3: embedding_model stored and echoed
+# ==============================================================================
+
+
+async def test_upsert_stores_embedding_model() -> None:
+    """embedding_model is passed as the 7th bound param to upsert."""
+    db = _RecordingDatabase()
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    await upsert_llm_config(
+        db,
+        claims,
+        provider="openai",
+        model="gpt-4o",
+        api_key="sk-key",
+        embedding_model="nomic-embed-text",
+    )
+
+    # 7th param (index 6) is embedding_model
+    assert db.last_params[6] == "nomic-embed-text"
+
+
+async def test_upsert_embedding_model_none_when_omitted() -> None:
+    """Omitted embedding_model → None in params."""
+    db = _RecordingDatabase()
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    await upsert_llm_config(
+        db,
+        claims,
+        provider="openai",
+        model="gpt-4o",
+        api_key="sk-key",
+    )
+
+    assert db.last_params[6] is None
+
+
+async def test_get_llm_config_returns_embedding_model() -> None:
+    """get_llm_config returns embedding_model when present."""
+    row = {
+        "provider": "openai",
+        "model": "gpt-4o",
+        "api_key_ciphertext": SecretBox(get_api_settings().secret_encryption_key).encrypt("sk-key"),
+        "base_url": None,
+        "api_version": None,
+        "embedding_model": "nomic-embed-text",
+    }
+    db = _RecordingDatabase(rows=[row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    config = await get_llm_config(db, claims)
+
+    assert config is not None
+    assert config.embedding_model == "nomic-embed-text"
+
+
+async def test_get_llm_config_embedding_model_none_when_null() -> None:
+    """get_llm_config returns embedding_model=None when column is NULL."""
+    row = {
+        "provider": "openai",
+        "model": "gpt-4o",
+        "api_key_ciphertext": SecretBox(get_api_settings().secret_encryption_key).encrypt("sk-key"),
+        "base_url": None,
+        "api_version": None,
+        "embedding_model": None,
+    }
+    db = _RecordingDatabase(rows=[row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    config = await get_llm_config(db, claims)
+
+    assert config is not None
+    assert config.embedding_model is None
+
+
+async def test_api_key_never_echoed_in_config() -> None:
+    """api_key is decrypted internally but must not appear in the LLMConfig fields that
+    would be echoed to callers (provider, model, embedding_model, base_url, api_version)."""
+    row = {
+        "provider": "openai",
+        "model": "gpt-4o",
+        "api_key_ciphertext": SecretBox(get_api_settings().secret_encryption_key).encrypt("sk-super-secret"),
+        "base_url": None,
+        "api_version": None,
+        "embedding_model": "nomic-embed-text",
+    }
+    db = _RecordingDatabase(rows=[row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    config = await get_llm_config(db, claims)
+
+    assert config is not None
+    # api_key is available on the dataclass (for internal use by providers),
+    # but it should never be serialized back to callers. The route layer is
+    # responsible for that; here we just confirm the field is not in the
+    # "safe to echo" fields.
+    safe_fields = {config.provider, config.model, config.embedding_model, config.base_url, config.api_version}
+    assert "sk-super-secret" not in safe_fields

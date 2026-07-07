@@ -14,6 +14,17 @@ Covers:
 - .delay()-based enqueue test (decision 2 regression guard): proves that
   ingest_document.delay(doc_id=..., tenant_id=..., run_id=..., correlation_id=...)
   does not raise TypeError at enqueue time.
+
+S5.3 additions:
+- Success path with stub provider returning 768-dim vectors: chunks embedded +
+  replace_chunks called + run succeeded (chunks_out set) + doc parsed.
+- EMBEDDING_NOT_CONFIGURED (no embedding_model): run failed, no embed call, no retry.
+- Dimension mismatch (stub returns wrong-length vector): run failed
+  EMBEDDING_DIM_MISMATCH, no chunk write, no retry.
+- embed raises LLMError: propagates (retryable), run not marked succeeded.
+- Empty parsed text: chunks_out=0 succeeded.
+- Tenant-scoped system:ingestion claims asserted.
+- Database.connect called with init=register_vector_init.
 """
 from __future__ import annotations
 
@@ -66,10 +77,21 @@ def _reset_modules() -> None:
 
 
 class _RecordingDatabase:
-    """Records every execute/fetchrow call for assertion in tests."""
+    """Records every execute/fetchrow call for assertion in tests.
 
-    def __init__(self, doc_row: dict[str, Any] | None = None) -> None:
+    Discriminates query targets:
+    - ``tenant_llm_configs`` queries → returns ``_llm_config_row`` (or None).
+    - All other fetchrow queries → returns ``_doc_row``.
+    This ensures the S5.3 embedding path is testable without breaking existing tests.
+    """
+
+    def __init__(
+        self,
+        doc_row: dict[str, Any] | None = None,
+        llm_config_row: dict[str, Any] | None = None,
+    ) -> None:
         self._doc_row = doc_row
+        self._llm_config_row = llm_config_row
         self.executions: list[tuple[str, tuple[Any, ...]]] = []
         self._run_status: str = "queued"
         self._doc_status: str = "pending"
@@ -85,6 +107,8 @@ class _RecordingDatabase:
         return "UPDATE 1"
 
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
+        if "TENANT_LLM_CONFIGS" in query.upper():
+            return self._llm_config_row
         return self._doc_row
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
@@ -164,29 +188,86 @@ def _make_doc_row(
     }
 
 
+# ---------------------------------------------------------------------------
+# S5.3 shared stubs (used by both updated existing tests and new S5.3 tests)
+# ---------------------------------------------------------------------------
+
+
+def _make_llm_config_row(
+    *,
+    embedding_model: str | None = "nomic-embed-text",
+) -> dict[str, Any]:
+    from common.crypto import SecretBox  # noqa: PLC0415
+
+    from api.config import get_api_settings  # noqa: PLC0415
+    box = SecretBox(get_api_settings().secret_encryption_key)
+    return {
+        "provider": "openai",
+        "model": "gpt-4o",
+        "api_key_ciphertext": box.encrypt("sk-test"),
+        "base_url": "http://localhost:11434/v1",
+        "api_version": None,
+        "embedding_model": embedding_model,
+    }
+
+
+class _StubEmbeddingProvider:
+    """Stub LLM provider that returns fixed-dimension vectors."""
+
+    def __init__(self, dim: int = 768) -> None:
+        self._dim = dim
+        self.called_texts: list[list[str]] = []
+        self.called_model: list[str] = []
+
+    async def embed(self, texts: list[str], *, model: str) -> list[list[float]]:
+        self.called_texts.append(texts)
+        self.called_model.append(model)
+        return [[0.1] * self._dim for _ in texts]
+
+    async def generate(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError
+
+    async def classify(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError
+
+    def stream(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError
+
+
 # ==============================================================================
 # Success path
 # ==============================================================================
 
 
 async def test_ingest_document_success_path() -> None:
-    """Success path: parses txt bytes, stores parsed.txt, run→succeeded, doc→parsed."""
+    """Success path: parses txt bytes, stores parsed.txt, run→succeeded, doc→parsed.
+
+    S5.3 note: the task now also chunks + embeds after parsing. We patch
+    provider_for and repo.replace_chunks so this test remains infrastructure-free.
+    """
     _reset_modules()
 
     raw_bytes = b"Hello from the document."
     storage_key = f"{_TENANT_ID}/{_DOC_ID}/sample.txt"
     storage = _InMemoryStorage({storage_key: raw_bytes})
-    db = _RecordingDatabase(doc_row=_make_doc_row(storage_key=storage_key))
 
     with patch.dict("os.environ", _TEST_ENV, clear=False):
         from api.config import get_api_settings
 
         get_api_settings.cache_clear()
 
+        llm_config_row = _make_llm_config_row()
+        db = _RecordingDatabase(
+            doc_row=_make_doc_row(storage_key=storage_key),
+            llm_config_row=llm_config_row,
+        )
+
         # Patch out the database and storage so no real connections are made.
         with (
             patch("api.ingestion.tasks.get_storage", return_value=storage),
             patch("api.ingestion.tasks.Database.connect", return_value=db),
+            patch("api.ingestion.tasks.provider_for", return_value=_StubEmbeddingProvider(dim=768)),
+            patch("api.ingestion.tasks.repo.replace_chunks"),
         ):
             from common.auth import AuthClaims, Role  # noqa: PLC0415
 
@@ -458,3 +539,386 @@ def test_ingest_document_delay_accepts_correlation_id() -> None:
                 correlation_id="cid-delay-test",
             )
             assert result is not None
+
+
+# ==============================================================================
+# S5.3: chunk + embed + store
+# ==============================================================================
+
+# _make_llm_config_row, _StubEmbeddingProvider are defined above (shared stubs).
+
+# _EmbeddingDatabase is just _RecordingDatabase with llm_config_row support,
+# which is already built into _RecordingDatabase above.
+
+
+async def test_s53_success_path_embeds_and_stores_chunks() -> None:
+    """Success: stub provider returns 768-dim vectors → replace_chunks called + run succeeded."""
+    _reset_modules()
+
+    raw_bytes = b"Hello world. This is a document. It has several sentences for chunking."
+    storage_key = f"{_TENANT_ID}/{_DOC_ID}/sample.txt"
+    storage = _InMemoryStorage({storage_key: raw_bytes})
+
+    with patch.dict("os.environ", {**_TEST_ENV, "EMBEDDING_DIMENSION": "768"}, clear=False):
+        from api.config import get_api_settings  # noqa: PLC0415
+        get_api_settings.cache_clear()
+
+        llm_config_row = _make_llm_config_row()
+        db = _RecordingDatabase(
+            doc_row=_make_doc_row(storage_key=storage_key),
+            llm_config_row=llm_config_row,
+        )
+        stub_provider = _StubEmbeddingProvider(dim=768)
+
+        replace_chunks_calls: list[tuple[Any, ...]] = []
+
+        async def _stub_replace_chunks(db_: Any, claims_: Any, doc_id_: str, rows_: Any) -> None:
+            replace_chunks_calls.append((claims_, doc_id_, rows_))
+
+        class _FakeTask:
+            pass
+
+        with patch("api.ingestion.tasks.provider_for", return_value=stub_provider):
+            with patch("api.ingestion.tasks.repo.replace_chunks", side_effect=_stub_replace_chunks):
+                from common.auth import AuthClaims, Role  # noqa: PLC0415
+
+                from api.ingestion.tasks import _execute  # noqa: PLC0415
+
+                claims = AuthClaims(
+                    subject="system:ingestion",
+                    role=Role.CLIENT_ADMIN,
+                    tenant_id=_TENANT_ID,
+                )
+                result = await _execute(
+                    _FakeTask(),  # type: ignore[arg-type]
+                    db,  # type: ignore[arg-type]
+                    claims,
+                    _DOC_ID,
+                    _RUN_ID,
+                    storage,
+                )
+
+    assert result["status"] == "succeeded"
+    # replace_chunks must have been called.
+    assert len(replace_chunks_calls) == 1, "replace_chunks must be called on success"
+    called_claims, called_doc_id, called_rows = replace_chunks_calls[0]
+    assert called_doc_id == _DOC_ID
+    assert called_claims.tenant_id == _TENANT_ID
+    assert len(called_rows) > 0
+
+    # Verify deterministic chunk_ids format.
+    for i, row in enumerate(called_rows):
+        assert row.chunk_id == f"{_DOC_ID}-{i:04d}", f"Bad chunk_id: {row.chunk_id!r}"
+
+    # Verify embeddings have the right length.
+    for row in called_rows:
+        assert len(row.embedding) == 768
+
+    # run updated to succeeded with chunks_out.
+    run_updates = [e for e in db.executions if "INGESTION_RUNS" in e[0].upper()]
+    succeeded_updates = [e for e in run_updates if e[1][0] == "succeeded"]
+    assert succeeded_updates, "run must reach succeeded"
+    # chunks_out value (len(rows)) must appear in params.
+    assert any(len(called_rows) in e[1] for e in succeeded_updates), (
+        "chunks_out must be bound in the succeeded UPDATE"
+    )
+
+    # doc updated to 'parsed'.
+    doc_updates = [e for e in db.executions if "KNOWLEDGE_DOCS" in e[0].upper()]
+    assert any(e[1][0] == "parsed" for e in doc_updates)
+
+
+async def test_s53_embedding_not_configured_deterministic_fail() -> None:
+    """No embedding_model → run failed EMBEDDING_NOT_CONFIGURED, no embed, no retry."""
+    _reset_modules()
+
+    raw_bytes = b"Hello world. This is content."
+    storage_key = f"{_TENANT_ID}/{_DOC_ID}/sample.txt"
+    storage = _InMemoryStorage({storage_key: raw_bytes})
+
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.config import get_api_settings  # noqa: PLC0415
+        get_api_settings.cache_clear()
+
+        # Config row with embedding_model=None.
+        llm_config_row = _make_llm_config_row(embedding_model=None)
+        db = _RecordingDatabase(
+            doc_row=_make_doc_row(storage_key=storage_key),
+            llm_config_row=llm_config_row,
+        )
+        stub_provider = _StubEmbeddingProvider(dim=768)
+
+        class _FakeTask:
+            pass
+
+        with patch("api.ingestion.tasks.provider_for", return_value=stub_provider):
+            from common.auth import AuthClaims, Role  # noqa: PLC0415
+
+            from api.ingestion.tasks import _execute  # noqa: PLC0415
+
+            claims = AuthClaims(
+                subject="system:ingestion",
+                role=Role.CLIENT_ADMIN,
+                tenant_id=_TENANT_ID,
+            )
+            result = await _execute(
+                _FakeTask(),  # type: ignore[arg-type]
+                db,  # type: ignore[arg-type]
+                claims,
+                _DOC_ID,
+                _RUN_ID,
+                storage,
+            )
+
+    assert result["status"] == "failed"
+    # embed must NOT have been called.
+    assert stub_provider.called_texts == [], "embed must not be called when no embedding_model"
+
+    # run must be failed with EMBEDDING_NOT_CONFIGURED.
+    run_updates = [e for e in db.executions if "INGESTION_RUNS" in e[0].upper()]
+    failed_updates = [e for e in run_updates if e[1][0] == "failed"]
+    assert failed_updates
+    assert any(
+        isinstance(arg, dict) and arg.get("code") == "EMBEDDING_NOT_CONFIGURED"
+        for e in failed_updates
+        for arg in e[1]
+    ), "EMBEDDING_NOT_CONFIGURED must be in the errors"
+
+    # doc must be failed.
+    doc_updates = [e for e in db.executions if "KNOWLEDGE_DOCS" in e[0].upper()]
+    assert any(e[1][0] == "failed" for e in doc_updates)
+
+
+async def test_s53_dimension_mismatch_deterministic_fail() -> None:
+    """Stub returns wrong-length vector → run failed EMBEDDING_DIM_MISMATCH, no write."""
+    _reset_modules()
+
+    raw_bytes = b"Hello world. This is content for chunking tests."
+    storage_key = f"{_TENANT_ID}/{_DOC_ID}/sample.txt"
+    storage = _InMemoryStorage({storage_key: raw_bytes})
+
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.config import get_api_settings  # noqa: PLC0415
+        get_api_settings.cache_clear()
+
+        llm_config_row = _make_llm_config_row()
+        db = _RecordingDatabase(
+            doc_row=_make_doc_row(storage_key=storage_key),
+            llm_config_row=llm_config_row,
+        )
+        # Provider returns wrong dimension (e.g. 512 instead of 768).
+        stub_provider = _StubEmbeddingProvider(dim=512)
+
+        replace_chunks_calls: list[Any] = []
+
+        async def _stub_replace_chunks(*args: Any, **kwargs: Any) -> None:
+            replace_chunks_calls.append(args)
+
+        class _FakeTask:
+            pass
+
+        with patch("api.ingestion.tasks.provider_for", return_value=stub_provider):
+            with patch("api.ingestion.tasks.repo.replace_chunks", side_effect=_stub_replace_chunks):
+                from common.auth import AuthClaims, Role  # noqa: PLC0415
+
+                from api.ingestion.tasks import _execute  # noqa: PLC0415
+
+                claims = AuthClaims(
+                    subject="system:ingestion",
+                    role=Role.CLIENT_ADMIN,
+                    tenant_id=_TENANT_ID,
+                )
+                result = await _execute(
+                    _FakeTask(),  # type: ignore[arg-type]
+                    db,  # type: ignore[arg-type]
+                    claims,
+                    _DOC_ID,
+                    _RUN_ID,
+                    storage,
+                )
+
+    assert result["status"] == "failed"
+    # replace_chunks must NOT have been called.
+    assert replace_chunks_calls == [], "replace_chunks must not be called on dim mismatch"
+
+    # run must be failed with EMBEDDING_DIM_MISMATCH.
+    run_updates = [e for e in db.executions if "INGESTION_RUNS" in e[0].upper()]
+    failed_updates = [e for e in run_updates if e[1][0] == "failed"]
+    assert failed_updates
+    assert any(
+        isinstance(arg, dict) and arg.get("code") == "EMBEDDING_DIM_MISMATCH"
+        for e in failed_updates
+        for arg in e[1]
+    ), "EMBEDDING_DIM_MISMATCH must be in the errors"
+
+
+async def test_s53_llm_error_propagates_for_retry() -> None:
+    """LLMError from embed propagates (not caught), so Celery retries."""
+    _reset_modules()
+
+    raw_bytes = b"Hello world. Content to embed."
+    storage_key = f"{_TENANT_ID}/{_DOC_ID}/sample.txt"
+    storage = _InMemoryStorage({storage_key: raw_bytes})
+
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.config import get_api_settings  # noqa: PLC0415
+        get_api_settings.cache_clear()
+
+        llm_config_row = _make_llm_config_row()
+        db = _RecordingDatabase(
+            doc_row=_make_doc_row(storage_key=storage_key),
+            llm_config_row=llm_config_row,
+        )
+
+        from api.llm.provider import LLMError  # noqa: PLC0415
+
+        class _ErrorProvider:
+            async def embed(self, texts: list[str], *, model: str) -> list[list[float]]:
+                raise LLMError("Network error.")
+            async def generate(self, *args: Any, **kwargs: Any) -> Any: ...
+            async def classify(self, *args: Any, **kwargs: Any) -> Any: ...
+            def stream(self, *args: Any, **kwargs: Any) -> Any: ...
+
+        class _FakeTask:
+            pass
+
+        with patch("api.ingestion.tasks.provider_for", return_value=_ErrorProvider()):
+            from common.auth import AuthClaims, Role  # noqa: PLC0415
+
+            from api.ingestion.tasks import _execute  # noqa: PLC0415
+
+            claims = AuthClaims(
+                subject="system:ingestion",
+                role=Role.CLIENT_ADMIN,
+                tenant_id=_TENANT_ID,
+            )
+            import pytest as _pytest  # noqa: PLC0415
+            with _pytest.raises(LLMError, match="Network error"):
+                await _execute(
+                    _FakeTask(),  # type: ignore[arg-type]
+                    db,  # type: ignore[arg-type]
+                    claims,
+                    _DOC_ID,
+                    _RUN_ID,
+                    storage,
+                )
+
+    # run must NOT have been marked succeeded.
+    run_updates = [e for e in db.executions if "INGESTION_RUNS" in e[0].upper()]
+    succeeded = [e for e in run_updates if e[1][0] == "succeeded"]
+    assert succeeded == [], "run must not be marked succeeded when LLMError propagates"
+
+
+async def test_s53_empty_text_succeeds_with_zero_chunks() -> None:
+    """Empty parsed text → chunks_out=0, run succeeded, no embed call."""
+    _reset_modules()
+
+    # Upload a file that parses to only whitespace.
+    raw_bytes = b"   \n  \t  "  # whitespace only — chunk_text returns []
+    storage_key = f"{_TENANT_ID}/{_DOC_ID}/sample.txt"
+    storage = _InMemoryStorage({storage_key: raw_bytes})
+
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.config import get_api_settings  # noqa: PLC0415
+        get_api_settings.cache_clear()
+
+        llm_config_row = _make_llm_config_row()
+        db = _RecordingDatabase(
+            doc_row=_make_doc_row(storage_key=storage_key),
+            llm_config_row=llm_config_row,
+        )
+        stub_provider = _StubEmbeddingProvider(dim=768)
+
+        replace_chunks_calls: list[Any] = []
+
+        async def _stub_replace_chunks(*args: Any, **kwargs: Any) -> None:
+            replace_chunks_calls.append(args)
+
+        class _FakeTask:
+            pass
+
+        with patch("api.ingestion.tasks.provider_for", return_value=stub_provider):
+            with patch("api.ingestion.tasks.repo.replace_chunks", side_effect=_stub_replace_chunks):
+                from common.auth import AuthClaims, Role  # noqa: PLC0415
+
+                from api.ingestion.tasks import _execute  # noqa: PLC0415
+
+                claims = AuthClaims(
+                    subject="system:ingestion",
+                    role=Role.CLIENT_ADMIN,
+                    tenant_id=_TENANT_ID,
+                )
+                result = await _execute(
+                    _FakeTask(),  # type: ignore[arg-type]
+                    db,  # type: ignore[arg-type]
+                    claims,
+                    _DOC_ID,
+                    _RUN_ID,
+                    storage,
+                )
+
+    assert result["status"] == "succeeded"
+    # embed and replace_chunks must NOT have been called.
+    assert stub_provider.called_texts == []
+    assert replace_chunks_calls == []
+
+    # chunks_out=0 must appear in the succeeded update.
+    run_updates = [e for e in db.executions if "INGESTION_RUNS" in e[0].upper()]
+    succeeded = [e for e in run_updates if e[1][0] == "succeeded"]
+    assert succeeded
+    assert any(0 in e[1] for e in succeeded), "chunks_out=0 must be in succeeded UPDATE params"
+
+
+async def test_s53_database_connect_called_with_register_vector_init() -> None:
+    """Database.connect is called with init=register_vector_init (S5.3 decision 3).
+
+    This is the codec regression guard: without this, writing vector columns
+    fails at runtime with a live DB.
+    """
+    _reset_modules()
+
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.config import get_api_settings  # noqa: PLC0415
+        get_api_settings.cache_clear()
+
+        raw_bytes = b"Some content."
+        storage_key = f"{_TENANT_ID}/{_DOC_ID}/sample.txt"
+        storage = _InMemoryStorage({storage_key: raw_bytes})
+        llm_config_row = _make_llm_config_row()
+        db = _RecordingDatabase(
+            doc_row=_make_doc_row(storage_key=storage_key),
+            llm_config_row=llm_config_row,
+        )
+
+        connect_kwargs: list[dict[str, Any]] = []
+
+        async def _stub_connect(dsn: str, **kwargs: Any) -> Any:
+            connect_kwargs.append(kwargs)
+            return db
+
+        with (
+            patch("api.ingestion.tasks.get_storage", return_value=storage),
+            patch("api.ingestion.tasks.Database.connect", side_effect=_stub_connect),
+            patch("api.ingestion.tasks.provider_for", return_value=_StubEmbeddingProvider(dim=768)),
+            patch("api.ingestion.tasks.repo.replace_chunks"),
+        ):
+            from common.auth import AuthClaims, Role  # noqa: PLC0415
+            from common.pgvector import register_vector_init as _rvi  # noqa: PLC0415
+
+            from api.ingestion.tasks import _run  # noqa: PLC0415
+
+            claims = AuthClaims(
+                subject="system:ingestion",
+                role=Role.CLIENT_ADMIN,
+                tenant_id=_TENANT_ID,
+            )
+
+            class _FakeTask:
+                pass
+
+            await _run(_FakeTask(), claims, _DOC_ID, _RUN_ID, storage)  # type: ignore[arg-type]
+
+    assert connect_kwargs, "Database.connect must have been called"
+    assert connect_kwargs[0].get("init") is _rvi, (
+        "Database.connect must be called with init=register_vector_init"
+    )
