@@ -163,6 +163,7 @@ def create_app() -> FastAPI:
     from api.conversation_store.routes import router as conversation_router
     from api.gateway.routes import router as gateway_router
     from api.ingestion.routes import router as ingestion_router
+    from api.leads.routes import router as leads_router
     from api.llm.routes import router as llm_router
     from api.rag.routes import router as rag_router
     from api.rbac.routes import router as rbac_router
@@ -173,6 +174,7 @@ def create_app() -> FastAPI:
     app.include_router(conversation_router)
     app.include_router(gateway_router)
     app.include_router(ingestion_router)
+    app.include_router(leads_router)
     app.include_router(llm_router)
     app.include_router(rag_router)
     app.include_router(rbac_router)

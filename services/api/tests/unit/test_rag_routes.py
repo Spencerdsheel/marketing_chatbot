@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from common.auth import AuthClaims, Role
 from common.cache import InMemoryCache
 from common.errors import ValidationError
@@ -21,7 +22,7 @@ from httpx import ASGITransport, AsyncClient
 from api.auth.tokens import create_access_token
 from api.llm.provider import LLMError
 from api.rag.repository import ChunkMatch
-from api.rag.service import RetrievalResult
+from api.rag.service import HybridMatch, HybridResult, RetrievalResult
 
 _TEST_JWT_SECRET = "x" * 48
 _TENANT_ID = "tenant-abc-123"
@@ -99,7 +100,8 @@ def _mint_cookie(
     return token
 
 
-async def test_rag_search_client_admin_happy_path_returns_200_leak_free() -> None:
+async def test_rag_search_mode_vector_returns_200_leak_free_s61_shape() -> None:
+    """``mode=vector`` uses the S6.1 (unchanged) shape -- back-compatible."""
     app = _build_app()
     result = RetrievalResult(
         chunks=[
@@ -113,7 +115,7 @@ async def test_rag_search_client_admin_happy_path_returns_200_leak_free() -> Non
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.post(
                 "/debug/rag/search",
-                json={"query": "what can the ai agent do?"},
+                json={"query": "what can the ai agent do?", "mode": "vector"},
                 cookies={"access_token": token},
             )
 
@@ -129,6 +131,91 @@ async def test_rag_search_client_admin_happy_path_returns_200_leak_free() -> Non
     assert "tenant_id" not in body_str
     assert "embedding" not in body_str
     assert _TENANT_ID not in body_str
+
+
+async def test_rag_search_mode_defaults_to_hybrid() -> None:
+    """No ``mode`` in the body -> hybrid path is used (calls retrieve_hybrid)."""
+    app = _build_app()
+    result = HybridResult(
+        chunks=[
+            HybridMatch(
+                doc_id="doc-1",
+                chunk_id="doc-1-0000",
+                content="mystery shopping",
+                score=0.9,
+                rrf_score=0.032,
+                matched_by=["vector", "keyword"],
+            ),
+            HybridMatch(
+                doc_id="doc-2",
+                chunk_id="doc-2-0000",
+                content="keyword only hit",
+                score=None,
+                rrf_score=0.016,
+                matched_by=["keyword"],
+            ),
+        ],
+        confidence=0.71,
+    )
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+
+    with patch("api.rag.routes.retrieve_hybrid", new=AsyncMock(return_value=result)):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/debug/rag/search",
+                json={"query": "mystery shopping"},
+                cookies={"access_token": token},
+            )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count"] == 2
+    assert body["confidence"] == 0.71
+    assert body["chunks"][0] == {
+        "doc_id": "doc-1",
+        "chunk_id": "doc-1-0000",
+        "content": "mystery shopping",
+        "score": 0.9,
+        "rrf_score": pytest.approx(0.032),
+        "matched_by": ["vector", "keyword"],
+    }
+    assert body["chunks"][1]["score"] is None
+    assert body["chunks"][1]["matched_by"] == ["keyword"]
+    # Leak-free: never tenant_id, never the embedding vector.
+    body_str = str(body)
+    assert "tenant_id" not in body_str
+    assert "embedding" not in body_str
+    assert _TENANT_ID not in body_str
+
+
+async def test_rag_search_mode_hybrid_explicit_same_as_default() -> None:
+    app = _build_app()
+    result = HybridResult(chunks=[], confidence=0.0)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+
+    with patch("api.rag.routes.retrieve_hybrid", new=AsyncMock(return_value=result)) as mock:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/debug/rag/search",
+                json={"query": "hello", "mode": "hybrid"},
+                cookies={"access_token": token},
+            )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"count": 0, "confidence": 0.0, "chunks": []}
+    mock.assert_awaited_once()
+
+
+async def test_rag_search_invalid_mode_returns_422() -> None:
+    app = _build_app()
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/debug/rag/search",
+            json={"query": "hello", "mode": "not-a-real-mode"},
+            cookies={"access_token": token},
+        )
+    assert resp.status_code == 422
 
 
 async def test_rag_search_client_agent_returns_403() -> None:
@@ -151,6 +238,29 @@ async def test_rag_search_no_cookie_returns_401() -> None:
 
 
 async def test_rag_search_embedding_not_configured_returns_422() -> None:
+    """Default mode (hybrid) still needs the vector leg's embedding step."""
+    app = _build_app()
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+
+    async def _raise(*args: object, **kwargs: object) -> HybridResult:
+        raise ValidationError(
+            "No embedding model is configured for this tenant.",
+            code="RAG_EMBEDDING_NOT_CONFIGURED",
+        )
+
+    with patch("api.rag.routes.retrieve_hybrid", side_effect=_raise):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/debug/rag/search",
+                json={"query": "hello"},
+                cookies={"access_token": token},
+            )
+
+    assert resp.status_code == 422
+    assert resp.json()["error_code"] == "RAG_EMBEDDING_NOT_CONFIGURED"
+
+
+async def test_rag_search_vector_mode_embedding_not_configured_returns_422() -> None:
     app = _build_app()
     token = _mint_cookie(role=Role.CLIENT_ADMIN)
 
@@ -164,7 +274,7 @@ async def test_rag_search_embedding_not_configured_returns_422() -> None:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.post(
                 "/debug/rag/search",
-                json={"query": "hello"},
+                json={"query": "hello", "mode": "vector"},
                 cookies={"access_token": token},
             )
 
@@ -176,10 +286,10 @@ async def test_rag_search_llm_error_returns_502() -> None:
     app = _build_app()
     token = _mint_cookie(role=Role.CLIENT_ADMIN)
 
-    async def _raise(*args: object, **kwargs: object) -> RetrievalResult:
+    async def _raise(*args: object, **kwargs: object) -> HybridResult:
         raise LLMError("upstream failed")
 
-    with patch("api.rag.routes.retrieve", side_effect=_raise):
+    with patch("api.rag.routes.retrieve_hybrid", side_effect=_raise):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.post(
                 "/debug/rag/search",

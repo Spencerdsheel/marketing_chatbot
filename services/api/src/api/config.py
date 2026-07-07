@@ -93,6 +93,26 @@ class ApiSettings(Settings):
     rag_default_top_k: int = 5
     rag_max_top_k: int = 20
 
+    # RAG hybrid retrieval (S6.2).
+    # rag_hybrid_candidate_k: candidate depth per leg (vector + keyword) before
+    #   RRF fusion -- fuse over a wider pool than the final k.
+    # rag_rrf_k: the RRF constant (standard default 60) in 1/(rrf_k + rank).
+    # rag_fts_language: the Postgres FTS regconfig (bound param, never
+    #   string-interpolated); must match the literal used in the migration
+    #   0013 GIN index expression for the index to be used.
+    # rag_confidence_floor: a vector hit's score must be >= this to count
+    #   toward "coverage" in _compute_confidence.
+    # rag_conf_w_top / rag_conf_w_margin / rag_conf_w_coverage: weights for the
+    #   richer hybrid confidence formula (top similarity + margin + coverage),
+    #   default sum to 1.0.
+    rag_hybrid_candidate_k: int = 20
+    rag_rrf_k: int = 60
+    rag_fts_language: str = "english"
+    rag_confidence_floor: float = 0.35
+    rag_conf_w_top: float = 0.6
+    rag_conf_w_margin: float = 0.25
+    rag_conf_w_coverage: float = 0.15
+
 
 @lru_cache(maxsize=1)
 def get_api_settings() -> ApiSettings:

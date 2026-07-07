@@ -11,11 +11,12 @@ must never leak across the seam, no matter what the DB "actually" holds.
 """
 from __future__ import annotations
 
-import sys
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 from common.auth import AuthClaims, Role
+
+from api.rag.repository import KeywordMatch
 
 _TENANT_A = "tenant-a"
 _TENANT_B = "tenant-b"
@@ -40,9 +41,11 @@ _ALL_ROWS = [
 
 
 def _reset_modules() -> None:
-    for key in list(sys.modules.keys()):
-        if key.startswith("api.rag"):
-            del sys.modules[key]
+    # Clear settings caches only. Do NOT delete api.rag / api.config from
+    # sys.modules -- that splits the module graph and poisons the repository/
+    # routes tests (which import search_chunks at collection time). api.rag.*
+    # read settings via get_api_settings() at call time, so a cache-clear is
+    # sufficient. (Same trap as the S4.4/S5.1 api.config fallout.)
     from common.settings import get_settings
 
     from api.config import get_api_settings
@@ -167,3 +170,130 @@ async def test_global_platform_admin_caller_rejected_not_leaked_to_search() -> N
 
     assert raised
     search_spy.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# S6.2: the KEYWORD leg must be tenant-isolated too -- retrieve_hybrid under
+# tenant-A must never surface tenant-B content via EITHER leg.
+# ---------------------------------------------------------------------------
+
+# Distinct content per tenant on BOTH legs, so a leaked row (from either the
+# vector or the keyword leg) is unambiguous in the assertions below.
+_ALL_KEYWORD_ROWS = [
+    {"tenant_id": _TENANT_A, "doc_id": "a-doc", "chunk_id": "a-kw-0000", "content": "tenant A mystery shopping", "rank": 0.9},
+    {"tenant_id": _TENANT_B, "doc_id": "b-doc", "chunk_id": "b-kw-0000", "content": "tenant B mystery shopping", "rank": 0.8},
+]
+
+
+async def _fake_keyword_search(
+    db: Any,
+    claims: AuthClaims,
+    query: str,
+    *,
+    top_k: int,
+) -> list[KeywordMatch]:
+    """Applies the same tenant filter the real FTS query enforces (WHERE tenant_id = $N).
+
+    ``api.rag.service.keyword_search`` is patched here at the already-mapped
+    (``KeywordMatch``) seam -- unlike ``_fake_similarity_search`` above, which
+    stands in for the lower-level ``common.pgvector.similarity_search`` and
+    still returns raw rows for ``api.rag.repository.search_chunks`` to map.
+    """
+    return [
+        KeywordMatch(doc_id=row["doc_id"], chunk_id=row["chunk_id"], content=row["content"], rank=row["rank"])
+        for row in _ALL_KEYWORD_ROWS
+        if row["tenant_id"] == claims.tenant_id
+    ][:top_k]
+
+
+async def test_retrieve_hybrid_under_tenant_a_never_returns_tenant_b_via_either_leg() -> None:
+    _reset_modules()
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.config import get_api_settings  # noqa: PLC0415
+
+        get_api_settings.cache_clear()
+        dim = get_api_settings().embedding_dimension
+
+        from api.rag.service import retrieve_hybrid  # noqa: PLC0415
+
+        provider = _StubProvider(dim)
+
+        with (
+            patch("api.rag.service.get_llm_config", new=AsyncMock(return_value=_StubConfig())),
+            patch("api.rag.service.provider_for", return_value=provider),
+            patch("api.rag.repository.similarity_search", new=_fake_similarity_search),
+            patch("api.rag.service.keyword_search", new=_fake_keyword_search),
+        ):
+            result_a = await retrieve_hybrid(object(), _claims(_TENANT_A), "mystery shopping", k=5)
+            result_b = await retrieve_hybrid(object(), _claims(_TENANT_B), "mystery shopping", k=5)
+
+    a_contents = [c.content for c in result_a.chunks]
+    b_contents = [c.content for c in result_b.chunks]
+
+    assert any("tenant A" in c for c in a_contents)
+    assert all("tenant B" not in c for c in a_contents)
+
+    assert any("tenant B" in c for c in b_contents)
+    assert all("tenant A" not in c for c in b_contents)
+
+
+async def test_retrieve_hybrid_keyword_leg_alone_is_tenant_isolated() -> None:
+    """Even when the vector leg is empty, the keyword leg alone must not leak."""
+    _reset_modules()
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.config import get_api_settings  # noqa: PLC0415
+
+        get_api_settings.cache_clear()
+        dim = get_api_settings().embedding_dimension
+
+        from api.rag.service import retrieve_hybrid  # noqa: PLC0415
+
+        provider = _StubProvider(dim)
+
+        with (
+            patch("api.rag.service.get_llm_config", new=AsyncMock(return_value=_StubConfig())),
+            patch("api.rag.service.provider_for", return_value=provider),
+            patch("api.rag.service.search_chunks", new=AsyncMock(return_value=[])),
+            patch("api.rag.service.keyword_search", new=_fake_keyword_search),
+        ):
+            result_a = await retrieve_hybrid(object(), _claims(_TENANT_A), "mystery shopping", k=5)
+
+    assert len(result_a.chunks) == 1
+    assert result_a.chunks[0].chunk_id == "a-kw-0000"
+    assert result_a.chunks[0].matched_by == ["keyword"]
+    assert "tenant B" not in result_a.chunks[0].content
+
+
+async def test_retrieve_hybrid_global_platform_admin_rejected_before_either_leg() -> None:
+    """A PLATFORM_ADMIN (tenant_id=None) caller must be rejected before both legs run."""
+    from common.errors import ValidationError
+
+    _reset_modules()
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.config import get_api_settings  # noqa: PLC0415
+
+        get_api_settings.cache_clear()
+        dim = get_api_settings().embedding_dimension
+
+        from api.rag.service import retrieve_hybrid  # noqa: PLC0415
+
+        provider = _StubProvider(dim)
+        search_spy = AsyncMock(side_effect=_fake_similarity_search)
+        keyword_spy = AsyncMock(side_effect=_fake_keyword_search)
+
+        with (
+            patch("api.rag.service.get_llm_config", new=AsyncMock(return_value=_StubConfig())),
+            patch("api.rag.service.provider_for", return_value=provider),
+            patch("api.rag.repository.similarity_search", new=search_spy),
+            patch("api.rag.service.keyword_search", new=keyword_spy),
+        ):
+            claims = AuthClaims(subject="admin", role=Role.PLATFORM_ADMIN, tenant_id=None)
+            try:
+                await retrieve_hybrid(object(), claims, "query", k=5)
+                raised = False
+            except ValidationError:
+                raised = True
+
+    assert raised
+    search_spy.assert_not_awaited()
+    keyword_spy.assert_not_awaited()
