@@ -30,6 +30,24 @@ async def get_user_by_email(db: Database, email: str) -> Row | None:
     return dict(record) if record is not None else None
 
 
+async def get_user_by_id(db: Database, user_id: str) -> Row | None:
+    """Look up a user by id. Returns the full row or None.
+
+    Parameterized (``WHERE id = $1``). Callers that need tenant-scoped
+    validation (e.g. lead assignment) must check the returned row's
+    ``tenant_id``/``role``/``active`` themselves -- this is a plain identity
+    lookup, not a tenant-scoped query, since ``users`` has no repository of
+    its own yet.
+    """
+    sql = (
+        "SELECT id, tenant_id, email, role, password_hash, name, "
+        "active, last_login_at "
+        "FROM users WHERE id = $1"
+    )
+    record = await db.fetchrow(sql, user_id)
+    return dict(record) if record is not None else None
+
+
 async def set_password_hash(db: Database, user_id: str, new_hash: str) -> None:
     """Update a user's password hash. Parameterized; no tenant filter needed
     (the caller already validated the reset token for this user_id).

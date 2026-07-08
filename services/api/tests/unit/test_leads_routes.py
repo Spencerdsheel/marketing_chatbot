@@ -543,3 +543,122 @@ async def test_post_leads_no_default_source() -> None:
     mock_create_lead.assert_awaited_once()
     _, kwargs = mock_create_lead.call_args
     assert kwargs["source"] == "widget"
+
+
+# ---------------------------------------------------------------------------
+# crm.sync_lead enqueue-on-capture (S7.4 decision 4)
+# ---------------------------------------------------------------------------
+
+
+async def test_post_leads_enqueues_crm_sync_with_trusted_ids() -> None:
+    """After a successful capture, crm.sync_lead is enqueued with the trusted
+    tenant_id + lead_id (never from the request body)."""
+    db = _StubDatabase()
+    app = _build_app(db)
+
+    mock_create_lead = AsyncMock(return_value="lead-crm-1")
+
+    with (
+        patch("api.leads.routes.create_lead", new=mock_create_lead),
+        patch("api.leads.routes.sync_lead") as mock_sync_lead,
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            visitor_token = _create_visitor_token(tenant_id="tenant-real")
+            body = {
+                "name": "Jane",
+                "email": "jane@example.com",
+                "tenant_id": "tenant-fake",
+                "consent": {
+                    "granted": True,
+                    "purpose": "contact",
+                    "text": "OK",
+                },
+            }
+
+            response = await client.post(
+                "/public/leads",
+                json=body,
+                headers={"Authorization": f"Bearer {visitor_token}"},
+            )
+
+    assert response.status_code == 201
+    mock_sync_lead.delay.assert_called_once()
+    _, kwargs = mock_sync_lead.delay.call_args
+    assert kwargs["tenant_id"] == "tenant-real"
+    assert kwargs["lead_id"] == "lead-crm-1"
+
+
+async def test_post_leads_still_201_when_enqueue_raises() -> None:
+    """An enqueue failure must not fail capture -- it is wrapped and logged."""
+    db = _StubDatabase()
+    app = _build_app(db)
+
+    mock_create_lead = AsyncMock(return_value="lead-crm-2")
+
+    with (
+        patch("api.leads.routes.create_lead", new=mock_create_lead),
+        patch("api.leads.routes.sync_lead") as mock_sync_lead,
+    ):
+        mock_sync_lead.delay.side_effect = RuntimeError("broker unavailable")
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            visitor_token = _create_visitor_token()
+            body = {
+                "name": "Jane",
+                "email": "jane@example.com",
+                "consent": {
+                    "granted": True,
+                    "purpose": "contact",
+                    "text": "OK",
+                },
+            }
+
+            response = await client.post(
+                "/public/leads",
+                json=body,
+                headers={"Authorization": f"Bearer {visitor_token}"},
+            )
+
+    assert response.status_code == 201
+    data = response.json()
+    assert data["lead_id"] == "lead-crm-2"
+
+
+async def test_post_leads_enqueue_failure_logs_crm_enqueue_failed(caplog: Any) -> None:
+    db = _StubDatabase()
+    app = _build_app(db)
+
+    mock_create_lead = AsyncMock(return_value="lead-crm-3")
+
+    with (
+        patch("api.leads.routes.create_lead", new=mock_create_lead),
+        patch("api.leads.routes.sync_lead") as mock_sync_lead,
+    ):
+        mock_sync_lead.delay.side_effect = RuntimeError("broker unavailable")
+
+        with caplog.at_level(logging.DEBUG):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                visitor_token = _create_visitor_token()
+                body = {
+                    "name": "Jane",
+                    "email": "jane@example.com",
+                    "consent": {
+                        "granted": True,
+                        "purpose": "contact",
+                        "text": "OK",
+                    },
+                }
+
+                await client.post(
+                    "/public/leads",
+                    json=body,
+                    headers={"Authorization": f"Bearer {visitor_token}"},
+                )
+
+    assert "crm_enqueue_failed" in caplog.text

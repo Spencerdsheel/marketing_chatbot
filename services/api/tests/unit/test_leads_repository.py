@@ -6,6 +6,8 @@ Covers:
 - Cross-tenant isolation: lead created under tenant A is not visible to tenant B.
 - IDs are uuid4().hex.
 - Positional placeholders ($1, $2, ...) are used.
+- update_lead_stage issues a tenant-scoped UPDATE, returns the updated Lead,
+  no-ops (returns None) cross-tenant, and rejects global callers.
 """
 from __future__ import annotations
 
@@ -46,13 +48,65 @@ class _StubDatabase:
     def __init__(self) -> None:
         # leads: keyed by (tenant_id, lead_id)
         self._leads: dict[tuple[str, str], dict[str, Any]] = {}
-        # Record all execute/fetchrow calls for inspection
+        # lead_activities: keyed by (tenant_id, activity_id)
+        self._activities: dict[tuple[str, str], dict[str, Any]] = {}
+        # Record all execute/fetchrow/fetch calls for inspection
         self.execute_calls: list[tuple[str, tuple[Any, ...]]] = []
         self.fetchrow_calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.fetch_calls: list[tuple[str, tuple[Any, ...]]] = []
 
     async def execute(self, query: str, *args: Any) -> str:
         self.execute_calls.append((query, args))
         q = query.strip().upper()
+
+        if q.startswith("UPDATE LEADS SET ASSIGNED_AGENT_ID"):
+            # args: assigned_agent_id, tenant_id, lead_id
+            assigned_agent_id = args[0]
+            tenant_id = args[1]
+            lead_id = args[2]
+            key = (tenant_id, lead_id)
+            existing = self._leads.get(key)
+            if existing is None:
+                return "UPDATE 0"
+            existing["assigned_agent_id"] = assigned_agent_id
+            existing["updated_at"] = _NOW
+            return "UPDATE 1"
+
+        if q.startswith("UPDATE LEADS"):
+            # args: stage, status, qualification_score, tenant_id, lead_id
+            stage = args[0]
+            status = args[1]
+            qualification_score = args[2]
+            tenant_id = args[3]
+            lead_id = args[4]
+            key = (tenant_id, lead_id)
+            existing = self._leads.get(key)
+            if existing is None:
+                return "UPDATE 0"
+            existing["stage"] = stage
+            existing["status"] = status
+            existing["qualification_score"] = qualification_score
+            existing["updated_at"] = _NOW
+            return "UPDATE 1"
+
+        if q.startswith("INSERT INTO LEAD_ACTIVITIES"):
+            # args: tenant_id, activity_id, lead_id, type, payload, actor
+            tenant_id = args[0]
+            activity_id = args[1]
+            lead_id = args[2]
+            activity_type = args[3]
+            payload = args[4]
+            actor = args[5]
+            self._activities[(tenant_id, activity_id)] = {
+                "tenant_id": tenant_id,
+                "activity_id": activity_id,
+                "lead_id": lead_id,
+                "type": activity_type,
+                "payload": payload,
+                "actor": actor,
+                "created_at": _NOW,
+            }
+            return "INSERT 0 1"
 
         if q.startswith("INSERT INTO LEADS"):
             # args: tenant_id, lead_id, visitor_id, name, email, phone, status, stage,
@@ -102,6 +156,24 @@ class _StubDatabase:
             return self._leads.get(key)
 
         return None
+
+    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        self.fetch_calls.append((query, args))
+        q = query.strip().upper()
+
+        if "FROM LEAD_ACTIVITIES" in q:
+            # list_activities — WHERE tenant_id = $1 AND lead_id = $2
+            tenant_id = args[0]
+            lead_id = args[1]
+            rows = [
+                row
+                for row in self._activities.values()
+                if row["tenant_id"] == tenant_id and row["lead_id"] == lead_id
+            ]
+            rows.sort(key=lambda r: r["created_at"], reverse=True)
+            return rows
+
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -327,3 +399,383 @@ async def test_get_lead_uses_positional_placeholders() -> None:
         assert "$1" in select_query  # tenant_id
         assert "$2" in select_query  # lead_id
         assert ":" not in select_query  # no named placeholders
+
+
+# ---------------------------------------------------------------------------
+# update_lead_stage
+# ---------------------------------------------------------------------------
+
+
+async def test_update_lead_stage_updates_and_returns_lead() -> None:
+    """update_lead_stage issues a tenant-scoped UPDATE and returns the updated Lead."""
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.leads.repository import Lead, create_lead, update_lead_stage
+
+        db = _StubDatabase()
+        claims = _claims(tenant_id="tenant-abc")
+
+        lead_id = await create_lead(
+            db,
+            claims,
+            visitor_id="visitor-1",
+            name="Jane",
+            email="jane@example.com",
+            phone=None,
+            consent={"granted": True, "purpose": "contact", "text": "OK"},
+            source="widget",
+        )
+
+        updated = await update_lead_stage(
+            db,
+            claims,
+            lead_id,
+            stage="qualified",
+            status="open",
+            qualification_score=55,
+        )
+
+        assert isinstance(updated, Lead)
+        assert updated.lead_id == lead_id
+        assert updated.stage == "qualified"
+        assert updated.status == "open"
+        assert updated.qualification_score == 55
+
+
+async def test_update_lead_stage_uses_tenant_scoped_positional_sql() -> None:
+    """The UPDATE statement filters WHERE tenant_id=$_ AND lead_id=$_ with positional params."""
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.leads.repository import create_lead, update_lead_stage
+
+        db = _StubDatabase()
+        claims = _claims(tenant_id="tenant-abc")
+
+        lead_id = await create_lead(
+            db,
+            claims,
+            visitor_id="visitor-1",
+            name="Jane",
+            email="jane@example.com",
+            phone=None,
+            consent={"granted": True, "purpose": "contact", "text": "OK"},
+            source="widget",
+        )
+
+        await update_lead_stage(
+            db,
+            claims,
+            lead_id,
+            stage="qualified",
+            status="open",
+            qualification_score=55,
+        )
+
+        update_query, update_args = db.execute_calls[-1]
+        assert "update leads" in update_query.lower()
+        assert "where" in update_query.lower()
+        assert "tenant_id" in update_query.lower()
+        assert "lead_id" in update_query.lower()
+        assert "updated_at" in update_query.lower()
+        assert ":" not in update_query  # no named placeholders
+        # tenant_id and lead_id must be among the bound params
+        assert claims.tenant_id in update_args
+        assert lead_id in update_args
+
+
+async def test_update_lead_stage_cross_tenant_returns_none() -> None:
+    """A caller from tenant B updating tenant A's lead matches 0 rows -> None."""
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.leads.repository import create_lead, update_lead_stage
+
+        db = _StubDatabase()
+        claims_a = _claims(tenant_id="tenant-a")
+        claims_b = _claims(tenant_id="tenant-b")
+
+        lead_id = await create_lead(
+            db,
+            claims_a,
+            visitor_id="visitor-1",
+            name="Jane",
+            email="jane@example.com",
+            phone=None,
+            consent={"granted": True, "purpose": "contact", "text": "OK"},
+            source="widget",
+        )
+
+        result = await update_lead_stage(
+            db,
+            claims_b,
+            lead_id,
+            stage="qualified",
+            status="open",
+            qualification_score=55,
+        )
+
+        assert result is None
+
+
+async def test_update_lead_stage_missing_lead_returns_none() -> None:
+    """Updating a nonexistent lead_id returns None."""
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.leads.repository import update_lead_stage
+
+        db = _StubDatabase()
+        claims = _claims(tenant_id="tenant-abc")
+
+        result = await update_lead_stage(
+            db,
+            claims,
+            "nonexistent-id",
+            stage="qualified",
+            status="open",
+            qualification_score=55,
+        )
+
+        assert result is None
+
+
+async def test_update_lead_stage_rejects_global_caller() -> None:
+    """A PLATFORM_ADMIN (global, tenant_id=None) caller raises ValidationError."""
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from common.errors import ValidationError
+
+        from api.leads.repository import update_lead_stage
+
+        db = _StubDatabase()
+        global_claims = AuthClaims(subject="admin-1", role=Role.PLATFORM_ADMIN, tenant_id=None)
+
+        with pytest.raises(ValidationError):
+            await update_lead_stage(
+                db,
+                global_claims,
+                "some-lead-id",
+                stage="qualified",
+                status="open",
+                qualification_score=55,
+            )
+
+
+# ---------------------------------------------------------------------------
+# add_activity / list_activities / assign_lead
+# ---------------------------------------------------------------------------
+
+
+async def test_add_activity_inserts_tenant_scoped_row() -> None:
+    """add_activity issues a tenant-scoped INSERT and returns a uuid4().hex activity_id."""
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.leads.repository import add_activity, create_lead
+
+        db = _StubDatabase()
+        claims = _claims(tenant_id="tenant-abc")
+        lead_id = await create_lead(
+            db,
+            claims,
+            visitor_id="visitor-1",
+            name="Jane",
+            email="jane@example.com",
+            phone=None,
+            consent={"granted": True, "purpose": "contact", "text": "OK"},
+            source="widget",
+        )
+
+        activity_id = await add_activity(
+            db,
+            claims,
+            lead_id,
+            type="note",
+            payload={"text": "Called, left voicemail."},
+            actor="user-1",
+        )
+
+        assert isinstance(activity_id, str)
+        assert len(activity_id) == 32
+
+        insert_query, insert_args = db.execute_calls[-1]
+        assert "insert into lead_activities" in insert_query.lower()
+        assert "$1" in insert_query
+        assert ":" not in insert_query
+        assert insert_args[0] == claims.tenant_id
+        assert insert_args[1] == activity_id
+        assert insert_args[2] == lead_id
+        assert insert_args[3] == "note"
+        assert insert_args[4] == {"text": "Called, left voicemail."}
+        assert insert_args[5] == "user-1"
+
+
+async def test_add_activity_rejects_global_caller() -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from common.errors import ValidationError
+
+        from api.leads.repository import add_activity
+
+        db = _StubDatabase()
+        global_claims = AuthClaims(subject="admin-1", role=Role.PLATFORM_ADMIN, tenant_id=None)
+
+        with pytest.raises(ValidationError):
+            await add_activity(
+                db,
+                global_claims,
+                "some-lead-id",
+                type="note",
+                payload={"text": "x"},
+                actor="admin-1",
+            )
+
+
+async def test_list_activities_returns_tenant_scoped_ordered() -> None:
+    """list_activities returns only this tenant's activities for the lead, newest first."""
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.leads.repository import LeadActivity, add_activity, create_lead, list_activities
+
+        db = _StubDatabase()
+        claims = _claims(tenant_id="tenant-abc")
+        lead_id = await create_lead(
+            db,
+            claims,
+            visitor_id="visitor-1",
+            name="Jane",
+            email="jane@example.com",
+            phone=None,
+            consent={"granted": True, "purpose": "contact", "text": "OK"},
+            source="widget",
+        )
+
+        first_id = await add_activity(
+            db, claims, lead_id, type="note", payload={"text": "first"}, actor="user-1"
+        )
+        second_id = await add_activity(
+            db, claims, lead_id, type="note", payload={"text": "second"}, actor="user-1"
+        )
+        # Force distinct timestamps so DESC ordering is unambiguous.
+        db._activities[(claims.tenant_id, first_id)]["created_at"] = datetime(
+            2026, 1, 1, 12, 0, 0, tzinfo=UTC
+        )
+        db._activities[(claims.tenant_id, second_id)]["created_at"] = datetime(
+            2026, 1, 1, 12, 5, 0, tzinfo=UTC
+        )
+
+        activities = await list_activities(db, claims, lead_id)
+
+        assert all(isinstance(a, LeadActivity) for a in activities)
+        assert [a.activity_id for a in activities] == [second_id, first_id]
+
+
+async def test_list_activities_cross_tenant_empty() -> None:
+    """A tenant B caller sees no activities for tenant A's lead."""
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.leads.repository import add_activity, create_lead, list_activities
+
+        db = _StubDatabase()
+        claims_a = _claims(tenant_id="tenant-a")
+        claims_b = _claims(tenant_id="tenant-b")
+
+        lead_id = await create_lead(
+            db,
+            claims_a,
+            visitor_id="visitor-1",
+            name="Jane",
+            email="jane@example.com",
+            phone=None,
+            consent={"granted": True, "purpose": "contact", "text": "OK"},
+            source="widget",
+        )
+        await add_activity(db, claims_a, lead_id, type="note", payload={"text": "hi"}, actor="user-1")
+
+        activities = await list_activities(db, claims_b, lead_id)
+
+        assert activities == []
+
+
+async def test_list_activities_rejects_global_caller() -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from common.errors import ValidationError
+
+        from api.leads.repository import list_activities
+
+        db = _StubDatabase()
+        global_claims = AuthClaims(subject="admin-1", role=Role.PLATFORM_ADMIN, tenant_id=None)
+
+        with pytest.raises(ValidationError):
+            await list_activities(db, global_claims, "some-lead-id")
+
+
+async def test_assign_lead_updates_assigned_agent_id() -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.leads.repository import Lead, assign_lead, create_lead
+
+        db = _StubDatabase()
+        claims = _claims(tenant_id="tenant-abc")
+        lead_id = await create_lead(
+            db,
+            claims,
+            visitor_id="visitor-1",
+            name="Jane",
+            email="jane@example.com",
+            phone=None,
+            consent={"granted": True, "purpose": "contact", "text": "OK"},
+            source="widget",
+        )
+
+        updated = await assign_lead(db, claims, lead_id, agent_id="agent-1")
+
+        assert isinstance(updated, Lead)
+        assert updated.assigned_agent_id == "agent-1"
+
+        update_query, update_args = db.execute_calls[-1]
+        assert "update leads" in update_query.lower()
+        assert "assigned_agent_id" in update_query.lower()
+        assert "$1" in update_query
+        assert ":" not in update_query
+        assert claims.tenant_id in update_args
+        assert lead_id in update_args
+
+
+async def test_assign_lead_cross_tenant_returns_none() -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.leads.repository import assign_lead, create_lead
+
+        db = _StubDatabase()
+        claims_a = _claims(tenant_id="tenant-a")
+        claims_b = _claims(tenant_id="tenant-b")
+
+        lead_id = await create_lead(
+            db,
+            claims_a,
+            visitor_id="visitor-1",
+            name="Jane",
+            email="jane@example.com",
+            phone=None,
+            consent={"granted": True, "purpose": "contact", "text": "OK"},
+            source="widget",
+        )
+
+        result = await assign_lead(db, claims_b, lead_id, agent_id="agent-1")
+
+        assert result is None
+        stored = db._leads[("tenant-a", lead_id)]
+        assert stored["assigned_agent_id"] is None
+
+
+async def test_assign_lead_rejects_global_caller() -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from common.errors import ValidationError
+
+        from api.leads.repository import assign_lead
+
+        db = _StubDatabase()
+        global_claims = AuthClaims(subject="admin-1", role=Role.PLATFORM_ADMIN, tenant_id=None)
+
+        with pytest.raises(ValidationError):
+            await assign_lead(db, global_claims, "some-lead-id", agent_id="agent-1")

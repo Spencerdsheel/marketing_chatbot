@@ -43,6 +43,18 @@ class Lead:
     updated_at: datetime
 
 
+@dataclass(frozen=True)
+class LeadActivity:
+    """A single append-only timeline event for a lead."""
+
+    activity_id: str
+    lead_id: str
+    type: str
+    payload: dict[str, Any] | None
+    actor: str | None
+    created_at: datetime
+
+
 def _reject_global(claims: AuthClaims) -> None:
     """Raise ``ValidationError`` for global callers (PLATFORM_ADMIN).
 
@@ -119,6 +131,157 @@ async def get_lead(
     return _row_to_lead(row) if row is not None else None
 
 
+async def update_lead_stage(
+    db: Database,
+    claims: AuthClaims,
+    lead_id: str,
+    *,
+    stage: str,
+    status: str,
+    qualification_score: int,
+) -> Lead | None:
+    """Update a lead's ``stage``/``status``/``qualification_score``, tenant-scoped.
+
+    ``status`` and ``qualification_score`` must already be derived (see
+    ``api.leads.pipeline``) -- this method persists them as-is; it does not
+    validate the transition itself.
+
+    Returns the updated ``Lead``, or ``None`` if no row matched (missing
+    ``lead_id`` or cross-tenant access -- callers cannot distinguish the two,
+    which is the point: no cross-tenant existence leak).
+    """
+    _reject_global(claims)
+
+    result = await db.execute(
+        "UPDATE leads SET stage = $1, status = $2, qualification_score = $3, "
+        "updated_at = now() "
+        "WHERE tenant_id = $4 AND lead_id = $5",
+        stage,
+        status,
+        qualification_score,
+        claims.tenant_id,
+        lead_id,
+    )
+    if _rows_affected(result) == 0:
+        return None
+
+    return await get_lead(db, claims, lead_id)
+
+
+async def add_activity(
+    db: Database,
+    claims: AuthClaims,
+    lead_id: str,
+    *,
+    type: str,
+    payload: dict[str, Any] | None,
+    actor: str,
+) -> str:
+    """Append a timeline event for a lead. Returns the new ``activity_id``.
+
+    Tenant-scoped INSERT; ``payload`` is bound as jsonb (default codec).
+    This does not verify the lead exists -- callers (routes) are expected to
+    have already resolved the lead via ``get_lead`` before appending.
+    """
+    _reject_global(claims)
+
+    new_activity_id = uuid4().hex
+    await db.execute(
+        "INSERT INTO lead_activities "
+        "(tenant_id, activity_id, lead_id, type, payload, actor) "
+        "VALUES ($1, $2, $3, $4, $5, $6)",
+        claims.tenant_id,
+        new_activity_id,
+        lead_id,
+        type,
+        payload,
+        actor,
+    )
+    return new_activity_id
+
+
+async def list_activities(
+    db: Database,
+    claims: AuthClaims,
+    lead_id: str,
+) -> list[LeadActivity]:
+    """Fetch a lead's timeline, tenant-scoped, newest first."""
+    _reject_global(claims)
+
+    rows = await db.fetch(
+        "SELECT activity_id, lead_id, type, payload, actor, created_at "
+        "FROM lead_activities "
+        "WHERE tenant_id = $1 AND lead_id = $2 "
+        "ORDER BY created_at DESC",
+        claims.tenant_id,
+        lead_id,
+    )
+    return [_row_to_activity(row) for row in rows]
+
+
+async def assign_lead(
+    db: Database,
+    claims: AuthClaims,
+    lead_id: str,
+    *,
+    agent_id: str,
+) -> Lead | None:
+    """Assign a lead to an agent, tenant-scoped.
+
+    Persists ``assigned_agent_id`` as-is -- callers (routes) are expected to
+    have already validated the assignee via ``auth.repository.get_user_by_id``
+    before calling this. Returns the updated ``Lead``, or ``None`` if no row
+    matched (missing ``lead_id`` or cross-tenant access).
+    """
+    _reject_global(claims)
+
+    result = await db.execute(
+        "UPDATE leads SET assigned_agent_id = $1, updated_at = now() "
+        "WHERE tenant_id = $2 AND lead_id = $3",
+        agent_id,
+        claims.tenant_id,
+        lead_id,
+    )
+    if _rows_affected(result) == 0:
+        return None
+
+    return await get_lead(db, claims, lead_id)
+
+
+async def list_leads_for_export(
+    db: Database,
+    claims: AuthClaims,
+) -> list[Lead]:
+    """Fetch all of the caller's tenant leads, newest first, for CSV export.
+
+    Tenant-scoped (S7.4 decision 5) -- other tenants' leads are never
+    returned. Raises ``ValidationError`` for global callers (PLATFORM_ADMIN).
+    """
+    _reject_global(claims)
+
+    rows = await db.fetch(
+        "SELECT lead_id, visitor_id, name, email, phone, status, stage, "
+        "qualification_score, consent, assigned_agent_id, source, "
+        "created_at, updated_at "
+        "FROM leads "
+        "WHERE tenant_id = $1 "
+        "ORDER BY created_at DESC",
+        claims.tenant_id,
+    )
+    return [_row_to_lead(row) for row in rows]
+
+
+def _rows_affected(command_tag: str) -> int:
+    """Parse the row count from an asyncpg-style command tag (e.g. 'UPDATE 1')."""
+    parts = command_tag.strip().split()
+    if not parts:
+        return 0
+    try:
+        return int(parts[-1])
+    except ValueError:
+        return 0
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -139,4 +302,15 @@ def _row_to_lead(row: Any) -> Lead:
         source=str(row["source"]),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+    )
+
+
+def _row_to_activity(row: Any) -> LeadActivity:
+    return LeadActivity(
+        activity_id=str(row["activity_id"]),
+        lead_id=str(row["lead_id"]),
+        type=str(row["type"]),
+        payload=row["payload"],
+        actor=row["actor"],
+        created_at=row["created_at"],
     )

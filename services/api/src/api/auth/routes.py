@@ -130,7 +130,24 @@ async def login(body: LoginRequest, request: Request, response: Response) -> Log
 
     _log.info("user logged in", extra={"event": "login_success"})
 
-    # 8. Return profile (no token, no password_hash)
+    # 9. Best-effort audit record (never breaks login)
+    try:
+        from api.audit.repository import record_audit
+
+        await record_audit(
+            db,
+            claims,
+            action="auth.login",
+            target_type="user",
+            target_id=user_id,
+        )
+    except Exception:
+        _log.warning(
+            "failed to record audit event for login",
+            extra={"event": "audit_record_failed"},
+        )
+
+    # 10. Return profile (no token, no password_hash)
     return LoginProfile(
         id=user_id,
         email=row["email"],

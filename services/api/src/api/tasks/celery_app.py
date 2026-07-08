@@ -68,7 +68,7 @@ celery_app = Celery(
     "chatbot",
     broker=_resolve_broker_url(),
     backend=_resolve_result_backend(),
-    include=["api.tasks.debug_tasks", "api.ingestion.tasks"],
+    include=["api.tasks.debug_tasks", "api.ingestion.tasks", "api.crm.tasks"],
 )
 
 # -- Serialization (security: JSON only, never pickle) -------------------------

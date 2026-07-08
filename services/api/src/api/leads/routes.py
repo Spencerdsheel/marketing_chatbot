@@ -18,6 +18,7 @@ from common.logging import get_logger
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, field_validator
 
+from api.crm.tasks import sync_lead
 from api.gateway.dependencies import get_visitor_claims
 from api.leads.repository import create_lead
 
@@ -120,5 +121,29 @@ async def capture_lead(
         "lead captured",
         extra={"event": "lead_captured", "lead_id": lead_id, "tenant_id": claims.tenant_id},
     )
+
+    # -- Enqueue outbound CRM sync (fire-and-forget; S7.4 decision 4) -------
+    # Never awaited, never allowed to fail the capture: an enqueue failure
+    # (e.g. broker unavailable) is logged and swallowed -- the visitor still
+    # gets their 201. crm.sync_lead re-derives everything it needs from the
+    # trusted tenant_id + lead_id; nothing from the request body is passed.
+    from common.logging import _correlation_id  # noqa: PLC0415, PLC2701
+
+    correlation_id = _correlation_id.get() or ""
+    try:
+        sync_lead.delay(
+            tenant_id=claims.tenant_id,
+            lead_id=lead_id,
+            correlation_id=correlation_id,
+        )
+    except Exception:
+        _log.warning(
+            "crm_enqueue_failed",
+            extra={
+                "event": "crm_enqueue_failed",
+                "lead_id": lead_id,
+                "tenant_id": claims.tenant_id,
+            },
+        )
 
     return LeadCaptureResponse(lead_id=lead_id, status="new")
