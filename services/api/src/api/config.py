@@ -113,6 +113,38 @@ class ApiSettings(Settings):
     rag_conf_w_margin: float = 0.25
     rag_conf_w_coverage: float = 0.15
 
+    # Observability (S11.3).
+    # sentry_dsn: Sentry DSN URL. When unset or empty, Sentry is a no-op.
+    #   Comes from env/.env; never hardcode a real DSN.
+    # environment: deployment environment label (dev, staging, production).
+    sentry_dsn: str | None = None
+    environment: str = "dev"
+
+    # Native scheduling / booking (S8.1).
+    # schedule_slot_window_days: default window size (days) for GET /public/schedule/slots
+    #   when date_from/date_to are not supplied by the caller.
+    # schedule_slot_window_max_days: hard cap on the window span -- compute_slots
+    #   enforces this itself too, so a caller-supplied window can't run unbounded.
+    schedule_slot_window_days: int = 14
+    schedule_slot_window_max_days: int = 60
+
+    # Calendar sync (S8.2).
+    # calendar_http_timeout_seconds: per-call httpx timeout for CalendarProvider
+    #   free-busy/create-event requests (GoogleCalendarProvider).
+    calendar_http_timeout_seconds: float = 10.0
+
+    # Reminder jobs (S8.3).
+    # reminder_poll_interval_seconds: the Celery Beat "dispatch-due-reminders"
+    #   periodic task's fixed poll interval.
+    # reminder_dispatch_batch_size: LIMIT on the atomic claim UPDATE per tick --
+    #   only reduces lock contention/tick cost, correctness does not depend on it.
+    # reminder_sink: selects the ReminderSink impl (api.scheduling.reminders
+    #   .reminder_sink_for). Only "log" (LogReminderSink) exists this sprint;
+    #   S9.2 adds the real notification-service-backed sink.
+    reminder_poll_interval_seconds: int = 60
+    reminder_dispatch_batch_size: int = 100
+    reminder_sink: str = "log"
+
 
 @lru_cache(maxsize=1)
 def get_api_settings() -> ApiSettings:

@@ -21,6 +21,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
 from api.config import ApiSettings, get_api_settings
+from api.observability.sentry import capture_exception, init_sentry
 
 _log = get_logger(__name__)
 
@@ -92,7 +93,17 @@ def create_app() -> FastAPI:
     root = get_logger("api")
     root.setLevel(getattr(logging, settings.log_level.upper(), logging.INFO))
 
+    # S11.3: optional Sentry init (no-op if DSN unset or sentry-sdk not installed).
+    init_sentry(settings.sentry_dsn, settings.environment)
+
     app = FastAPI(title="Chatbot API", version="0.1.0", lifespan=_lifespan)
+
+    # -- HTTP metrics middleware (S11.3) -- records request latency + counts ----
+    from api.observability.middleware import metrics_middleware
+
+    @app.middleware("http")
+    async def _metrics_middleware(request: Request, call_next: Any) -> Response:
+        return await metrics_middleware(request, call_next)
 
     # -- Edge middleware (security headers + CORS) -- outermost so it wraps
     #    everything including the correlation-id middleware and error handlers.
@@ -132,8 +143,9 @@ def create_app() -> FastAPI:
         with log_context(correlation_id=cid):
             try:
                 response: Response = await call_next(request)
-            except Exception:
+            except Exception as exc:
                 _log.exception("unhandled exception", extra={"event": "unhandled_error"})
+                capture_exception(exc)
                 safe = InternalServerError()
                 return JSONResponse(
                     status_code=safe.http_status,
@@ -170,6 +182,8 @@ def create_app() -> FastAPI:
     from api.llm.routes import router as llm_router
     from api.rag.routes import router as rag_router
     from api.rbac.routes import router as rbac_router
+    from api.scheduling.admin_routes import router as scheduling_admin_router
+    from api.scheduling.routes import router as scheduling_router
     from api.tasks.routes import router as tasks_router
     from api.tenants.routes import router as tenants_router
 
@@ -184,6 +198,8 @@ def create_app() -> FastAPI:
     app.include_router(llm_router)
     app.include_router(rag_router)
     app.include_router(rbac_router)
+    app.include_router(scheduling_admin_router)
+    app.include_router(scheduling_router)
     app.include_router(tasks_router)
     app.include_router(tenants_router)
 

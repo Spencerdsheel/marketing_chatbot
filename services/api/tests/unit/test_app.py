@@ -56,6 +56,8 @@ _TEST_SETTINGS_ENV = {
     "SECRET_ENCRYPTION_KEY": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
     "SERVICE_NAME": "api",
     "LOG_LEVEL": "WARNING",
+    "SENTRY_DSN": "",
+    "ENVIRONMENT": "test",
 }
 
 
@@ -208,6 +210,34 @@ async def test_unhandled_exception_returns_500_without_leak() -> None:
     assert body["error_code"] == "INTERNAL_ERROR"
     assert "kaboom" not in body["message"]
     assert "correlation_id" in body
+
+
+async def test_unhandled_exception_records_500_metric_and_captures_sentry() -> None:
+    """An endpoint that raises → 500 metric recorded AND capture_exception called."""
+    from prometheus_client import REGISTRY, generate_latest
+
+    app = _build_app(extra_routes=True)
+
+    # Monkeypatch capture_exception to track calls. capture_exception is
+    # SYNCHRONOUS (called un-awaited in the middleware), so the double must be
+    # sync too -- an async double would return a never-awaited coroutine and
+    # the append would never run.
+    captured: list[Exception] = []
+
+    def _fake_capture(exc: Exception) -> None:
+        captured.append(exc)
+
+    with patch("api.app.capture_exception", side_effect=_fake_capture):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.get("/test-unhandled")
+
+    assert resp.status_code == 500
+    assert len(captured) == 1
+    assert isinstance(captured[0], RuntimeError)
+
+    # Verify the 500 metric was recorded
+    output = generate_latest(REGISTRY).decode("utf-8")
+    assert 'status="500"' in output
 
 
 # -- _validate_runtime_config --------------------------------------------------

@@ -68,7 +68,12 @@ celery_app = Celery(
     "chatbot",
     broker=_resolve_broker_url(),
     backend=_resolve_result_backend(),
-    include=["api.tasks.debug_tasks", "api.ingestion.tasks", "api.crm.tasks"],
+    include=[
+        "api.tasks.debug_tasks",
+        "api.ingestion.tasks",
+        "api.crm.tasks",
+        "api.scheduling.tasks",
+    ],
 )
 
 # -- Serialization (security: JSON only, never pickle) -------------------------
@@ -85,8 +90,15 @@ celery_app.conf.update(
     # Timezone.
     timezone="UTC",
     enable_utc=True,
-    # Beat schedule — empty for now; real periodic tasks land in S8.3 (reminders).
-    beat_schedule={},
+    # Beat schedule — the reminder dispatcher (S8.3). Polls at
+    # reminder_poll_interval_seconds; the task itself atomically claims due
+    # rows (exactly-once gate lives in the claim SQL, not here).
+    beat_schedule={
+        "dispatch-due-reminders": {
+            "task": "scheduling.dispatch_due_reminders",
+            "schedule": get_api_settings().reminder_poll_interval_seconds,
+        },
+    },
 )
 
 

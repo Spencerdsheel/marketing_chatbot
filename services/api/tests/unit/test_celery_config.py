@@ -263,3 +263,57 @@ def test_resolver_raises_when_neither_celery_env_nor_redis_url_set() -> None:
     with patch("api.tasks.celery_app.get_api_settings", return_value=stub_settings):
         with pytest.raises(RuntimeError, match="not configured"):
             _resolve_broker_url()
+
+
+# ==============================================================================
+# Beat schedule -- dispatch-due-reminders (S8.3)
+# ==============================================================================
+
+
+def test_beat_schedule_contains_dispatch_due_reminders() -> None:
+    """beat_schedule has the reminder-dispatch periodic task at the configured interval."""
+    import sys
+    from unittest.mock import patch
+
+    for key in list(sys.modules.keys()):
+        if key.startswith("api.tasks") or key == "api.config":
+            del sys.modules[key]
+
+    from common.settings import get_settings
+
+    get_settings.cache_clear()
+
+    poll_interval = "45"
+    env = {**_BASE_ENV, "REDIS_URL": "redis://stub-host:6379", "REMINDER_POLL_INTERVAL_SECONDS": poll_interval}
+    with patch.dict("os.environ", env, clear=True):
+        import api.tasks.celery_app as mod  # noqa: PLC0415
+
+        app = mod.celery_app
+
+    entry = app.conf.beat_schedule.get("dispatch-due-reminders")
+    assert entry is not None, "beat_schedule must contain 'dispatch-due-reminders'"
+    assert entry["task"] == "scheduling.dispatch_due_reminders"
+    assert entry["schedule"] == 45
+
+
+def test_scheduling_tasks_module_is_in_include() -> None:
+    """api.scheduling.tasks must be in the Celery app's include list so the
+    worker discovers scheduling.dispatch_due_reminders / scheduling.send_reminder."""
+    import sys
+    from unittest.mock import patch
+
+    for key in list(sys.modules.keys()):
+        if key.startswith("api.tasks") or key == "api.config":
+            del sys.modules[key]
+
+    from common.settings import get_settings
+
+    get_settings.cache_clear()
+
+    env = {**_BASE_ENV, "REDIS_URL": "redis://stub-host:6379"}
+    with patch.dict("os.environ", env, clear=True):
+        import api.tasks.celery_app as mod  # noqa: PLC0415
+
+        app = mod.celery_app
+
+    assert "api.scheduling.tasks" in app.conf.include
