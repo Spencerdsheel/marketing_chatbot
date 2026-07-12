@@ -180,6 +180,8 @@ def create_app() -> FastAPI:
     from api.leads.admin_routes import router as leads_admin_router
     from api.leads.routes import router as leads_router
     from api.llm.routes import router as llm_router
+    from api.notifications.admin_routes import router as notifications_admin_router
+    from api.orchestrator.routes import router as chat_router
     from api.rag.routes import router as rag_router
     from api.rbac.routes import router as rbac_router
     from api.scheduling.admin_routes import router as scheduling_admin_router
@@ -196,6 +198,8 @@ def create_app() -> FastAPI:
     app.include_router(leads_admin_router)
     app.include_router(leads_router)
     app.include_router(llm_router)
+    app.include_router(notifications_admin_router)
+    app.include_router(chat_router)
     app.include_router(rag_router)
     app.include_router(rbac_router)
     app.include_router(scheduling_admin_router)

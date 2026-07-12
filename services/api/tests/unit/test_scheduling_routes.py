@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import asyncpg
 from common.auth import AuthClaims, Role
@@ -788,3 +788,131 @@ async def test_post_book_no_calendar_configured_still_creates_three_reminder_row
     event_id = response.json()["event_id"]
     reminders = [j for j in db._reminder_jobs.values() if j["event_id"] == event_id]
     assert len(reminders) == 3
+
+
+# ---------------------------------------------------------------------------
+# Booking confirmation enqueue (S9.2, Scope §8)
+# ---------------------------------------------------------------------------
+
+
+async def test_post_book_resolvable_recipient_enqueues_confirmation_and_delays_once() -> None:
+    db = _StubDatabase()
+    db.seed_availability(tenant_id=_TENANT_ID)
+    app = _build_app(db)
+
+    with (
+        patch(
+            "api.scheduling.routes.resolve_event_recipient",
+            new=AsyncMock(return_value="lead@example.com"),
+        ) as mock_resolve,
+        patch(
+            "api.scheduling.routes.enqueue_notification",
+            new=AsyncMock(return_value="job-confirm-1"),
+        ) as mock_enqueue,
+        patch("api.scheduling.routes.send_notification") as mock_task,
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            token = _visitor_token()
+            response = await client.post(
+                "/public/schedule/book", json=_book_body(), headers={"Authorization": f"Bearer {token}"}
+            )
+
+    assert response.status_code == 201
+    event_id = response.json()["event_id"]
+    mock_resolve.assert_awaited_once()
+    mock_enqueue.assert_awaited_once()
+    _, kwargs = mock_enqueue.call_args
+    assert kwargs["dedupe_key"] == f"booking_confirm:{event_id}"
+    assert kwargs["channel"] == "email"
+    mock_task.delay.assert_called_once()
+    _, delay_kwargs = mock_task.delay.call_args
+    assert delay_kwargs["job_id"] == "job-confirm-1"
+
+
+async def test_post_book_no_recipient_skips_enqueue_still_201() -> None:
+    """No resolvable recipient (default stub DB) -> no enqueue, booking still 201."""
+    db = _StubDatabase()
+    db.seed_availability(tenant_id=_TENANT_ID)
+    app = _build_app(db)
+
+    with patch("api.scheduling.routes.enqueue_notification") as mock_enqueue:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            token = _visitor_token()
+            response = await client.post(
+                "/public/schedule/book", json=_book_body(), headers={"Authorization": f"Bearer {token}"}
+            )
+
+    assert response.status_code == 201
+    mock_enqueue.assert_not_called()
+
+
+async def test_post_book_enqueue_raises_degrades_still_201() -> None:
+    """An enqueue that raises is best-effort -- booking still 201 (never 500)."""
+    db = _StubDatabase()
+    db.seed_availability(tenant_id=_TENANT_ID)
+    app = _build_app(db)
+
+    with (
+        patch(
+            "api.scheduling.routes.resolve_event_recipient",
+            new=AsyncMock(return_value="lead@example.com"),
+        ),
+        patch(
+            "api.scheduling.routes.enqueue_notification",
+            new=AsyncMock(side_effect=RuntimeError("db unavailable")),
+        ),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            token = _visitor_token()
+            response = await client.post(
+                "/public/schedule/book", json=_book_body(), headers={"Authorization": f"Bearer {token}"}
+            )
+
+    assert response.status_code == 201
+
+
+async def test_post_book_calendar_sync_failure_enqueues_no_confirmation() -> None:
+    """A CALENDAR_SYNC_FAILED compensation path enqueues NO confirmation."""
+    db = _StubDatabase()
+    db.seed_availability(tenant_id=_TENANT_ID)
+    app = _build_app(db)
+
+    with patch("api.scheduling.routes.enqueue_notification") as mock_enqueue:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            admin_token = _admin_token()
+            await _configure_calendar(client, admin_token, provider="not-a-real-provider")
+
+            visitor_token = _visitor_token()
+            response = await client.post(
+                "/public/schedule/book", json=_book_body(),
+                headers={"Authorization": f"Bearer {visitor_token}"},
+            )
+
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "CALENDAR_SYNC_FAILED"
+    mock_enqueue.assert_not_called()
+
+
+async def test_post_book_repeat_dedupe_key_does_not_double_delay() -> None:
+    """Idempotency (MANDATORY): a repeat with the same dedupe target
+    (enqueue_notification -> None) results in NO second .delay()."""
+    db = _StubDatabase()
+    db.seed_availability(tenant_id=_TENANT_ID)
+    app = _build_app(db)
+
+    with (
+        patch(
+            "api.scheduling.routes.resolve_event_recipient",
+            new=AsyncMock(return_value="lead@example.com"),
+        ),
+        patch("api.scheduling.routes.enqueue_notification", new=AsyncMock(return_value=None)),
+        patch("api.scheduling.routes.send_notification") as mock_task,
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            token = _visitor_token()
+            response = await client.post(
+                "/public/schedule/book", json=_book_body(), headers={"Authorization": f"Bearer {token}"}
+            )
+
+    assert response.status_code == 201
+    mock_task.delay.assert_not_called()

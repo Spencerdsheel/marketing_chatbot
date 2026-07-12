@@ -36,6 +36,7 @@ from common.db import Database
 from common.errors import ValidationError
 from common.logging import get_logger
 
+from api.notifications.recipients import NoRecipientError
 from api.scheduling.reminder_repository import (
     ClaimedReminder,
     claim_due_reminders,
@@ -195,13 +196,27 @@ async def _execute_send(
         return {"job_id": job_id, "status": "skipped"}
 
     _, starts_at = event
-    sink = reminder_sink_for(sink_name)
+    sink = reminder_sink_for(sink_name, db=db)
     reminder = ReminderDispatch(
         event_id=event_id, offset=offset, run_at=job.run_at, starts_at=starts_at
     )
 
     try:
         await sink.dispatch(claims, reminder)
+    except NoRecipientError:
+        # Auditable no-op: nothing went wrong, there was simply nobody to
+        # remind (an anonymous booking with no lead/email). NOT a failure,
+        # NOT retried (S9.2 decision 2/3).
+        await mark_reminder(db, claims, job_id, status="skipped", last_error="NO_RECIPIENT")
+        _log.info(
+            "reminder_skipped_no_recipient",
+            extra={
+                "event": "reminder_skipped_no_recipient",
+                "job_id": job_id,
+                "tenant_id": tenant_id,
+            },
+        )
+        return {"job_id": job_id, "status": "skipped"}
     except ValidationError as exc:
         # Deterministic sink error (bad config) -- do NOT raise, so Celery
         # does not retry (mirrors api.crm.tasks).

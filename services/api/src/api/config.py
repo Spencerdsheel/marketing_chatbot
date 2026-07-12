@@ -23,11 +23,11 @@ class ApiSettings(Settings):
     # Password reset token TTL (default 30 min).
     password_reset_ttl_seconds: int = 1800
 
-    # DEV-ONLY: when True, password reset tokens are logged so a developer can
-    # copy-paste them for testing. MUST stay False in production -- a reset
-    # token is a secret (CLAUDE.md S3 "never log secrets/tokens/PII"). This is
-    # a temporary bridge until Phase 9 email delivery.
-    auth_reset_token_log: bool = False
+    # Password reset (S9.2): the base URL the reset link is built from --
+    # ``{password_reset_url_base}?token={token}``. Non-secret; override per
+    # deploy via env. Retires the S3.x auth_reset_token_log dev-only bridge
+    # now that a real reset email is enqueued (S9.2 decision 4).
+    password_reset_url_base: str = "http://localhost:3000/reset-password"  # noqa: S105
 
     # Visitor session TTL (default 30 min). Used by the widget admission flow.
     visitor_session_ttl_seconds: int = 1800
@@ -144,6 +144,38 @@ class ApiSettings(Settings):
     reminder_poll_interval_seconds: int = 60
     reminder_dispatch_batch_size: int = 100
     reminder_sink: str = "log"
+
+    # Notifications (S9.1).
+    # notification_smtp_timeout_seconds: the smtplib.SMTP connect/send timeout
+    #   used by SmtpEmailProvider. No default provider setting -- provider is
+    #   per-tenant, exactly like calendar (a tenant with no config is a
+    #   deterministic NOTIFICATION_NOT_CONFIGURED, not a silent fallback).
+    notification_smtp_timeout_seconds: float = 10.0
+
+    # Notifications (S9.3).
+    # notification_twilio_timeout_seconds: the httpx.AsyncClient timeout used
+    #   by TwilioNotificationProvider for SMS/WhatsApp sends. Mirrors
+    #   calendar_http_timeout_seconds/notification_smtp_timeout_seconds. No
+    #   Account SID / Auth Token / sender setting here -- those are
+    #   per-tenant, encrypted (tenant_notification_configs).
+    notification_twilio_timeout_seconds: float = 10.0
+
+    # Orchestrator turn pipeline (S10.1).
+    # orchestrator_rag_k: retrieval depth (k) passed to retrieve_hybrid for a turn.
+    # orchestrator_history_turns: keep_recent passed to get_working_memory --
+    #   the windowed tail of recent messages included in the grounded prompt.
+    orchestrator_rag_k: int = 5
+    orchestrator_history_turns: int = 10
+
+    # Orchestrator 3-way decision defaults (S10.2). Used by
+    # get_orchestrator_config when a tenant has no explicit
+    # tenant_orchestrator_configs row -- an unconfigured tenant still routes
+    # deterministically. escalate_threshold=0.35 preserves the exact numeric
+    # boundary of the retired S10.1 orchestrator_confidence_floor amendment
+    # (superseded by the richer answer/clarify/escalate decision -- see
+    # api.orchestrator.service._decide).
+    orchestrator_default_answer_threshold: float = 0.5
+    orchestrator_default_escalate_threshold: float = 0.35
 
 
 @lru_cache(maxsize=1)

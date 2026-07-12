@@ -21,6 +21,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from common.errors import ValidationError
 
+from api.notifications.recipients import NoRecipientError
+
 _TEST_ENV = {
     "DEPLOYMENT_MODE": "saas",
     "DATABASE_URL": "postgres://stub-host:5432/appdb",
@@ -370,6 +372,109 @@ async def test_send_reminder_transient_sink_error_raises_for_celery_retry() -> N
                 )
 
     mock_mark.assert_not_called()
+
+
+# ==============================================================================
+# send_reminder -- NoRecipientError -> skipped/NO_RECIPIENT, NOT failed, NOT raised (S9.2)
+# ==============================================================================
+
+
+async def test_send_reminder_no_recipient_error_marks_skipped_not_failed_not_raised() -> None:
+    _reset_modules()
+
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.config import get_api_settings  # noqa: PLC0415
+
+        get_api_settings.cache_clear()
+
+        job = _make_reminder_job(status="queued")
+        stub_sink = AsyncMock()
+        stub_sink.dispatch = AsyncMock(side_effect=NoRecipientError("no contact"))
+
+        with (
+            patch("api.scheduling.tasks.get_reminder_job", AsyncMock(return_value=job)),
+            patch("api.scheduling.tasks._get_event", AsyncMock(return_value=("booked", _NOW))),
+            patch("api.scheduling.tasks.reminder_sink_for", return_value=stub_sink),
+            patch("api.scheduling.tasks.mark_reminder", AsyncMock()) as mock_mark,
+        ):
+            from api.scheduling.tasks import _execute_send  # noqa: PLC0415
+
+            result = await _execute_send(
+                _StubDatabase(),  # type: ignore[arg-type]
+                job_id=_JOB_ID, tenant_id=_TENANT_ID, event_id=_EVENT_ID, offset="1h",
+                sink_name="notification",
+            )
+
+    assert result == {"job_id": _JOB_ID, "status": "skipped"}
+    mock_mark.assert_awaited_once()
+    _, kwargs = mock_mark.call_args
+    assert kwargs["status"] == "skipped"
+    assert kwargs["last_error"] == "NO_RECIPIENT"
+
+
+async def test_execute_send_passes_db_to_reminder_sink_for() -> None:
+    """reminder_sink_for is called with db= (S9.2 Scope §5)."""
+    _reset_modules()
+
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.config import get_api_settings  # noqa: PLC0415
+
+        get_api_settings.cache_clear()
+
+        job = _make_reminder_job(status="queued")
+        stub_sink = AsyncMock()
+        stub_sink.dispatch = AsyncMock()
+        stub_db = _StubDatabase()
+
+        with (
+            patch("api.scheduling.tasks.get_reminder_job", AsyncMock(return_value=job)),
+            patch("api.scheduling.tasks._get_event", AsyncMock(return_value=("booked", _NOW))),
+            patch("api.scheduling.tasks.reminder_sink_for", return_value=stub_sink) as mock_selector,
+            patch("api.scheduling.tasks.mark_reminder", AsyncMock()),
+        ):
+            from api.scheduling.tasks import _execute_send  # noqa: PLC0415
+
+            await _execute_send(
+                stub_db,  # type: ignore[arg-type]
+                job_id=_JOB_ID, tenant_id=_TENANT_ID, event_id=_EVENT_ID, offset="1h",
+                sink_name="notification",
+            )
+
+    mock_selector.assert_called_once_with("notification", db=stub_db)
+
+
+# ==============================================================================
+# The "log" path is unchanged (regression, S9.2 decision 6)
+# ==============================================================================
+
+
+async def test_send_reminder_log_path_unchanged_regression() -> None:
+    _reset_modules()
+
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.config import get_api_settings  # noqa: PLC0415
+
+        get_api_settings.cache_clear()
+
+        job = _make_reminder_job(status="queued")
+
+        with (
+            patch("api.scheduling.tasks.get_reminder_job", AsyncMock(return_value=job)),
+            patch("api.scheduling.tasks._get_event", AsyncMock(return_value=("booked", _NOW))),
+            patch("api.scheduling.tasks.mark_reminder", AsyncMock()) as mock_mark,
+        ):
+            from api.scheduling.tasks import _execute_send  # noqa: PLC0415
+
+            result = await _execute_send(
+                _StubDatabase(),  # type: ignore[arg-type]
+                job_id=_JOB_ID, tenant_id=_TENANT_ID, event_id=_EVENT_ID, offset="1h",
+                sink_name="log",
+            )
+
+    assert result == {"job_id": _JOB_ID, "status": "sent"}
+    mock_mark.assert_awaited_once()
+    _, kwargs = mock_mark.call_args
+    assert kwargs["status"] == "sent"
 
 
 # ==============================================================================

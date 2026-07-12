@@ -4,9 +4,11 @@ Tokens are stored as SHA-256 hashes -- a Redis dump must not reveal a usable
 token. The ``consume`` operation is atomic (``GETDEL``) so each token is
 single-use.
 
-This is a temporary dev bridge until Phase 9 email delivery. The token is
-NEVER returned in an HTTP response body; it is surfaced via logs only when
-the dev-only ``auth_reset_token_log`` setting is True.
+The token is NEVER returned in an HTTP response body and NEVER logged. Since
+S9.2, ``api.auth.routes.password_reset_request`` emails the raw token as part
+of a reset link (``api.notifications.templates.password_reset_message``) via
+the notification-service; ``dedupe_key``/``payload``/logs carry only its
+SHA-256 hash (``_hash_token``), never the raw value.
 """
 from __future__ import annotations
 

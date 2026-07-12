@@ -73,6 +73,7 @@ celery_app = Celery(
         "api.ingestion.tasks",
         "api.crm.tasks",
         "api.scheduling.tasks",
+        "api.notifications.tasks",
     ],
 )
 

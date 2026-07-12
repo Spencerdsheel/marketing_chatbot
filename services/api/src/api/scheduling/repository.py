@@ -41,6 +41,22 @@ class Availability:
 
 
 @dataclass(frozen=True)
+class EventContact:
+    """A single event's contact-resolution fields (S9.2, Scope §6).
+
+    Used by ``api.notifications.recipients.resolve_event_recipient`` --
+    intentionally narrow (no consent/calendar_ref) since it exists only to
+    resolve an outbound recipient.
+    """
+
+    lead_id: str | None
+    visitor_id: str | None
+    timezone: str
+    starts_at: datetime
+    status: str
+
+
+@dataclass(frozen=True)
 class ScheduleEvent:
     """A single booked/cancelled/completed/no-show call."""
 
@@ -230,6 +246,34 @@ async def delete_event(db: Database, claims: AuthClaims, event_id: str) -> None:
         "DELETE FROM schedule_events WHERE tenant_id = $1 AND event_id = $2",
         claims.tenant_id,
         event_id,
+    )
+
+
+async def get_event_contact(
+    db: Database, claims: AuthClaims, event_id: str
+) -> EventContact | None:
+    """Fetch a single event's contact-resolution fields, tenant-scoped.
+
+    Used by ``api.notifications.recipients.resolve_event_recipient`` (S9.2,
+    Decision 3) -- never exposes ``calendar_ref``/``consent``. Returns
+    ``None`` if the event is missing or belongs to another tenant.
+    """
+    _reject_global(claims)
+
+    row = await db.fetchrow(
+        "SELECT lead_id, visitor_id, timezone, starts_at, status "
+        "FROM schedule_events WHERE tenant_id = $1 AND event_id = $2",
+        claims.tenant_id,
+        event_id,
+    )
+    if row is None:
+        return None
+    return EventContact(
+        lead_id=row["lead_id"],
+        visitor_id=row["visitor_id"],
+        timezone=str(row["timezone"]),
+        starts_at=row["starts_at"],
+        status=str(row["status"]),
     )
 
 

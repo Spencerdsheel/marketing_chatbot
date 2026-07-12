@@ -24,6 +24,7 @@ from api.conversation_store.repository import (
     delete_conversation,
     export_conversation,
     get_conversation,
+    get_message,
     get_messages,
     get_window,
     get_working_memory,
@@ -250,6 +251,40 @@ async def test_get_messages_visitor_scopes_by_visitor_id() -> None:
     assert db.last_params == ("tenant-a", "conv-1", "visitor-xyz")
 
 
+async def test_get_messages_visitor_query_scopes_via_conversations_join() -> None:
+    """Regression guard: messages has NO visitor_id column (migration 0007).
+    get_messages's own SELECT (not just the visibility check) must scope a
+    VISITOR caller via an EXISTS join to conversations, never a bare
+    `visitor_id = $N` clause directly against `messages` (that raises
+    asyncpg.UndefinedColumnError in production)."""
+    now = datetime.now(UTC)
+    msg_row = {
+        "message_id": "msg-1",
+        "role": "user",
+        "content": "Hello",
+        "intent": None,
+        "confidence": None,
+        "tokens": None,
+        "created_at": now,
+    }
+    db = _SequencedDatabase(
+        fetchrow_results=[_visible_row()],
+        fetch_results=[[msg_row]],
+    )
+    claims = _claims("tenant-a", Role.VISITOR, subject="visitor-xyz")
+
+    messages = await get_messages(db, claims, "conv-1")
+
+    assert len(messages) == 1
+    # The messages SELECT is the second SQL call (after the visibility fetchrow).
+    messages_sql = db.all_sql[1]
+    assert "EXISTS (SELECT 1 FROM conversations" in messages_sql
+    assert "c.visitor_id" in messages_sql
+    # Negative guard: no bare/unqualified visitor_id column reference on messages.
+    assert " AND visitor_id = " not in messages_sql
+    assert "visitor-xyz" in db.all_params[1]
+
+
 async def test_get_messages_not_visible_raises_not_found() -> None:
     """get_messages: if conversation not visible to caller → NotFoundError."""
     db = _RecordingDatabase(rows=[])  # No conversation row
@@ -441,6 +476,51 @@ async def test_get_window_visitor_param_numbering() -> None:
     assert "visitor_id = $3" in db.last_sql
     assert "LIMIT $4" in db.last_sql
     assert db.last_params == ("tenant-a", "conv-1", "visitor-xyz", 2)
+
+
+async def test_get_window_limit_visitor_query_scopes_via_conversations_join() -> None:
+    """Regression guard: messages has NO visitor_id column (migration 0007).
+    get_window's limit-mode SELECT must scope a VISITOR caller via an EXISTS
+    join to conversations, never a bare `visitor_id = $N` clause directly
+    against `messages`."""
+    now = datetime.now(UTC)
+    rows = [_msg_row("m2", "bot", "two", None, now), _msg_row("m1", "user", "one", None, now)]
+    db = _SequencedDatabase(
+        fetchrow_results=[_visible_row()],
+        fetch_results=[rows],
+    )
+    claims = _claims("tenant-a", Role.VISITOR, subject="visitor-xyz")
+
+    msgs = await get_window(db, claims, "conv-1", limit=2)
+
+    assert len(msgs) == 2
+    window_sql = db.all_sql[1]
+    assert "EXISTS (SELECT 1 FROM conversations" in window_sql
+    assert "c.visitor_id" in window_sql
+    assert " AND visitor_id = " not in window_sql
+    assert "LIMIT $4" in window_sql
+    assert db.all_params[1] == ("tenant-a", "conv-1", "visitor-xyz", 2)
+
+
+async def test_get_window_token_budget_visitor_query_scopes_via_conversations_join() -> None:
+    """Same regression guard as above, for get_window's token_budget branch
+    (which shares the buggy `where`/`base` string construction)."""
+    now = datetime.now(UTC)
+    rows = [_msg_row("m2", "bot", "two", 5, now), _msg_row("m1", "user", "one", 3, now)]
+    db = _SequencedDatabase(
+        fetchrow_results=[_visible_row()],
+        fetch_results=[rows],
+    )
+    claims = _claims("tenant-a", Role.VISITOR, subject="visitor-xyz")
+
+    msgs = await get_window(db, claims, "conv-1", token_budget=10)
+
+    assert len(msgs) == 2
+    window_sql = db.all_sql[1]
+    assert "EXISTS (SELECT 1 FROM conversations" in window_sql
+    assert "c.visitor_id" in window_sql
+    assert " AND visitor_id = " not in window_sql
+    assert "visitor-xyz" in db.all_params[1]
 
 
 async def test_get_window_token_budget_with_stored_tokens() -> None:
@@ -1007,3 +1087,316 @@ async def test_purge_expired_parses_delete_count() -> None:
     count = await purge_expired(db, claims, before=before)
 
     assert count == 3
+
+
+# -- get_message (S10.1) --------------------------------------------------------
+
+
+def _message_row_with_sources(
+    message_id: str = "msg-a",
+    role: str = "bot",
+    content: str = "The answer.",
+    sources: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "message_id": message_id,
+        "role": role,
+        "content": content,
+        "intent": None,
+        "confidence": 0.8,
+        "tokens": 12,
+        "created_at": datetime.now(UTC),
+        "sources": sources,
+    }
+
+
+async def test_get_message_binds_tenant_conversation_message_positional() -> None:
+    """get_message SELECT binds WHERE tenant_id=$1 AND conversation_id=$2 AND
+    message_id=$3, positional placeholders."""
+    row = _message_row_with_sources(sources=[{"doc_id": "d1", "chunk_id": "c1", "score": 0.9, "matched_by": ["vector"]}])
+    db = _RecordingDatabase(rows=[row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    msg = await get_message(db, claims, "conv-1", "msg-a")
+
+    assert msg is not None
+    assert msg.message_id == "msg-a"
+    assert msg.sources == [{"doc_id": "d1", "chunk_id": "c1", "score": 0.9, "matched_by": ["vector"]}]
+    assert "tenant_id = $1" in db.last_sql
+    assert "conversation_id = $2" in db.last_sql
+    assert "message_id = $3" in db.last_sql
+    assert db.last_params[0] == "tenant-a"
+    assert db.last_params[1] == "conv-1"
+    assert db.last_params[2] == "msg-a"
+
+
+async def test_get_message_visitor_scoped_via_conversation_join() -> None:
+    """VISITOR caller: get_message adds a visitor_id scope (mirrors
+    _verify_conversation_visible), binding the visitor subject as an extra param."""
+    row = _message_row_with_sources()
+    db = _RecordingDatabase(rows=[row])
+    claims = _claims("tenant-a", Role.VISITOR, subject="visitor-xyz")
+
+    msg = await get_message(db, claims, "conv-1", "msg-a")
+
+    assert msg is not None
+    assert "visitor-xyz" in db.last_params
+    assert "visitor_id" in db.last_sql
+
+
+async def test_get_message_not_visible_returns_none() -> None:
+    """Absent/not-visible message → None (not an exception)."""
+    db = _RecordingDatabase(rows=[])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    msg = await get_message(db, claims, "conv-1", "msg-missing")
+
+    assert msg is None
+
+
+async def test_get_message_global_caller_rejected() -> None:
+    """PLATFORM_ADMIN → ValidationError on get_message."""
+    db = _RecordingDatabase()
+    claims = _claims(None, Role.PLATFORM_ADMIN)
+
+    with pytest.raises(ValidationError):
+        await get_message(db, claims, "conv-1", "msg-a")
+
+
+# -- append_message sources (S10.1) ---------------------------------------------
+
+
+async def test_append_message_binds_sources_param() -> None:
+    """append_message(sources=[...]) binds the sources param in the INSERT."""
+    conv_row = {
+        "conversation_id": "conv-1",
+        "status": "active",
+        "channel": "widget",
+        "visitor_id": None,
+        "started_at": datetime.now(UTC),
+        "ended_at": None,
+        "metadata": {},
+        "summary": None,
+        "summary_message_count": 0,
+    }
+    db = _RecordingDatabase(rows=[conv_row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+    sources = [{"doc_id": "d1", "chunk_id": "c1", "score": 0.9, "matched_by": ["vector"]}]
+
+    await append_message(
+        db, claims, "conv-1", role="bot", content="Answer.", sources=sources,
+    )
+
+    assert "sources" in db.last_sql
+    assert sources in db.last_params
+
+
+async def test_append_message_without_sources_binds_null() -> None:
+    """Existing callers (no sources kwarg) still bind NULL for sources."""
+    conv_row = {
+        "conversation_id": "conv-1",
+        "status": "active",
+        "channel": "widget",
+        "visitor_id": None,
+        "started_at": datetime.now(UTC),
+        "ended_at": None,
+        "metadata": {},
+        "summary": None,
+        "summary_message_count": 0,
+    }
+    db = _RecordingDatabase(rows=[conv_row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    await append_message(db, claims, "conv-1", role="user", content="Hello")
+
+    assert None in db.last_params
+
+
+# -- append_message decision/grounded (S10.2) ------------------------------------
+
+
+async def test_append_message_binds_decision_and_grounded_params() -> None:
+    """append_message(decision=..., grounded=...) binds them in the INSERT."""
+    conv_row = {
+        "conversation_id": "conv-1",
+        "status": "active",
+        "channel": "widget",
+        "visitor_id": None,
+        "started_at": datetime.now(UTC),
+        "ended_at": None,
+        "metadata": {},
+        "summary": None,
+        "summary_message_count": 0,
+    }
+    db = _RecordingDatabase(rows=[conv_row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    await append_message(
+        db, claims, "conv-1", role="bot", content="Answer.",
+        decision="clarify", grounded=False,
+    )
+
+    assert "decision" in db.last_sql
+    assert "grounded" in db.last_sql
+    assert "clarify" in db.last_params
+    assert False in db.last_params
+
+
+async def test_append_message_without_decision_grounded_binds_null() -> None:
+    """Existing callers (no decision/grounded kwargs) still bind NULL."""
+    conv_row = {
+        "conversation_id": "conv-1",
+        "status": "active",
+        "channel": "widget",
+        "visitor_id": None,
+        "started_at": datetime.now(UTC),
+        "ended_at": None,
+        "metadata": {},
+        "summary": None,
+        "summary_message_count": 0,
+    }
+    db = _RecordingDatabase(rows=[conv_row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    await append_message(db, claims, "conv-1", role="user", content="Hello")
+
+    # Last two positional params are decision, grounded -- both NULL.
+    assert db.last_params[-2] is None
+    assert db.last_params[-1] is None
+
+
+# -- get_message decision/grounded round-trip (S10.2) -----------------------------
+
+
+def _message_row_with_decision(
+    message_id: str = "msg-a",
+    role: str = "bot",
+    content: str = "The answer.",
+    decision: str | None = "clarify",
+    grounded: bool | None = False,
+) -> dict[str, Any]:
+    return {
+        "message_id": message_id,
+        "role": role,
+        "content": content,
+        "intent": "question",
+        "confidence": 0.4,
+        "tokens": None,
+        "created_at": datetime.now(UTC),
+        "sources": [],
+        "decision": decision,
+        "grounded": grounded,
+    }
+
+
+async def test_get_message_selects_and_returns_decision_and_grounded() -> None:
+    row = _message_row_with_decision(decision="escalate", grounded=False)
+    db = _RecordingDatabase(rows=[row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    msg = await get_message(db, claims, "conv-1", "msg-a")
+
+    assert msg is not None
+    assert msg.decision == "escalate"
+    assert msg.grounded is False
+    assert "decision" in db.last_sql
+    assert "grounded" in db.last_sql
+
+
+# -- append_message guardrail_flag (S10.3) ----------------------------------------
+
+
+async def test_append_message_binds_guardrail_flag_param() -> None:
+    """append_message(guardrail_flag=...) binds it in the INSERT."""
+    conv_row = {
+        "conversation_id": "conv-1",
+        "status": "active",
+        "channel": "widget",
+        "visitor_id": None,
+        "started_at": datetime.now(UTC),
+        "ended_at": None,
+        "metadata": {},
+        "summary": None,
+        "summary_message_count": 0,
+    }
+    db = _RecordingDatabase(rows=[conv_row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    await append_message(
+        db, claims, "conv-1", role="bot", content="Safe reply.",
+        decision="blocked", grounded=False, guardrail_flag="instruction_leak",
+    )
+
+    assert "guardrail_flag" in db.last_sql
+    assert "instruction_leak" in db.last_params
+
+
+async def test_append_message_without_guardrail_flag_binds_null() -> None:
+    """Existing callers (no guardrail_flag kwarg) still bind NULL."""
+    conv_row = {
+        "conversation_id": "conv-1",
+        "status": "active",
+        "channel": "widget",
+        "visitor_id": None,
+        "started_at": datetime.now(UTC),
+        "ended_at": None,
+        "metadata": {},
+        "summary": None,
+        "summary_message_count": 0,
+    }
+    db = _RecordingDatabase(rows=[conv_row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    await append_message(db, claims, "conv-1", role="user", content="Hello")
+
+    # Last positional param is guardrail_flag -- NULL.
+    assert db.last_params[-1] is None
+
+
+# -- get_message guardrail_flag round-trip (S10.3) ---------------------------------
+
+
+def _message_row_with_guardrail_flag(
+    message_id: str = "msg-a",
+    role: str = "bot",
+    content: str = "Safe reply.",
+    decision: str | None = "blocked",
+    grounded: bool | None = False,
+    guardrail_flag: str | None = "instruction_leak",
+) -> dict[str, Any]:
+    return {
+        "message_id": message_id,
+        "role": role,
+        "content": content,
+        "intent": "question",
+        "confidence": 0.8,
+        "tokens": None,
+        "created_at": datetime.now(UTC),
+        "sources": [],
+        "decision": decision,
+        "grounded": grounded,
+        "guardrail_flag": guardrail_flag,
+    }
+
+
+async def test_get_message_selects_and_returns_guardrail_flag() -> None:
+    row = _message_row_with_guardrail_flag(guardrail_flag="human_impersonation")
+    db = _RecordingDatabase(rows=[row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    msg = await get_message(db, claims, "conv-1", "msg-a")
+
+    assert msg is not None
+    assert msg.guardrail_flag == "human_impersonation"
+    assert "guardrail_flag" in db.last_sql
+
+
+async def test_get_message_guardrail_flag_none_when_clean() -> None:
+    row = _message_row_with_guardrail_flag(decision="answer", grounded=True, guardrail_flag=None)
+    db = _RecordingDatabase(rows=[row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    msg = await get_message(db, claims, "conv-1", "msg-a")
+
+    assert msg is not None
+    assert msg.guardrail_flag is None

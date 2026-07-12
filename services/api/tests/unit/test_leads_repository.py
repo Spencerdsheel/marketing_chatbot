@@ -148,6 +148,20 @@ class _StubDatabase:
         self.fetchrow_calls.append((query, args))
         q = query.strip().upper()
 
+        if "FROM LEADS" in q and "AND VISITOR_ID = $2" in q:
+            # get_lead_email_by_visitor_id -- WHERE tenant_id = $1 AND
+            # visitor_id = $2 ORDER BY created_at DESC LIMIT 1
+            tenant_id, visitor_id = args
+            matches = [
+                row
+                for row in self._leads.values()
+                if row["tenant_id"] == tenant_id and row["visitor_id"] == visitor_id
+            ]
+            if not matches:
+                return None
+            matches.sort(key=lambda r: r["created_at"], reverse=True)
+            return matches[0]
+
         if "FROM LEADS" in q and "WHERE TENANT_ID" in q:
             # get_lead — WHERE tenant_id = $1 AND lead_id = $2
             tenant_id = args[0]
@@ -779,3 +793,103 @@ async def test_assign_lead_rejects_global_caller() -> None:
 
         with pytest.raises(ValidationError):
             await assign_lead(db, global_claims, "some-lead-id", agent_id="agent-1")
+
+
+# ---------------------------------------------------------------------------
+# get_lead_email_by_visitor_id (S9.2, Scope §7)
+# ---------------------------------------------------------------------------
+
+
+async def test_get_lead_email_by_visitor_id_returns_most_recent() -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.leads.repository import create_lead, get_lead_email_by_visitor_id
+
+        db = _StubDatabase()
+        claims = _claims(tenant_id="tenant-abc")
+
+        await create_lead(
+            db, claims, visitor_id="visitor-1", name="First", email="first@example.com",
+            phone=None, consent={"granted": True, "purpose": "contact", "text": "OK"},
+            source="widget",
+        )
+        # A later lead for the same visitor -- created_at defaults to _NOW for
+        # both rows in this stub, so bump the second row's created_at
+        # explicitly to make "most recent" observable.
+        second_lead_id = await create_lead(
+            db, claims, visitor_id="visitor-1", name="Second", email="second@example.com",
+            phone=None, consent={"granted": True, "purpose": "contact", "text": "OK"},
+            source="widget",
+        )
+        from datetime import timedelta
+
+        db._leads[("tenant-abc", second_lead_id)]["created_at"] = _NOW + timedelta(minutes=5)
+
+        email = await get_lead_email_by_visitor_id(db, claims, "visitor-1")
+
+        assert email == "second@example.com"
+
+
+async def test_get_lead_email_by_visitor_id_returns_none_when_no_lead() -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.leads.repository import get_lead_email_by_visitor_id
+
+        db = _StubDatabase()
+        claims = _claims(tenant_id="tenant-abc")
+
+        result = await get_lead_email_by_visitor_id(db, claims, "visitor-does-not-exist")
+
+        assert result is None
+
+
+async def test_get_lead_email_by_visitor_id_cross_tenant_isolation() -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.leads.repository import create_lead, get_lead_email_by_visitor_id
+
+        db = _StubDatabase()
+        claims_a = _claims(tenant_id="tenant-a")
+        claims_b = _claims(tenant_id="tenant-b")
+
+        await create_lead(
+            db, claims_a, visitor_id="visitor-shared", name="Jane", email="jane@example.com",
+            phone=None, consent={"granted": True, "purpose": "contact", "text": "OK"},
+            source="widget",
+        )
+
+        result = await get_lead_email_by_visitor_id(db, claims_b, "visitor-shared")
+
+        assert result is None
+
+
+async def test_get_lead_email_by_visitor_id_uses_positional_placeholders() -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.leads.repository import get_lead_email_by_visitor_id
+
+        db = _StubDatabase()
+        claims = _claims(tenant_id="tenant-abc")
+
+        await get_lead_email_by_visitor_id(db, claims, "visitor-1")
+
+        query, args = db.fetchrow_calls[-1]
+        assert "$1" in query
+        assert "$2" in query
+        assert ":" not in query
+        assert args[0] == "tenant-abc"
+        assert args[1] == "visitor-1"
+
+
+async def test_get_lead_email_by_visitor_id_rejects_global_caller() -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from common.errors import ValidationError
+
+        from api.leads.repository import get_lead_email_by_visitor_id
+
+        db = _StubDatabase()
+        global_claims = AuthClaims(subject="admin-1", role=Role.PLATFORM_ADMIN, tenant_id=None)
+
+        with pytest.raises(ValidationError):
+            await get_lead_email_by_visitor_id(db, global_claims, "visitor-1")

@@ -124,6 +124,10 @@ class _StubDatabase:
             tenant_id = args[0]
             return self._availability.get(tenant_id)
 
+        if "FROM SCHEDULE_EVENTS" in q:
+            tenant_id, event_id = args
+            return self._events.get((tenant_id, event_id))
+
         return None
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
@@ -452,3 +456,88 @@ async def test_create_event_rejects_global_caller(stub_db: _StubDatabase) -> Non
                 timezone="UTC", visitor_id="visitor-1", lead_id=None,
                 consent={"granted": True, "purpose": "booking", "text": "OK", "captured_at": "x"},
             )
+
+
+# ---------------------------------------------------------------------------
+# get_event_contact (S9.2, Scope §6)
+# ---------------------------------------------------------------------------
+
+
+async def test_get_event_contact_returns_contact_fields(stub_db: _StubDatabase) -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import EventContact, create_event, get_event_contact
+
+        claims = _claims(tenant_id="tenant-abc")
+        event = await create_event(
+            stub_db, claims,
+            starts_at=datetime(2026, 1, 5, 14, 0, tzinfo=UTC),
+            ends_at=datetime(2026, 1, 5, 14, 30, tzinfo=UTC),
+            timezone="America/New_York", visitor_id="visitor-1", lead_id="lead-1",
+            consent={"granted": True, "purpose": "booking", "text": "OK", "captured_at": "x"},
+        )
+
+        contact = await get_event_contact(stub_db, claims, event.event_id)
+
+        assert isinstance(contact, EventContact)
+        assert contact.lead_id == "lead-1"
+        assert contact.visitor_id == "visitor-1"
+        assert contact.timezone == "America/New_York"
+        assert contact.status == "booked"
+
+
+async def test_get_event_contact_missing_event_returns_none(stub_db: _StubDatabase) -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import get_event_contact
+
+        claims = _claims(tenant_id="tenant-abc")
+        result = await get_event_contact(stub_db, claims, "event-does-not-exist")
+
+        assert result is None
+
+
+async def test_get_event_contact_cross_tenant_isolation(stub_db: _StubDatabase) -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import create_event, get_event_contact
+
+        claims_a = _claims(tenant_id="tenant-a")
+        claims_b = _claims(tenant_id="tenant-b")
+        event = await create_event(
+            stub_db, claims_a,
+            starts_at=datetime(2026, 1, 5, 14, 0, tzinfo=UTC),
+            ends_at=datetime(2026, 1, 5, 14, 30, tzinfo=UTC),
+            timezone="UTC", visitor_id="visitor-1", lead_id=None,
+            consent={"granted": True, "purpose": "booking", "text": "OK", "captured_at": "x"},
+        )
+
+        result = await get_event_contact(stub_db, claims_b, event.event_id)
+
+        assert result is None
+
+
+async def test_get_event_contact_uses_positional_placeholders(stub_db: _StubDatabase) -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import get_event_contact
+
+        claims = _claims(tenant_id="tenant-abc")
+        await get_event_contact(stub_db, claims, "event-1")
+
+        query, args = stub_db.fetchrow_calls[-1]
+        assert "$1" in query
+        assert "$2" in query
+        assert ":" not in query
+        assert args[0] == "tenant-abc"
+
+
+async def test_get_event_contact_rejects_global_caller(stub_db: _StubDatabase) -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import get_event_contact
+
+        global_claims = AuthClaims(subject="admin-1", role=Role.PLATFORM_ADMIN, tenant_id=None)
+
+        with pytest.raises(ValidationError):
+            await get_event_contact(stub_db, global_claims, "event-1")

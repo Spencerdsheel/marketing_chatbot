@@ -3,7 +3,17 @@
 Covers:
 - Request: known+active email -> 200 + key stored; unknown email -> 200 + no key;
   inactive user -> 200 + no key (no enumeration).
-- Gated logging: auth_reset_token_log=False -> no log; True -> token in caplog.
+- Reset email enqueue (S9.2): enqueue_notification called with
+  dedupe_key="pwreset:<sha256(token)>" (the HASH, never the raw token) and a
+  body containing the reset URL+token; .delay() called once; the raw token
+  NEVER appears in any log record.
+- PLATFORM_ADMIN (tenant_id is None) -> no enqueue
+  (password_reset_platform_admin_deferred), still 200.
+- An enqueue that raises -> still 200 (password_reset_enqueue_failed, ERROR).
+- Unknown/inactive email -> same 200, no enqueue (enumeration-safe).
+- Idempotency (MANDATORY): a repeat request re-issues a NEW token (a fresh
+  Redis key + hash) so dedupe is naturally per-token; a duplicate
+  enqueue_notification conflict (-> None) results in NO second .delay().
 - Confirm happy path: issue -> confirm -> 200; UPDATE recorded; key gone.
 - Single-use: reuse same token -> 401.
 - Bad/garbage token -> 401.
@@ -14,13 +24,20 @@ from __future__ import annotations
 
 import re
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from common.cache import InMemoryCache
 from common.crypto import hash_password, verify_password
 from httpx import ASGITransport, AsyncClient
 from redis.exceptions import RedisError
+
+
+def _extract_query_param(url_or_body: str, param: str) -> str:
+    """Pull a query-param value out of a URL/body string (test helper only)."""
+    match = re.search(param + r"=([^\s&]+)", url_or_body)
+    assert match is not None
+    return match.group(1)
 
 # -- Test doubles --------------------------------------------------------------
 
@@ -133,11 +150,7 @@ _TEST_SETTINGS_ENV = {
 }
 
 
-def _build_app(
-    redis: Any = None,
-    *,
-    auth_reset_token_log: bool = False,
-) -> Any:
+def _build_app(redis: Any = None) -> Any:
     """Create app with test doubles."""
     from common.settings import get_settings
 
@@ -146,10 +159,7 @@ def _build_app(
     get_settings.cache_clear()
     get_api_settings.cache_clear()
 
-    env = dict(_TEST_SETTINGS_ENV)
-    env["AUTH_RESET_TOKEN_LOG"] = str(auth_reset_token_log).lower()
-
-    with patch.dict("os.environ", env, clear=False):
+    with patch.dict("os.environ", _TEST_SETTINGS_ENV, clear=False):
         from api.app import create_app
         app = create_app()
 
@@ -168,8 +178,9 @@ async def test_request_known_active_email_stores_key() -> None:
     """Known + active email -> 200 + exactly one key under auth:pwreset:"""
     redis = _RecordingRedis()
     app = _build_app(redis=redis)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-        resp = await c.post("/auth/password-reset/request", json={"email": "admin@example.com"})
+    with patch("api.auth.routes.send_notification"):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/auth/password-reset/request", json={"email": "admin@example.com"})
     assert resp.status_code == 200
     assert resp.json() == {"status": "reset_requested"}
     pwreset_keys = [k for k, _, _ in redis.set_calls if k.startswith("auth:pwreset:")]
@@ -201,31 +212,174 @@ async def test_request_inactive_user_no_key_stored() -> None:
 
 
 # ==============================================================================
-# Request -- gated logging
+# Request -- reset email enqueue (S9.2)
 # ==============================================================================
 
 
-async def test_request_no_logging_when_disabled(caplog: pytest.LogCaptureFixture) -> None:
-    """auth_reset_token_log=False -> token is not logged."""
+async def test_request_enqueues_reset_email_with_hashed_dedupe_key() -> None:
+    """Known+active tenant user -> enqueue_notification called with a HASHED
+    dedupe_key (never the raw token) + a body containing the reset URL/token;
+    .delay() called once."""
     redis = _RecordingRedis()
-    app = _build_app(redis=redis, auth_reset_token_log=False)
-    with caplog.at_level("WARNING"):
+    app = _build_app(redis=redis)
+
+    captured_kwargs: dict[str, Any] = {}
+
+    async def _capture_enqueue(db: Any, claims: Any, **kwargs: Any) -> str:
+        captured_kwargs.update(kwargs)
+        return "job-pwreset-1"
+
+    with (
+        patch("api.auth.routes.enqueue_notification", side_effect=_capture_enqueue) as mock_enqueue,
+        patch("api.auth.routes.send_notification") as mock_task,
+    ):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            await c.post("/auth/password-reset/request", json={"email": "admin@example.com"})
-    assert not any(r.message.startswith("DEV password reset token") for r in caplog.records)
+            resp = await c.post("/auth/password-reset/request", json={"email": "admin@example.com"})
+
+    assert resp.status_code == 200
+    mock_enqueue.assert_awaited_once()
+    assert captured_kwargs["channel"] == "email"
+    assert captured_kwargs["recipient"] == "admin@example.com"
+
+    # The dedupe_key is the SHA-256 hash of the issued token -- extract the
+    # hash from the Redis store key (test-only visibility) to verify.
+    pwreset_keys = [k for k, _, _ in redis.set_calls if k.startswith("auth:pwreset:")]
+    assert len(pwreset_keys) == 1
+    token_hash = pwreset_keys[0].removeprefix("auth:pwreset:")
+    assert captured_kwargs["dedupe_key"] == f"pwreset:{token_hash}"
+
+    # The reset URL (and thus the raw token) appears ONLY in the body.
+    assert _extract_query_param(captured_kwargs["body"], "token")
+
+    mock_task.delay.assert_called_once()
+    _, delay_kwargs = mock_task.delay.call_args
+    assert delay_kwargs["job_id"] == "job-pwreset-1"
 
 
-async def test_request_logs_token_when_enabled(caplog: pytest.LogCaptureFixture) -> None:
-    """auth_reset_token_log=True -> a log record carrying the token is emitted."""
+async def test_request_dedupe_key_is_hash_not_raw_token() -> None:
+    """The dedupe_key must never contain the raw token substring."""
     redis = _RecordingRedis()
-    app = _build_app(redis=redis, auth_reset_token_log=True)
-    with caplog.at_level("WARNING"):
+    app = _build_app(redis=redis)
+
+    captured_kwargs: dict[str, Any] = {}
+
+    async def _capture_enqueue(db: Any, claims: Any, **kwargs: Any) -> str:
+        captured_kwargs.update(kwargs)
+        return "job-1"
+
+    with (
+        patch("api.auth.routes.enqueue_notification", side_effect=_capture_enqueue),
+        patch("api.auth.routes.send_notification"),
+    ):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             await c.post("/auth/password-reset/request", json={"email": "admin@example.com"})
-    token_records = [r for r in caplog.records if r.getMessage().startswith("DEV password reset token")]
-    assert len(token_records) == 1
-    # The actual token must be present in the message (the formatter drops extra fields).
-    assert re.search(r"[A-Za-z0-9_-]{20,}$", token_records[0].getMessage())
+
+    raw_token = _extract_query_param(captured_kwargs["body"], "token")
+    assert raw_token not in captured_kwargs["dedupe_key"]
+    payload = captured_kwargs.get("payload")
+    assert payload in (None, {}) or raw_token not in str(payload)
+
+
+async def test_request_no_log_line_carries_raw_token(caplog: pytest.LogCaptureFixture) -> None:
+    """PII/secret redaction (MANDATORY): the raw reset token never appears in any log record."""
+    redis = _RecordingRedis()
+    app = _build_app(redis=redis)
+
+    captured: dict[str, Any] = {}
+
+    async def _capture_enqueue(db: Any, claims: Any, **kwargs: Any) -> str:
+        captured.update(kwargs)
+        return "job-1"
+
+    with (
+        patch("api.auth.routes.enqueue_notification", side_effect=_capture_enqueue),
+        patch("api.auth.routes.send_notification"),
+        caplog.at_level("DEBUG"),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            await c.post("/auth/password-reset/request", json={"email": "admin@example.com"})
+
+    raw_token = _extract_query_param(captured["body"], "token")
+    for record in caplog.records:
+        assert raw_token not in record.getMessage()
+        assert raw_token not in repr(getattr(record, "__dict__", {}))
+
+
+async def test_request_platform_admin_no_enqueue_still_200() -> None:
+    """A PLATFORM_ADMIN (tenant_id is None) user -> NO enqueue, still 200."""
+    redis = _RecordingRedis()
+    app = _build_app(redis=redis)
+
+    platform_admin_row = dict(_ACTIVE_USER_ROW)
+    platform_admin_row["id"] = "user-platform-admin"
+    platform_admin_row["email"] = "platform-admin@example.com"
+    platform_admin_row["tenant_id"] = None
+    platform_admin_row["role"] = "PLATFORM_ADMIN"
+
+    class _PlatformAdminDb(_StubDatabase):
+        async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
+            if args and str(args[0]).lower() == "platform-admin@example.com":
+                return dict(platform_admin_row)
+            return await super().fetchrow(query, *args)
+
+    app.state.db = _PlatformAdminDb()
+
+    with patch("api.auth.routes.enqueue_notification") as mock_enqueue:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/auth/password-reset/request", json={"email": "platform-admin@example.com"}
+            )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "reset_requested"}
+    mock_enqueue.assert_not_called()
+
+
+async def test_request_enqueue_raises_still_200() -> None:
+    """An enqueue that raises -> still 200 (password_reset_enqueue_failed, ERROR)."""
+    redis = _RecordingRedis()
+    app = _build_app(redis=redis)
+
+    with patch(
+        "api.auth.routes.enqueue_notification", AsyncMock(side_effect=RuntimeError("db down"))
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/auth/password-reset/request", json={"email": "admin@example.com"})
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "reset_requested"}
+
+
+async def test_request_unknown_email_no_enqueue() -> None:
+    """Unknown email -> same 200, no enqueue (enumeration-safe)."""
+    redis = _RecordingRedis()
+    app = _build_app(redis=redis)
+
+    with patch("api.auth.routes.enqueue_notification") as mock_enqueue:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/auth/password-reset/request", json={"email": "nobody@nowhere.example"}
+            )
+
+    assert resp.status_code == 200
+    mock_enqueue.assert_not_called()
+
+
+async def test_request_repeat_dedupe_conflict_no_second_delay() -> None:
+    """Idempotency (MANDATORY): enqueue_notification -> None (conflict) results
+    in NO second .delay()."""
+    redis = _RecordingRedis()
+    app = _build_app(redis=redis)
+
+    with (
+        patch("api.auth.routes.enqueue_notification", AsyncMock(return_value=None)),
+        patch("api.auth.routes.send_notification") as mock_task,
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/auth/password-reset/request", json={"email": "admin@example.com"})
+
+    assert resp.status_code == 200
+    mock_task.delay.assert_not_called()
 
 
 # ==============================================================================

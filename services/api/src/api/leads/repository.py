@@ -131,6 +131,30 @@ async def get_lead(
     return _row_to_lead(row) if row is not None else None
 
 
+async def get_lead_email_by_visitor_id(
+    db: Database,
+    claims: AuthClaims,
+    visitor_id: str,
+) -> str | None:
+    """Fetch the most-recent lead's email for a visitor, tenant-scoped.
+
+    Used by ``api.notifications.recipients.resolve_event_recipient`` (S9.2,
+    Scope §7) when a scheduled event has no ``lead_id`` but does have a
+    ``visitor_id`` -- an anonymous booking that later (or earlier) captured a
+    lead. Returns ``None`` if no lead exists for that visitor in this tenant.
+    """
+    _reject_global(claims)
+
+    row = await db.fetchrow(
+        "SELECT email FROM leads "
+        "WHERE tenant_id = $1 AND visitor_id = $2 "
+        "ORDER BY created_at DESC LIMIT 1",
+        claims.tenant_id,
+        visitor_id,
+    )
+    return str(row["email"]) if row is not None else None
+
+
 async def update_lead_stage(
     db: Database,
     claims: AuthClaims,

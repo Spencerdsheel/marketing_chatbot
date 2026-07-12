@@ -14,6 +14,7 @@ from typing import Any
 from anthropic import APIError
 from common.logging import get_logger
 
+from api.llm.classify_matching import build_classify_instruction, match_label
 from api.llm.provider import (
     ChatMessage,
     Chunk,
@@ -103,11 +104,7 @@ class AnthropicProvider:
         if not labels:
             raise LLMError("LLM request failed.")
 
-        labels_str = ", ".join(labels)
-        instruction = (
-            f"Classify the text into exactly one of these labels: {labels_str}. "
-            "Reply with only the label, nothing else."
-        )
+        instruction = build_classify_instruction(labels)
 
         try:
             resp = await self._client.messages.create(
@@ -127,9 +124,18 @@ class AnthropicProvider:
             raise LLMError("LLM request failed.") from exc
 
         reply = "".join(b.text for b in resp.content if b.type == "text").strip()
-        for label in labels:
-            if reply.lower() == label.lower():
-                return label
+        matched = match_label(reply, labels)
+        if matched is not None:
+            if matched.lower() != reply.lower():
+                _log.info(
+                    "LLM classify matched label via fallback tolerance:"
+                    " provider=%s model=%s label=%s reply=%r",
+                    "anthropic",
+                    model,
+                    matched,
+                    reply[:_CLASSIFY_REPLY_LOG_LIMIT],
+                )
+            return matched
         _log.warning(
             "LLM classify produced no matching label: provider=%s model=%s labels=%s reply=%r",
             "anthropic",

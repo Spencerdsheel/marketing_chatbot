@@ -45,6 +45,10 @@ class Message:
     confidence: float | None
     tokens: int | None
     created_at: datetime
+    sources: list[dict[str, Any]] | None = None
+    decision: str | None = None
+    grounded: bool | None = None
+    guardrail_flag: str | None = None
 
 
 def _reject_global(claims: AuthClaims) -> None:
@@ -54,9 +58,15 @@ def _reject_global(claims: AuthClaims) -> None:
 
 
 def _scope_filter(claims: AuthClaims) -> tuple[str, list[Any]]:
-    """Extra WHERE clause + params for VISITOR scoping (visitor param is $3 in all
-    three read queries, which bind tenant_id=$1, conversation_id=$2 first).
-    CLIENT_ADMIN / CLIENT_AGENT: empty clause."""
+    """Extra WHERE clause + params for VISITOR scoping against ``conversations``
+    (which has its own ``visitor_id`` column) -- visitor param is $3 in the
+    queries that use this, which bind tenant_id=$1, conversation_id=$2 first.
+    CLIENT_ADMIN / CLIENT_AGENT: empty clause.
+
+    Do NOT use this against ``messages`` -- that table has no ``visitor_id``
+    column of its own (migration 0007); VISITOR scoping there must go through
+    an ``EXISTS (SELECT 1 FROM conversations ...)`` join instead (see
+    ``get_message``, ``get_messages``, ``get_window``)."""
     if claims.role == Role.VISITOR:
         return " AND visitor_id = $3", [claims.subject]
     return "", []
@@ -126,11 +136,20 @@ async def append_message(
     confidence: float | None = None,
     tokens: int | None = None,
     message_id: str | None = None,
+    sources: list[dict[str, Any]] | None = None,
+    decision: str | None = None,
+    grounded: bool | None = None,
+    guardrail_flag: str | None = None,
 ) -> str:
     """Append a message to a conversation (idempotent by ``message_id``).
 
     Raises ``NotFoundError`` if the conversation is not visible to the caller.
-    Returns the ``message_id`` (supplied or generated).
+    Returns the ``message_id`` (supplied or generated). ``sources`` (S10.1) is
+    the list of cited chunks for an assistant turn. ``decision``/``grounded``
+    (S10.2) tag the 3-way decision + whether the reply was grounded in
+    retrieved context. ``guardrail_flag`` (S10.3) tags the violated output-
+    guardrail rule name on a blocked turn, ``NULL`` on a clean one. Existing
+    callers that omit any of these bind ``NULL``, unchanged.
     """
     _reject_global(claims)
     await _verify_conversation_visible(db, claims, conversation_id)
@@ -140,8 +159,8 @@ async def append_message(
     await db.execute(
         "INSERT INTO messages "
         "(message_id, tenant_id, conversation_id, role, content, "
-        " intent, confidence, tokens) "
-        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
+        " intent, confidence, tokens, sources, decision, grounded, guardrail_flag) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) "
         "ON CONFLICT (tenant_id, conversation_id, message_id) DO NOTHING",
         message_id,
         claims.tenant_id,
@@ -151,8 +170,64 @@ async def append_message(
         intent,
         confidence,
         tokens,
+        sources,
+        decision,
+        grounded,
+        guardrail_flag,
     )
     return message_id
+
+
+async def get_message(
+    db: Database,
+    claims: AuthClaims,
+    conversation_id: str,
+    message_id: str,
+) -> Message | None:
+    """Fetch a single message by id if visible to the caller.
+
+    Mirrors ``_verify_conversation_visible``: a message is only visible if
+    its conversation is visible to the caller. VISITOR callers are
+    additionally scoped to their own ``visitor_id`` via a join on
+    ``conversations`` (messages carry no ``visitor_id`` column of their own).
+    Returns ``None`` if absent or not visible. Parameterized, positional.
+    """
+    _reject_global(claims)
+
+    params: list[Any] = [claims.tenant_id, conversation_id, message_id]
+    extra = ""
+    if claims.role == Role.VISITOR:
+        params.append(claims.subject)
+        extra = (
+            " AND EXISTS (SELECT 1 FROM conversations c "
+            "WHERE c.conversation_id = messages.conversation_id "
+            "AND c.tenant_id = messages.tenant_id "
+            f"AND c.visitor_id = ${len(params)})"
+        )
+    # Parameterized SQL; `extra` is a safe constant clause built above.
+    # ruff: noqa: S608
+    sql = (
+        "SELECT message_id, role, content, intent, confidence, tokens, "
+        "created_at, sources, decision, grounded, guardrail_flag FROM messages "
+        "WHERE tenant_id = $1 AND conversation_id = $2 AND message_id = $3" + extra
+    )
+    row = await db.fetchrow(sql, *params)
+    if row is None:
+        return None
+
+    return Message(
+        message_id=str(row["message_id"]),
+        role=str(row["role"]),
+        content=str(row["content"]),
+        intent=row["intent"],
+        confidence=row["confidence"],
+        tokens=row["tokens"],
+        created_at=row["created_at"],
+        sources=row["sources"],
+        decision=row.get("decision"),
+        grounded=row.get("grounded"),
+        guardrail_flag=row.get("guardrail_flag"),
+    )
 
 
 async def get_conversation(
@@ -200,8 +275,21 @@ async def get_messages(
     _reject_global(claims)
     await _verify_conversation_visible(db, claims, conversation_id)
 
-    extra, extra_params = _scope_filter(claims)
-    # Parameterized SQL; `extra` is a safe constant clause from _scope_filter.
+    # `messages` carries no `visitor_id` column of its own (migration 0007) --
+    # VISITOR callers must be scoped via an EXISTS join to `conversations`,
+    # mirroring `get_message`'s pattern. Build positionally — NEVER a
+    # hardcoded index.
+    params: list[Any] = [claims.tenant_id, conversation_id]
+    extra = ""
+    if claims.role == Role.VISITOR:
+        params.append(claims.subject)
+        extra = (
+            " AND EXISTS (SELECT 1 FROM conversations c "
+            "WHERE c.conversation_id = messages.conversation_id "
+            "AND c.tenant_id = messages.tenant_id "
+            f"AND c.visitor_id = ${len(params)})"
+        )
+    # Parameterized SQL; `extra` is a safe constant clause built above.
     # ruff: noqa: S608
     sql = (
         "SELECT message_id, role, content, intent, confidence, tokens, "
@@ -210,7 +298,7 @@ async def get_messages(
         "WHERE tenant_id = $1 AND conversation_id = $2" + extra + " "
         "ORDER BY created_at, message_id"
     )
-    rows = await db.fetch(sql, claims.tenant_id, conversation_id, *extra_params)
+    rows = await db.fetch(sql, *params)
     return [
         Message(
             message_id=str(r["message_id"]),
@@ -270,11 +358,19 @@ async def get_window(
     await _verify_conversation_visible(db, claims, conversation_id)
 
     # Build SQL positionally — NEVER a hardcoded index.
+    # `messages` carries no `visitor_id` column of its own (migration 0007) --
+    # VISITOR callers must be scoped via an EXISTS join to `conversations`,
+    # mirroring `get_message`'s pattern (not a bare column on `messages`).
     params: list[Any] = [claims.tenant_id, conversation_id]
     where = "WHERE tenant_id = $1 AND conversation_id = $2"
     if claims.role == Role.VISITOR:
         params.append(claims.subject)
-        where += f" AND visitor_id = ${len(params)}"
+        where += (
+            " AND EXISTS (SELECT 1 FROM conversations c "
+            "WHERE c.conversation_id = messages.conversation_id "
+            "AND c.tenant_id = messages.tenant_id "
+            f"AND c.visitor_id = ${len(params)})"
+        )
 
     base = (
         "SELECT message_id, role, content, intent, confidence, tokens, "

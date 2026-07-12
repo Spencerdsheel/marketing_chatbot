@@ -12,6 +12,7 @@ from typing import Any
 from common.logging import get_logger
 from openai import APIError
 
+from api.llm.classify_matching import build_classify_instruction, match_label
 from api.llm.provider import (
     ChatMessage,
     Chunk,
@@ -121,11 +122,7 @@ class OpenAICompatibleProvider:
         if not labels:
             raise LLMError("LLM request failed.")
 
-        labels_str = ", ".join(labels)
-        instruction = (
-            f"Classify the text into exactly one of these labels: {labels_str}. "
-            "Reply with only the label, nothing else."
-        )
+        instruction = build_classify_instruction(labels)
         chat_messages = [
             ChatMessage("system", instruction),
             ChatMessage("user", text),
@@ -151,9 +148,18 @@ class OpenAICompatibleProvider:
             raise LLMError("LLM request failed.")
 
         reply = (resp.choices[0].message.content or "").strip()
-        for label in labels:
-            if reply.lower() == label.lower():
-                return label
+        matched = match_label(reply, labels)
+        if matched is not None:
+            if matched.lower() != reply.lower():
+                _log.info(
+                    "LLM classify matched label via fallback tolerance:"
+                    " provider=%s model=%s label=%s reply=%r",
+                    "openai",
+                    model,
+                    matched,
+                    reply[:_CLASSIFY_REPLY_LOG_LIMIT],
+                )
+            return matched
         _log.warning(
             "LLM classify produced no matching label: provider=%s model=%s labels=%s reply=%r",
             "openai",

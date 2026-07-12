@@ -317,3 +317,54 @@ def test_scheduling_tasks_module_is_in_include() -> None:
         app = mod.celery_app
 
     assert "api.scheduling.tasks" in app.conf.include
+
+
+# ==============================================================================
+# Notifications include (S9.1) -- no beat_schedule change
+# ==============================================================================
+
+
+def test_notifications_tasks_module_is_in_include() -> None:
+    """api.notifications.tasks must be in the Celery app's include list so the
+    worker discovers notifications.send_notification."""
+    import sys
+    from unittest.mock import patch
+
+    for key in list(sys.modules.keys()):
+        if key.startswith("api.tasks") or key == "api.config":
+            del sys.modules[key]
+
+    from common.settings import get_settings
+
+    get_settings.cache_clear()
+
+    env = {**_BASE_ENV, "REDIS_URL": "redis://stub-host:6379"}
+    with patch.dict("os.environ", env, clear=True):
+        import api.tasks.celery_app as mod  # noqa: PLC0415
+
+        app = mod.celery_app
+
+    assert "api.notifications.tasks" in app.conf.include
+
+
+def test_beat_schedule_unchanged_by_notifications() -> None:
+    """beat_schedule must still contain ONLY dispatch-due-reminders -- S9.1
+    notifications are enqueued on demand, not polled by Beat."""
+    import sys
+    from unittest.mock import patch
+
+    for key in list(sys.modules.keys()):
+        if key.startswith("api.tasks") or key == "api.config":
+            del sys.modules[key]
+
+    from common.settings import get_settings
+
+    get_settings.cache_clear()
+
+    env = {**_BASE_ENV, "REDIS_URL": "redis://stub-host:6379"}
+    with patch.dict("os.environ", env, clear=True):
+        import api.tasks.celery_app as mod  # noqa: PLC0415
+
+        app = mod.celery_app
+
+    assert list(app.conf.beat_schedule.keys()) == ["dispatch-due-reminders"]

@@ -187,6 +187,26 @@ async def test_correlation_id_generated_when_absent() -> None:
     assert len(cid) == 32  # uuid4().hex is 32 hex chars
 
 
+# -- Router registration (S10.1) -------------------------------------------------
+
+
+async def test_chat_router_registered() -> None:
+    """POST /public/chat/message route exists (chat_router is registered)."""
+    app = _build_app()
+    route_paths: set[str] = set()
+    for r in app.routes:
+        path = getattr(r, "path", None)
+        if path is not None:
+            route_paths.add(path)
+        original_router = getattr(r, "original_router", None)
+        if original_router is not None:
+            for sub in original_router.routes:
+                sub_path = getattr(sub, "path", None)
+                if sub_path is not None:
+                    route_paths.add(sub_path)
+    assert "/public/chat/message" in route_paths
+
+
 # -- Error envelope ------------------------------------------------------------
 
 

@@ -398,6 +398,49 @@ async def test_classify_empty_labels_raises_llm_error() -> None:
     tracking_client.assert_not_called()
 
 
+async def test_classify_system_instruction_is_strict_non_conversational() -> None:
+    """classify's system instruction forbids conversational replies (weak-model prompt-discipline fix)."""
+    stub = _StubCompletions(text="Support")
+    client = _make_stub_client(completions=stub)
+    provider = OpenAICompatibleProvider(client=client)
+
+    await provider.classify(
+        "I need help with my order",
+        labels=["Sales", "Support", "Billing"],
+        model="gpt-4o",
+    )
+
+    system_message = stub.last_kwargs["messages"][0]
+    assert system_message["role"] == "system"
+    instruction = system_message["content"]
+    assert "classification" in instruction.lower()
+    assert "not a conversational assistant" in instruction.lower()
+    assert "do not" in instruction.lower() or "do not" in instruction.lower()
+    assert "engage" in instruction.lower() or "respond to" in instruction.lower()
+    assert "only the label" in instruction.lower() or "only one label" in instruction.lower()
+
+
+async def test_classify_system_instruction_includes_balanced_fewshot_examples() -> None:
+    """classify's system instruction includes few-shot examples spanning multiple distinct labels."""
+    stub = _StubCompletions(text="Support")
+    client = _make_stub_client(completions=stub)
+    provider = OpenAICompatibleProvider(client=client)
+
+    await provider.classify(
+        "I need help with my order",
+        labels=["Sales", "Support", "Billing"],
+        model="gpt-4o",
+    )
+
+    instruction = stub.last_kwargs["messages"][0]["content"]
+    assert "example" in instruction.lower()
+    # Examples must map to at least two DIFFERENT example labels (not all the same),
+    # so the classifier isn't biased toward one label.
+    example_lines = [line for line in instruction.splitlines() if line.lower().startswith("label:")]
+    assert len(example_lines) >= 2
+    assert len(set(example_lines)) >= 2
+
+
 async def test_classify_empty_choices_raises_llm_error() -> None:
     """classify with empty choices → LLMError."""
     stub = _StubCompletions(empty_choices=True)
@@ -460,7 +503,7 @@ async def test_classify_error_logs_warning_without_api_key(caplog: pytest.LogCap
 async def test_classify_no_match_logs_warning_without_api_key(caplog: pytest.LogCaptureFixture) -> None:
     """classify no-match → WARNING logged with reply substring; api_key never appears."""
     sentinel_key = "sk-SECRET-KEY-NEVER-LOG"
-    stub = _StubCompletions(text="This is a billing question.")
+    stub = _StubCompletions(text="I am not sure what category this is.")
     client = _make_stub_client(completions=stub)
     provider = OpenAICompatibleProvider(api_key=sentinel_key, client=client)
 
@@ -473,8 +516,87 @@ async def test_classify_no_match_logs_warning_without_api_key(caplog: pytest.Log
             )
 
     assert any("no matching label" in record.message for record in caplog.records)
-    assert any("billing question" in record.message for record in caplog.records)
+    assert any("not sure what category" in record.message for record in caplog.records)
     assert all(sentinel_key not in record.message for record in caplog.records)
+
+
+async def test_classify_trailing_punctuation_matches_label() -> None:
+    """classify strips trailing punctuation/whitespace before matching."""
+    stub = _StubCompletions(text="support. \n")
+    client = _make_stub_client(completions=stub)
+    provider = OpenAICompatibleProvider(client=client)
+
+    result = await provider.classify(
+        "I need help",
+        labels=["sales", "support", "billing"],
+        model="gpt-4o",
+    )
+
+    assert result == "support"
+
+
+async def test_classify_trailing_plural_matches_label() -> None:
+    """classify depluralizes a naive trailing 's' -- the live-bug scenario."""
+    stub = _StubCompletions(text="scheduling_requests")
+    client = _make_stub_client(completions=stub)
+    provider = OpenAICompatibleProvider(client=client)
+
+    result = await provider.classify(
+        "book me a call",
+        labels=["question", "chitchat", "scheduling_request", "off_topic", "other"],
+        model="gpt-4o",
+    )
+
+    assert result == "scheduling_request"
+
+
+async def test_classify_whole_word_substring_matches_label() -> None:
+    """classify recognizes a label wrapped in a sentence via whole-word match."""
+    stub = _StubCompletions(text="The correct label is scheduling_request.")
+    client = _make_stub_client(completions=stub)
+    provider = OpenAICompatibleProvider(client=client)
+
+    result = await provider.classify(
+        "book me a call",
+        labels=["question", "chitchat", "scheduling_request", "off_topic", "other"],
+        model="gpt-4o",
+    )
+
+    assert result == "scheduling_request"
+
+
+async def test_classify_ambiguous_substring_raises_llm_error() -> None:
+    """classify does not guess when two labels both loosely match -- fail loud."""
+    stub = _StubCompletions(text="This could be sales or support, not sure which.")
+    client = _make_stub_client(completions=stub)
+    provider = OpenAICompatibleProvider(client=client)
+
+    with pytest.raises(LLMError):
+        await provider.classify(
+            "I need help",
+            labels=["sales", "support", "billing"],
+            model="gpt-4o",
+        )
+
+
+async def test_classify_fallback_match_logs_info_not_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-exact (fallback) match logs at INFO, not WARNING."""
+    stub = _StubCompletions(text="scheduling_requests")
+    client = _make_stub_client(completions=stub)
+    provider = OpenAICompatibleProvider(client=client)
+
+    with caplog.at_level(logging.INFO, logger="api.llm.openai_provider"):
+        result = await provider.classify(
+            "book me a call",
+            labels=["question", "chitchat", "scheduling_request", "off_topic", "other"],
+            model="gpt-4o",
+        )
+
+    assert result == "scheduling_request"
+    assert not any(record.levelno >= logging.WARNING for record in caplog.records)
+    assert any(record.levelno == logging.INFO for record in caplog.records)
 
 
 async def test_classify_no_match_truncates_reply(caplog: pytest.LogCaptureFixture) -> None:

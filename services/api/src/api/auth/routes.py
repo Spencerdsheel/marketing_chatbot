@@ -19,10 +19,13 @@ from pydantic import BaseModel, Field
 
 from api.auth.blacklist import get_token_blacklist, remaining_ttl
 from api.auth.dependencies import get_current_claims
-from api.auth.password_reset import get_password_reset_store
+from api.auth.password_reset import _hash_token, get_password_reset_store
 from api.auth.repository import get_user_by_email, set_password_hash
 from api.auth.tokens import create_access_token, decode_access_token
 from api.config import get_api_settings
+from api.notifications.repository import enqueue_notification
+from api.notifications.tasks import send_notification
+from api.notifications.templates import password_reset_message
 from api.ratelimit import client_ip, enforce_rate_limit
 
 _log = get_logger(__name__)
@@ -234,8 +237,12 @@ async def password_reset_request(
 ) -> dict[str, str]:
     """Issue a single-use, time-limited password reset token.
 
-    Always returns 200 with the same body to prevent user enumeration.
-    A token is issued (and optionally logged) only for an existing active user.
+    Always returns 200 with the same body to prevent user enumeration. A
+    token is issued -- and a reset-link email best-effort enqueued (S9.2
+    decision 4/5) -- only for an existing, active, tenant-scoped user. A
+    PLATFORM_ADMIN (global) user gets a token but no email (decision 4,
+    documented limitation); an enqueue failure is logged at ERROR but never
+    changes the response (enumeration-safety wins).
     """
     settings = get_api_settings()
 
@@ -257,15 +264,57 @@ async def password_reset_request(
         token = await get_password_reset_store(request).issue(
             user_id, settings.password_reset_ttl_seconds
         )
-        if settings.auth_reset_token_log:
-            # DEV-ONLY: the token goes in the message because the JSON formatter
-            # drops non-allow-listed extra fields (common.logging keeps secrets
-            # out of logs). Gated behind auth_reset_token_log; OFF in production.
-            _log.warning(
-                "DEV password reset token issued: %s",
-                token,
-                extra={"event": "password_reset_token"},
+
+        tenant_id: str | None = (
+            str(row["tenant_id"]) if row.get("tenant_id") is not None else None
+        )
+
+        if tenant_id is None:
+            # PLATFORM_ADMIN (global) -- enqueue_notification is tenant-scoped
+            # and rejects global callers; there is no platform-level
+            # notification config this sprint (S9.2 decision 4, documented
+            # limitation). The reset endpoint still returns the same 200.
+            _log.info(
+                "password_reset_platform_admin_deferred",
+                extra={"event": "password_reset_platform_admin_deferred", "user_id": user_id},
             )
+        else:
+            try:
+                reset_claims = AuthClaims(
+                    subject=user_id, role=Role(row["role"]), tenant_id=tenant_id
+                )
+                reset_url = f"{settings.password_reset_url_base}?token={token}"
+                subject, body_text = password_reset_message(reset_url=reset_url)
+                dedupe_key = f"pwreset:{_hash_token(token)}"
+
+                job_id = await enqueue_notification(
+                    db,
+                    reset_claims,
+                    channel="email",
+                    recipient=row["email"],
+                    subject=subject,
+                    body=body_text,
+                    dedupe_key=dedupe_key,
+                )
+
+                if job_id is not None:
+                    from common.logging import _correlation_id  # noqa: PLC0415, PLC2701
+
+                    correlation_id = _correlation_id.get() or ""
+                    send_notification.delay(
+                        job_id=job_id,
+                        tenant_id=tenant_id,
+                        correlation_id=correlation_id,
+                    )
+            except Exception:
+                # Best-effort (S9.2 decision 5): the failure is louder here
+                # (ERROR, alertable) than the booking-confirmation degrade,
+                # but must NOT change the HTTP response -- a differing status
+                # for existing-vs-unknown users would leak enumeration.
+                _log.error(
+                    "password_reset_enqueue_failed",
+                    extra={"event": "password_reset_enqueue_failed", "user_id": user_id},
+                )
 
     # Always same response -- no enumeration.
     return {"status": "reset_requested"}

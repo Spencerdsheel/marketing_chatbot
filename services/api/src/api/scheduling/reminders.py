@@ -13,11 +13,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from common.auth import AuthClaims
 from common.errors import ValidationError
 from common.logging import get_logger
+
+if TYPE_CHECKING:
+    from common.db import Database
 
 _log = get_logger(__name__)
 
@@ -98,16 +101,27 @@ class LogReminderSink:
         return DispatchRef(sink="log", ref=reminder.event_id)
 
 
-def reminder_sink_for(sink: str) -> ReminderSink:
+def reminder_sink_for(sink: str, *, db: Database | None = None) -> ReminderSink:
     """Select a ``ReminderSink`` implementation for the configured ``sink`` name.
 
     Raises ``ReminderSinkConfigError`` for an unknown value -- deterministic,
     never retried, never a network call. Mirrors
     ``api.scheduling.calendar.calendar_provider_for`` /
     ``api.crm.sync.crm_sync_for``.
+
+    ``db`` is required for ``"notification"`` (ignored for ``"log"``, which
+    stays byte-identical to pre-S9.2 behaviour -- S9.2 decision 6/2). The
+    ``NotificationReminderSink`` import is function-local so this module
+    never imports ``api.notifications`` at load time -- breaks a circular
+    import between scheduling and notifications (S9.2 constraint).
     """
     if sink == "log":
         return LogReminderSink()
+
+    if sink == "notification":
+        from api.notifications.reminder_sink import NotificationReminderSink  # noqa: PLC0415
+
+        return NotificationReminderSink(db)  # type: ignore[arg-type]
 
     raise ReminderSinkConfigError(
         f"Unsupported reminder sink: {sink!r}.",

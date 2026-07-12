@@ -25,6 +25,10 @@ from pydantic import BaseModel, field_validator
 
 from api.config import ApiSettings, get_api_settings
 from api.gateway.dependencies import get_visitor_claims
+from api.notifications.recipients import resolve_event_recipient
+from api.notifications.repository import enqueue_notification
+from api.notifications.tasks import send_notification
+from api.notifications.templates import booking_confirmation_message
 from api.scheduling.calendar import CalendarEvent, calendar_provider_for
 from api.scheduling.calendar_config_repository import get_calendar_config
 from api.scheduling.reminder_repository import create_reminder_jobs
@@ -332,6 +336,55 @@ async def book_slot(
 
         calendar_ref = f"{ref.provider}:{ref.external_id}"
         await update_event_calendar_ref(db, claims, event.event_id, calendar_ref)
+
+    # Best-effort booking-confirmation enqueue (S9.2 Decisions 1/3/5). Placed
+    # AFTER the calendar-sync block so a CALENDAR_SYNC_FAILED compensation
+    # (delete_event above + raise) never reaches here -- no confirmation is
+    # enqueued for a rolled-back booking. An enqueue failure must NEVER fail
+    # the booking (email is a downstream side effect; reminders backstop it).
+    try:
+        recipient = await resolve_event_recipient(db, claims, event.event_id)
+        if recipient is None:
+            _log.warning(
+                "booking_confirm_skipped_no_recipient",
+                extra={
+                    "event": "booking_confirm_skipped_no_recipient",
+                    "event_id": event.event_id,
+                    "tenant_id": claims.tenant_id,
+                },
+            )
+        else:
+            confirm_subject, confirm_body = booking_confirmation_message(
+                starts_at=event.starts_at, timezone=event.timezone
+            )
+            job_id = await enqueue_notification(
+                db,
+                claims,
+                channel="email",
+                recipient=recipient,
+                subject=confirm_subject,
+                body=confirm_body,
+                dedupe_key=f"booking_confirm:{event.event_id}",
+                payload={"kind": "booking_confirm", "event_id": event.event_id},
+            )
+            if job_id is not None:
+                from common.logging import _correlation_id  # noqa: PLC0415, PLC2701
+
+                correlation_id = _correlation_id.get() or ""
+                send_notification.delay(
+                    job_id=job_id,
+                    tenant_id=claims.tenant_id,
+                    correlation_id=correlation_id,
+                )
+    except Exception:
+        _log.warning(
+            "booking_confirm_enqueue_degraded",
+            extra={
+                "event": "booking_confirm_enqueue_degraded",
+                "event_id": event.event_id,
+                "tenant_id": claims.tenant_id,
+            },
+        )
 
     return BookResponse(
         event_id=event.event_id,
