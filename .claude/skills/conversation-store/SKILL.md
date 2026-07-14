@@ -48,3 +48,8 @@ description: Use when building or modifying persistence of chatbot conversations
 ## Reusable insights (knowledge_base)
 - UPSERT for idempotent writes; composite keys with tenant_id. (`06`)
 - Strip internal tenant-scoped fields from client responses. (`02`)
+
+## As-built & doctrine (audit 2026-07-11)
+- **Status: built** (S4.1–S4.4 + 0022). Path: `services/api/src/api/conversation_store/`. Migrations 0007–0009, 0022 (`sources` on messages).
+- **As-built facts:** messages use a composite PK with `tenant_id`; `append_message` is idempotent (`ON CONFLICT DO NOTHING` on message_id); roles are `user|bot|system` (`bot` is mapped to `assistant` only at the LLM boundary); working memory = `get_working_memory` → running `summary` (folded via the tenant's LLM when the window overflows, D8) + windowed recent tail; GDPR delete/export shipped in S4.4. VISITORs see only their own conversation.
+- **Think here:** this is the system of record for the product's most sensitive data — writes are idempotent-by-key or they don't ship; a durable user turn outranks a pretty error path (store first, fail loud after). Retention/deletion changes are one-way doors: surface them, don't slip them in.

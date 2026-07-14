@@ -7,6 +7,7 @@ Covers:
 - azure missing api_version → LLMError.
 - azure missing base_url → LLMError.
 - factory threads max_retries and timeout from settings into provider constructors.
+- factory threads embedding_batch_size into OpenAICompatibleProvider only (S12.6).
 - factory returns MeteredProvider for all valid configs.
 """
 from __future__ import annotations
@@ -144,6 +145,7 @@ def test_factory_threads_retries_and_timeout_to_openai() -> None:
     with patch("api.llm.factory.get_api_settings") as mock_settings:
         mock_settings.return_value.llm_max_retries = 5
         mock_settings.return_value.llm_timeout_seconds = 45.0
+        mock_settings.return_value.embedding_batch_size = 5
         with patch(
             "api.llm.factory.OpenAICompatibleProvider",
             autospec=True,
@@ -154,6 +156,7 @@ def test_factory_threads_retries_and_timeout_to_openai() -> None:
                 base_url=None,
                 max_retries=5,
                 timeout=45.0,
+                embedding_batch_size=5,
             )
 
 

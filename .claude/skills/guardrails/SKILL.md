@@ -147,3 +147,11 @@ the user's call, not the agent's.
 
 See also: `CLAUDE.md` (constitution) and `platform-foundations` (shared implementations of the patterns
 referenced above).
+
+## Addendum (audit 2026-07-11)
+CLAUDE.md gained **§6b Operating doctrine** — the thinking/planning/deciding contract that complements
+these behavioral rules. §5b there is the **as-built module map** (trust it over the older intended
+layout). Current statuses + the remediation backlog live in `dev_plan/DEVELOPMENT_PLAN.md` §3b/§7 and
+`dev_plan/PRODUCT_AUDIT_2026-07-11.md`. The audit's standing lesson for this skill: **import-time
+side effects are a guardrail-class hazard** — code that reads settings/DB/network at module import
+breaks test collection and boot ordering (see SR-1.1); treat it like a blocked action in review.

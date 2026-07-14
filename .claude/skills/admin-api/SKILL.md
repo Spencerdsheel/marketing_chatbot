@@ -58,3 +58,8 @@ description: Use when building or modifying the admin/back-office API for the ch
 - Admin console: client onboarding, upload, lead review, analytics, escalation/greeting/business-hours config;
   isolate content/leads/config per tenant. (solution_flow)
 - Single, tightly controlled platform-admin scope; audit admin actions. (RBAC_MODEL)
+
+## As-built & doctrine (audit 2026-07-11)
+- **Status: NOT BUILT** — Phase 12 (S12.1–S12.4). Precursor pieces already exist elsewhere: tenant CRUD/seed in `api/tenants/` + `api/seed.py`, per-tenant LLM/CRM/calendar/notification config repos in their owning modules, lead review data in `api/leads/`, audit read in `api/audit/`.
+- **S12.1 carries audit debt:** hash the plaintext `tenants.client_key` + constant-time lookup + rotation endpoint (audit P3-1), and record the visitor-session-secret decision (P3-2).
+- **Think here:** admin-api *aggregates* other modules through their repositories — it owns onboarding orchestration and settings, never other modules' tables. Onboarding is the product's first impression: one-shot, idempotent, and the client key is shown exactly once. Every settings knob added here must already have a consumer (orchestrator/provider) that reads it — no dead config.

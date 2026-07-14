@@ -162,6 +162,10 @@ class _StubDatabase:
             matches.sort(key=lambda r: r["created_at"], reverse=True)
             return matches[0]
 
+        if "COUNT(*)" in q and "FROM LEADS" in q:
+            _, total = self._filtered_leads(query, args)
+            return {"count": total}
+
         if "FROM LEADS" in q and "WHERE TENANT_ID" in q:
             # get_lead — WHERE tenant_id = $1 AND lead_id = $2
             tenant_id = args[0]
@@ -187,7 +191,56 @@ class _StubDatabase:
             rows.sort(key=lambda r: r["created_at"], reverse=True)
             return rows
 
+        if "FROM LEADS" in q:
+            # list_leads page query -- filter by whatever WHERE clause was
+            # built; since this stub doesn't parse SQL, it replays the same
+            # filtering logic the real WHERE clause would apply, using the
+            # captured query text to know which filters are present.
+            return self._filtered_leads(query, args)[0]
+
         return []
+
+    def _filtered_leads(
+        self, query: str, args: tuple[Any, ...],
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Shared filtering used by both the count and page queries."""
+        q = query.upper()
+        idx = 0
+        tenant_id = args[idx]
+        idx += 1
+        rows = [row for row in self._leads.values() if row["tenant_id"] == tenant_id]
+
+        if "STAGE = $" in q:
+            stage = args[idx]
+            idx += 1
+            rows = [r for r in rows if r["stage"] == stage]
+        if "STATUS = $" in q:
+            status = args[idx]
+            idx += 1
+            rows = [r for r in rows if r["status"] == status]
+        if "ASSIGNED_AGENT_ID = $" in q:
+            agent_id = args[idx]
+            idx += 1
+            rows = [r for r in rows if r["assigned_agent_id"] == agent_id]
+        if "CREATED_AT >= $" in q:
+            created_from = args[idx]
+            idx += 1
+            rows = [r for r in rows if r["created_at"] >= created_from]
+        if "CREATED_AT < $" in q:
+            created_to = args[idx]
+            idx += 1
+            rows = [r for r in rows if r["created_at"] < created_to]
+
+        rows.sort(key=lambda r: (r["created_at"], r["lead_id"]), reverse=True)
+        total = len(rows)
+
+        if "LIMIT $" in q:
+            limit = args[idx]
+            idx += 1
+            offset = args[idx] if idx < len(args) else 0
+            rows = rows[offset : offset + limit]
+
+        return rows, total
 
 
 # ---------------------------------------------------------------------------
@@ -893,3 +946,207 @@ async def test_get_lead_email_by_visitor_id_rejects_global_caller() -> None:
 
         with pytest.raises(ValidationError):
             await get_lead_email_by_visitor_id(db, global_claims, "visitor-1")
+
+
+# ---------------------------------------------------------------------------
+# list_leads (S12.4)
+# ---------------------------------------------------------------------------
+
+
+def _seed_lead(
+    db: _StubDatabase,
+    *,
+    tenant_id: str,
+    lead_id: str,
+    stage: str = "captured",
+    status: str = "new",
+    assigned_agent_id: str | None = None,
+    created_at: datetime = _NOW,
+) -> None:
+    db._leads[(tenant_id, lead_id)] = {
+        "tenant_id": tenant_id,
+        "lead_id": lead_id,
+        "visitor_id": "visitor-1",
+        "name": "Jane Doe",
+        "email": "jane@example.com",
+        "phone": None,
+        "status": status,
+        "stage": stage,
+        "qualification_score": None,
+        "consent": {"granted": True, "purpose": "contact", "text": "OK"},
+        "assigned_agent_id": assigned_agent_id,
+        "source": "widget",
+        "created_at": created_at,
+        "updated_at": created_at,
+    }
+
+
+async def test_list_leads_tenant_scoping_first_param_is_tenant_id() -> None:
+    """MANDATORY isolation: the first bound param on every captured query is
+    claims.tenant_id, for a tenant-A vs a distinct tenant-B claims object."""
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.leads.repository import list_leads
+
+        db = _StubDatabase()
+        claims_a = _claims(tenant_id="tenant-a", role=Role.CLIENT_ADMIN)
+        claims_b = _claims(tenant_id="tenant-b", role=Role.CLIENT_ADMIN)
+        _seed_lead(db, tenant_id="tenant-a", lead_id="lead-a1")
+        _seed_lead(db, tenant_id="tenant-b", lead_id="lead-b1")
+
+        rows_a, total_a = await list_leads(db, claims_a)
+        rows_b, total_b = await list_leads(db, claims_b)
+
+        assert [r.lead_id for r in rows_a] == ["lead-a1"]
+        assert total_a == 1
+        assert [r.lead_id for r in rows_b] == ["lead-b1"]
+        assert total_b == 1
+
+        for query, args in [*db.fetch_calls, *db.fetchrow_calls]:
+            if "FROM LEADS" in query.upper():
+                assert args[0] in ("tenant-a", "tenant-b")
+                assert "$1" in query
+                assert ":" not in query
+
+
+async def test_list_leads_rejects_global_caller() -> None:
+    """MANDATORY: a PLATFORM_ADMIN (tenant_id=None) caller raises ValidationError,
+    no query issued."""
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from common.errors import ValidationError
+
+        from api.leads.repository import list_leads
+
+        db = _StubDatabase()
+        global_claims = AuthClaims(subject="admin-1", role=Role.PLATFORM_ADMIN, tenant_id=None)
+
+        with pytest.raises(ValidationError) as exc_info:
+            await list_leads(db, global_claims)
+
+        assert exc_info.value.code == "GLOBAL_CALLER_NOT_PERMITTED"
+        assert db.fetch_calls == []
+        assert db.fetchrow_calls == []
+
+
+async def test_list_leads_no_filters_where_only_tenant_id() -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.leads.repository import list_leads
+
+        db = _StubDatabase()
+        claims = _claims(tenant_id="tenant-abc", role=Role.CLIENT_ADMIN)
+        _seed_lead(db, tenant_id="tenant-abc", lead_id="lead-1")
+
+        await list_leads(db, claims)
+
+        page_query, _ = db.fetch_calls[-1]
+        where_clause = page_query.lower().split("where")[1].split("order by")[0]
+        assert "stage =" not in where_clause
+        assert "assigned_agent_id =" not in where_clause
+        assert "created_at" not in where_clause
+        # status filter excluded, but the selected qualification_score column
+        # legitimately contains the substring "status" nowhere -- direct check:
+        assert " status = " not in where_clause
+
+
+async def test_list_leads_each_filter_appends_one_bound_clause() -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.leads.repository import list_leads
+
+        db = _StubDatabase()
+        claims = _claims(tenant_id="tenant-abc", role=Role.CLIENT_ADMIN)
+        _seed_lead(db, tenant_id="tenant-abc", lead_id="lead-1", stage="qualified", status="open", assigned_agent_id="agent-9")
+
+        rows, total = await list_leads(db, claims, stage="qualified")
+        assert [r.lead_id for r in rows] == ["lead-1"]
+        query, args = db.fetch_calls[-1]
+        assert "stage = $" in query.lower()
+        assert "qualified" in args
+
+        rows, total = await list_leads(db, claims, status="open")
+        assert [r.lead_id for r in rows] == ["lead-1"]
+        query, args = db.fetch_calls[-1]
+        assert "status = $" in query.lower()
+        assert "open" in args
+
+        rows, total = await list_leads(db, claims, assigned_agent_id="agent-9")
+        assert [r.lead_id for r in rows] == ["lead-1"]
+        query, args = db.fetch_calls[-1]
+        assert "assigned_agent_id = $" in query.lower()
+        assert "agent-9" in args
+
+
+async def test_list_leads_created_from_to_filters() -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.leads.repository import list_leads
+
+        db = _StubDatabase()
+        claims = _claims(tenant_id="tenant-abc", role=Role.CLIENT_ADMIN)
+        _seed_lead(db, tenant_id="tenant-abc", lead_id="lead-old", created_at=datetime(2026, 1, 1, tzinfo=UTC))
+        _seed_lead(db, tenant_id="tenant-abc", lead_id="lead-new", created_at=datetime(2026, 6, 1, tzinfo=UTC))
+
+        rows, total = await list_leads(
+            db,
+            claims,
+            created_from=datetime(2026, 3, 1, tzinfo=UTC),
+            created_to=datetime(2026, 12, 1, tzinfo=UTC),
+        )
+
+        assert [r.lead_id for r in rows] == ["lead-new"]
+        assert total == 1
+        query, args = db.fetch_calls[-1]
+        assert "created_at >= $" in query.lower()
+        assert "created_at < $" in query.lower()
+
+
+async def test_list_leads_combined_filters_all_appear() -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.leads.repository import list_leads
+
+        db = _StubDatabase()
+        claims = _claims(tenant_id="tenant-abc", role=Role.CLIENT_ADMIN)
+        _seed_lead(
+            db, tenant_id="tenant-abc", lead_id="lead-1", stage="qualified", status="open",
+            assigned_agent_id="agent-9",
+        )
+
+        rows, total = await list_leads(
+            db, claims, stage="qualified", status="open", assigned_agent_id="agent-9",
+        )
+
+        assert [r.lead_id for r in rows] == ["lead-1"]
+        query, args = db.fetch_calls[-1]
+        for clause in ("stage = $", "status = $", "assigned_agent_id = $"):
+            assert clause in query.lower()
+        for val in ("qualified", "open", "agent-9"):
+            assert val in args
+
+
+async def test_list_leads_pagination_limit_offset_order() -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.leads.repository import list_leads
+
+        db = _StubDatabase()
+        claims = _claims(tenant_id="tenant-abc", role=Role.CLIENT_ADMIN)
+        for i in range(5):
+            _seed_lead(
+                db, tenant_id="tenant-abc", lead_id=f"lead-{i}",
+                created_at=datetime(2026, 1, i + 1, tzinfo=UTC),
+            )
+
+        rows, total = await list_leads(db, claims, limit=2, offset=1)
+
+        assert total == 5
+        assert len(rows) == 2
+        # newest first: lead-4 (Jan 5), lead-3 (Jan 4), lead-2 (Jan 3), ...
+        assert [r.lead_id for r in rows] == ["lead-3", "lead-2"]
+
+        query, args = db.fetch_calls[-1]
+        assert "order by created_at desc, lead_id desc" in query.lower()
+        assert 2 in args
+        assert 1 in args

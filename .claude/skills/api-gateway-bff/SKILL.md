@@ -63,3 +63,8 @@ description: Use when building or modifying the edge/gateway layer of the chatbo
 - Rate limiting is a security concern; rate limit by identity when possible, IP otherwise. (`03`)
 - Correlation IDs are the single most useful debugging tool in distributed systems. (`03`)
 - Nginx is the edge: SSL, routing, headers, compression — keep it simple. (`08`)
+
+## As-built & doctrine (audit 2026-07-11)
+- **Status: built** (S2.1–S2.3). Paths: `services/api/src/api/gateway/` (admission → `mint_visitor_session`), `api/edge.py` (security headers + CORS), `api/ratelimit.py` (`enforce_rate_limit`, IP + key tiers). Nginx (I.1) not built yet — the app IS the edge in dev.
+- **Known gaps (owned):** CORS known-origin check is global across tenants → SR-1.4; `/public/chat/message` unmetered → SR-1.2; `tenants.client_key` stored plaintext → hashed in S12.1.
+- **Think here:** everything on this surface is hostile *and cost-bearing* — a public endpoint without a rate tier and input caps is a billing incident, not a style issue. Visitor identity is exactly what the signed session says; nothing else from the request is trusted. New public endpoints copy the admission route's shape: rate-limit first, validate, then mint/act.

@@ -68,3 +68,8 @@ escalation/booking request (claims)
 - After low confidence or 6–7 turns, present a scheduler; on booking send confirmations + reminders at
   3d/24h/1h. (solution_flow)
 - Celery Beat for cron-like scheduling; design every task to be retried. (`02`, `06`)
+
+## As-built & doctrine (audit 2026-07-11)
+- **Status: built** (S8.1–S8.3; reminder delivery wired to notifications in S9.2). Path: `services/api/src/api/scheduling/` — availability CRUD + `slots.compute_slots` (window-capped), booking with consent + double-booking guards, `calendar.py` `CalendarProvider` (Google free-busy/sync, OAuth tokens encrypted; 0019), `reminder_repository` + `tasks` (0020).
+- **As-built facts:** reminders (3d/24h/1h) are rows claimed by an **atomic UPDATE … LIMIT** in the beat-driven dispatcher — the exactly-once gate lives in the claim SQL, not in Celery; deterministic sink errors → `failed` + `last_error` (no retry), transient → raise (Celery retry).
+- **Think here:** time is the bug farm — everything stored UTC, tenant timezone applied at the edges; every guard (closed hours, double-booking, past-slot) is enforced in SQL/repo, not just the UI. Idempotency on rebook: cancel-and-replace reminder jobs keyed by event, never accumulate.

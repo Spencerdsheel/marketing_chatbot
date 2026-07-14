@@ -20,6 +20,7 @@ from common.errors import NotFoundError, ValidationError
 
 from api.conversation_store.repository import (
     append_message,
+    count_messages,
     create_conversation,
     delete_conversation,
     export_conversation,
@@ -1400,3 +1401,366 @@ async def test_get_message_guardrail_flag_none_when_clean() -> None:
 
     assert msg is not None
     assert msg.guardrail_flag is None
+
+
+# -- count_messages (S10.4) ------------------------------------------------------
+
+
+async def test_count_messages_binds_tenant_and_conversation_positionally() -> None:
+    """count_messages SELECT binds WHERE tenant_id=$1 AND conversation_id=$2,
+    positional placeholders, and returns the stubbed count."""
+    db = _RecordingDatabase(rows=[{"count": 3}])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    count = await count_messages(db, claims, "conv-1")
+
+    assert count == 3
+    assert "tenant_id = $1" in db.last_sql
+    assert "conversation_id = $2" in db.last_sql
+    assert db.last_params[0] == "tenant-a"
+    assert db.last_params[1] == "conv-1"
+
+
+async def test_count_messages_role_filter_binds_role_param() -> None:
+    """count_messages(role="user") binds an extra AND role=$N clause."""
+    db = _RecordingDatabase(rows=[{"count": 7}])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    count = await count_messages(db, claims, "conv-1", role="user")
+
+    assert count == 7
+    assert "role = $3" in db.last_sql
+    assert db.last_params == ("tenant-a", "conv-1", "user")
+
+
+async def test_count_messages_visitor_scopes_via_conversations_join() -> None:
+    """Regression guard: messages has NO visitor_id column of its own
+    (migration 0007) -- VISITOR scoping in count_messages MUST go through the
+    same EXISTS (SELECT 1 FROM conversations ...) join get_message uses, NOT
+    the old broken _scope_filter (bare `visitor_id = $N` against messages,
+    which raises asyncpg.UndefinedColumnError in production)."""
+    db = _RecordingDatabase(rows=[{"count": 2}])
+    claims = _claims("tenant-a", Role.VISITOR, subject="visitor-xyz")
+
+    count = await count_messages(db, claims, "conv-1", role="user")
+
+    assert count == 2
+    assert "EXISTS (SELECT 1 FROM conversations" in db.last_sql
+    assert "c.visitor_id" in db.last_sql
+    # Negative guard: no bare/unqualified visitor_id column reference on messages.
+    assert " AND visitor_id = " not in db.last_sql
+    assert "visitor-xyz" in db.last_params
+
+
+async def test_count_messages_visitor_role_param_numbering() -> None:
+    """VISITOR + role: role=$3, visitor_id=$4 (positional, built in order)."""
+    db = _RecordingDatabase(rows=[{"count": 5}])
+    claims = _claims("tenant-a", Role.VISITOR, subject="visitor-xyz")
+
+    await count_messages(db, claims, "conv-1", role="user")
+
+    assert "role = $3" in db.last_sql
+    assert db.last_params == ("tenant-a", "conv-1", "user", "visitor-xyz")
+
+
+async def test_count_messages_global_caller_rejected() -> None:
+    """PLATFORM_ADMIN → ValidationError on count_messages."""
+    db = _RecordingDatabase()
+    claims = _claims(None, Role.PLATFORM_ADMIN)
+
+    with pytest.raises(ValidationError):
+        await count_messages(db, claims, "conv-1")
+
+
+# -- append_message / get_message action round-trip (S10.4) ----------------------
+
+
+async def test_append_message_binds_action_param() -> None:
+    """append_message(action=...) binds it in the INSERT."""
+    conv_row = {
+        "conversation_id": "conv-1",
+        "status": "active",
+        "channel": "widget",
+        "visitor_id": None,
+        "started_at": datetime.now(UTC),
+        "ended_at": None,
+        "metadata": {},
+        "summary": None,
+        "summary_message_count": 0,
+    }
+    db = _RecordingDatabase(rows=[conv_row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    await append_message(
+        db, claims, "conv-1", role="bot", content="Book a call.",
+        decision="escalate", action="schedule_cta",
+    )
+
+    assert "action" in db.last_sql
+    assert "schedule_cta" in db.last_params
+
+
+async def test_append_message_without_action_binds_null() -> None:
+    """Existing callers (no action kwarg) still bind NULL for action."""
+    conv_row = {
+        "conversation_id": "conv-1",
+        "status": "active",
+        "channel": "widget",
+        "visitor_id": None,
+        "started_at": datetime.now(UTC),
+        "ended_at": None,
+        "metadata": {},
+        "summary": None,
+        "summary_message_count": 0,
+    }
+    db = _RecordingDatabase(rows=[conv_row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    await append_message(db, claims, "conv-1", role="user", content="Hello")
+
+    assert db.last_params[-1] is None
+
+
+def _message_row_with_action(
+    message_id: str = "msg-a",
+    role: str = "bot",
+    content: str = "Book a call.",
+    decision: str | None = "escalate",
+    action: str | None = "schedule_cta",
+) -> dict[str, Any]:
+    return {
+        "message_id": message_id,
+        "role": role,
+        "content": content,
+        "intent": None,
+        "confidence": None,
+        "tokens": None,
+        "created_at": datetime.now(UTC),
+        "sources": [],
+        "decision": decision,
+        "grounded": False,
+        "guardrail_flag": None,
+        "action": action,
+    }
+
+
+async def test_get_message_selects_and_returns_action() -> None:
+    row = _message_row_with_action(action="schedule_cta")
+    db = _RecordingDatabase(rows=[row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    msg = await get_message(db, claims, "conv-1", "msg-a")
+
+    assert msg is not None
+    assert msg.action == "schedule_cta"
+    assert "action" in db.last_sql
+
+
+async def test_get_message_action_none_when_no_cta() -> None:
+    row = _message_row_with_action(decision="answer", action=None)
+    db = _RecordingDatabase(rows=[row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    msg = await get_message(db, claims, "conv-1", "msg-a")
+
+    assert msg is not None
+    assert msg.action is None
+
+
+# ---------------------------------------------------------------------------
+# list_conversations (S12.4)
+# ---------------------------------------------------------------------------
+
+
+class _CountThenPageDatabase:
+    """Double that returns a canned count row on the first fetchrow, and
+    canned page rows on fetch -- mirrors list_conversations'
+    count-then-page query shape."""
+
+    def __init__(self, *, total: int, rows: list[dict[str, Any]]) -> None:
+        self._total = total
+        self._rows = rows
+        self.fetchrow_calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.fetch_calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
+        self.fetchrow_calls.append((query, args))
+        return {"count": self._total}
+
+    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        self.fetch_calls.append((query, args))
+        return self._rows
+
+    async def execute(self, query: str, *args: Any) -> str:
+        return "OK"
+
+    async def close(self) -> None:
+        pass
+
+
+def _conv_summary_row(
+    conversation_id: str = "conv-1", **overrides: Any,
+) -> dict[str, Any]:
+    base = {
+        "conversation_id": conversation_id,
+        "status": "active",
+        "channel": "widget",
+        "visitor_id": "visitor-1",
+        "started_at": datetime.now(UTC),
+        "ended_at": None,
+        "summary": None,
+        "message_count": 3,
+    }
+    base.update(overrides)
+    return base
+
+
+async def test_list_conversations_tenant_scoping_first_param_is_tenant_id() -> None:
+    """MANDATORY isolation: tenant_id is the first bound param, for a
+    tenant-A vs a distinct tenant-B claims object."""
+    from api.conversation_store.repository import list_conversations
+
+    db = _CountThenPageDatabase(total=1, rows=[_conv_summary_row()])
+    claims_a = _claims("tenant-a", Role.CLIENT_ADMIN)
+    claims_b = _claims("tenant-b", Role.CLIENT_AGENT)
+
+    await list_conversations(db, claims_a)
+    await list_conversations(db, claims_b)
+
+    for query, args in [*db.fetchrow_calls, *db.fetch_calls]:
+        assert "tenant_id" in query
+        assert args[0] in ("tenant-a", "tenant-b")
+        assert "$1" in query
+        assert ":" not in query
+
+
+async def test_list_conversations_rejects_global_caller() -> None:
+    """MANDATORY: a PLATFORM_ADMIN (tenant_id=None) caller raises
+    ValidationError, no query issued."""
+    from api.conversation_store.repository import list_conversations
+
+    db = _CountThenPageDatabase(total=0, rows=[])
+    global_claims = AuthClaims(subject="admin-1", role=Role.PLATFORM_ADMIN, tenant_id=None)
+
+    with pytest.raises(ValidationError):
+        await list_conversations(db, global_claims)
+
+    assert db.fetchrow_calls == []
+    assert db.fetch_calls == []
+
+
+async def test_list_conversations_window_filters_append_bound_clauses() -> None:
+    from api.conversation_store.repository import list_conversations
+
+    db = _CountThenPageDatabase(total=1, rows=[_conv_summary_row()])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+    started_from = datetime(2026, 1, 1, tzinfo=UTC)
+    started_to = datetime(2026, 6, 1, tzinfo=UTC)
+
+    await list_conversations(db, claims, started_from=started_from, started_to=started_to)
+
+    query, args = db.fetch_calls[-1]
+    assert "started_at >= $" in query.lower()
+    assert "started_at < $" in query.lower()
+    assert started_from in args
+    assert started_to in args
+
+
+async def test_list_conversations_status_and_channel_filters_bound_not_interpolated() -> None:
+    from api.conversation_store.repository import list_conversations
+
+    db = _CountThenPageDatabase(total=1, rows=[_conv_summary_row()])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    await list_conversations(db, claims, status="ended", channel="widget")
+
+    query, args = db.fetch_calls[-1]
+    assert "status = $" in query.lower()
+    assert "channel = $" in query.lower()
+    assert "ended" in args
+    assert "widget" in args
+    # values are bound, never string-interpolated into the SQL text itself
+    assert "'ended'" not in query
+    assert "'widget'" not in query
+
+
+async def test_list_conversations_escalated_true_injects_exists() -> None:
+    from api.conversation_store.repository import list_conversations
+
+    db = _CountThenPageDatabase(total=1, rows=[_conv_summary_row()])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    await list_conversations(db, claims, escalated=True)
+
+    query, _ = db.fetch_calls[-1]
+    assert "EXISTS" in query
+    assert "NOT EXISTS" not in query
+    assert "decision = 'escalate'" in query
+    assert "role = 'bot'" in query
+
+
+async def test_list_conversations_escalated_false_injects_not_exists() -> None:
+    from api.conversation_store.repository import list_conversations
+
+    db = _CountThenPageDatabase(total=1, rows=[_conv_summary_row()])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    await list_conversations(db, claims, escalated=False)
+
+    query, _ = db.fetch_calls[-1]
+    assert "NOT EXISTS" in query
+
+
+async def test_list_conversations_escalated_none_omits_clause() -> None:
+    from api.conversation_store.repository import list_conversations
+
+    db = _CountThenPageDatabase(total=1, rows=[_conv_summary_row()])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    await list_conversations(db, claims, escalated=None)
+
+    query, _ = db.fetch_calls[-1]
+    assert "EXISTS" not in query
+
+
+async def test_list_conversations_message_count_subselect_present() -> None:
+    from api.conversation_store.repository import list_conversations
+
+    db = _CountThenPageDatabase(total=1, rows=[_conv_summary_row(message_count=7)])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    rows, total = await list_conversations(db, claims)
+
+    query, _ = db.fetch_calls[-1]
+    assert "count(*)" in query.lower()
+    assert "message_count" in query.lower()
+    assert rows[0].message_count == 7
+
+
+async def test_list_conversations_returns_rows_and_total() -> None:
+    from api.conversation_store.repository import ConversationSummaryRow, list_conversations
+
+    db = _CountThenPageDatabase(total=42, rows=[_conv_summary_row(conversation_id="conv-9")])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    rows, total = await list_conversations(db, claims)
+
+    assert total == 42
+    assert isinstance(rows[0], ConversationSummaryRow)
+    assert rows[0].conversation_id == "conv-9"
+
+
+async def test_list_conversations_order_by_and_pagination() -> None:
+    from api.conversation_store.repository import list_conversations
+
+    db = _CountThenPageDatabase(total=1, rows=[_conv_summary_row()])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    await list_conversations(db, claims, limit=10, offset=5)
+
+    query, args = db.fetch_calls[-1]
+    assert "order by c.started_at desc, c.conversation_id desc" in query.lower()
+    assert "limit $" in query.lower()
+    assert "offset $" in query.lower()
+    assert 10 in args
+    assert 5 in args

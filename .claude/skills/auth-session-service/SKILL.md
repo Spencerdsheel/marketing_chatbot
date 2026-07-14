@@ -66,3 +66,8 @@ JWT claims: `{ sub, role, tenant_id, project_ids?, exp }`. Authorization is enfo
 ## Reusable insights (knowledge_base)
 - httpOnly cookies over localStorage (XSS). JWTs stateless + Redis blacklist for logout. (`07`, ADR-004)
 - RBAC enforced at data layer; reset tokens single-use + time-limited. (`07`, RBAC_MODEL)
+
+## As-built & doctrine (audit 2026-07-11)
+- **Status: built** (S1.1–S1.6; reset email wired in S9.2). Paths: `services/api/src/api/auth/` (`routes`, `tokens`, `dependencies`, `blacklist`, `repository`, `password_reset`) + `api/rbac/routes.py`.
+- **As-built facts:** reset tokens stored as SHA-256 hashes, consumed atomically via Redis `GETDEL` (single-use); logout = jti blacklist in Redis; visitor sessions are minted by the gateway with the **same HS256 `jwt_secret`** as admin JWTs — role claims separate them; a dedicated visitor secret is a recorded S12-era decision (SR-1.6).
+- **Think here:** pre-auth identity lookups (`get_user_by_email`) are the only legitimately unscoped queries — mark and justify each. Any new token type must answer three questions before it exists: TTL? revocation path? what does a leaked one grant?

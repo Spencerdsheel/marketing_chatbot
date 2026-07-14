@@ -17,6 +17,7 @@ from common.auth import AuthClaims, Role
 from common.cache import InMemoryCache
 from httpx import ASGITransport, AsyncClient
 
+from api.admin.repository import _hash_client_key
 from api.auth.tokens import create_access_token
 
 # -- Constants -----------------------------------------------------------------
@@ -50,20 +51,30 @@ _TENANT_DISABLED_ROW: dict[str, Any] = {
     "allowed_origins": ["http://localhost:3000"],
 }
 
+# S12.1: tenants.client_key_hash stores a SHA-256 hash, not the raw key.
+# get_tenant_by_client_key hashes the incoming raw key before looking it up,
+# so this stub DB (and the SQL it receives) must be keyed by hash too --
+# proves the hashing migration is a genuine behavior change, not dead code.
 _CLIENT_KEY_DB: dict[str, dict[str, Any]] = {
-    _CLIENT_KEY_A: _TENANT_A_ROW,
-    _CLIENT_KEY_B: _TENANT_B_ROW,
-    "pk_disabled": _TENANT_DISABLED_ROW,
+    _hash_client_key(_CLIENT_KEY_A): _TENANT_A_ROW,
+    _hash_client_key(_CLIENT_KEY_B): _TENANT_B_ROW,
+    _hash_client_key("pk_disabled"): _TENANT_DISABLED_ROW,
 }
 
 
 class _StubDatabase:
-    """Database double for gateway queries (lookup by client_key)."""
+    """Database double for gateway queries (lookup by client_key_hash)."""
 
     async def fetchrow(self, query: str, *args: object) -> dict[str, Any] | None:
         if args:
-            client_key = str(args[0])
-            return _CLIENT_KEY_DB.get(client_key)
+            # The raw client key must NEVER be the bound param -- only its hash.
+            bound = str(args[0])
+            assert bound not in (  # noqa: S101
+                _CLIENT_KEY_A,
+                _CLIENT_KEY_B,
+                "pk_disabled",
+            ), "raw client_key leaked into SQL binding -- expected only the hash"
+            return _CLIENT_KEY_DB.get(bound)
         return None
 
     async def fetchval(self, query: str, *args: object) -> object:

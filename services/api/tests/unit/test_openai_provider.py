@@ -8,6 +8,10 @@ Uses a stub client to avoid real network calls. Verifies:
 - openai.APIError → LLMError (no fabricated text).
 - embed returns vectors in order; kwargs are exactly {model, input}.
 - Empty embeddings data → LLMError.
+- embed sub-batches texts into groups of embedding_batch_size (S12.6): small
+  input → 1 call; large input → N calls, order preserved; exact multiple →
+  no trailing empty batch; empty input → 0 calls; mid-batch error → stops
+  immediately, no further calls.
 - classify returns canonical-cased label; non-label → LLMError; empty labels → LLMError.
 - stream yields Chunk deltas in order; empty/None deltas skipped.
 - Upstream-error logging emits WARNING with status/detail; api_key never logged.
@@ -114,6 +118,42 @@ class _StubEmbeddings:
         return SimpleNamespace(
             data=[SimpleNamespace(embedding=v) for v in self._vectors],
         )
+
+
+class _BatchTrackingEmbeddings:
+    """Stub for ``client.embeddings`` that records each call's ``input`` batch.
+
+    Each returned vector encodes its own global index (``[0.0]``, ``[1.0]``,
+    ...) so tests can assert order-preservation across sub-batched calls, not
+    just call count.
+    """
+
+    def __init__(
+        self,
+        *,
+        raise_on_call_index: int | None = None,
+        raise_error: Exception | None = None,
+    ) -> None:
+        self.calls: list[list[str]] = []
+        self._raise_on_call_index = raise_on_call_index
+        self._raise_error = raise_error
+        self._global_index = 0
+
+    async def create(self, **kwargs: object) -> SimpleNamespace:
+        call_index = len(self.calls)
+        batch = list(kwargs["input"])  # type: ignore[arg-type]
+        self.calls.append(batch)
+
+        if self._raise_on_call_index is not None and call_index == self._raise_on_call_index:
+            raise self._raise_error if self._raise_error is not None else RuntimeError(
+                "unexpected error"
+            )
+
+        data = []
+        for _ in batch:
+            data.append(SimpleNamespace(embedding=[float(self._global_index)]))
+            self._global_index += 1
+        return SimpleNamespace(data=data)
 
 
 def _make_stub_client(
@@ -278,6 +318,96 @@ async def test_embed_wraps_api_error_in_llm_error() -> None:
             ["hello"],
             model="nonexistent-model",
         )
+
+
+# -- embed sub-batching tests (S12.6) -------------------------------------------
+
+
+async def test_embed_small_input_uses_single_batch_call() -> None:
+    """texts shorter than embedding_batch_size -> exactly one call, input unchanged."""
+    stub = _BatchTrackingEmbeddings()
+    client = _make_stub_client(embeddings=stub)
+    provider = OpenAICompatibleProvider(client=client, embedding_batch_size=5)
+
+    texts = ["a", "b", "c"]
+    result = await provider.embed(texts, model="nomic-embed-text")
+
+    assert len(stub.calls) == 1
+    assert stub.calls[0] == texts
+    assert result == [[0.0], [1.0], [2.0]]
+
+
+async def test_embed_large_input_spans_multiple_batches_in_order() -> None:
+    """texts longer than embedding_batch_size -> N calls, bounded size, order preserved."""
+    stub = _BatchTrackingEmbeddings()
+    client = _make_stub_client(embeddings=stub)
+    provider = OpenAICompatibleProvider(client=client, embedding_batch_size=2)
+
+    texts = ["t0", "t1", "t2", "t3", "t4"]
+    result = await provider.embed(texts, model="nomic-embed-text")
+
+    assert [len(c) for c in stub.calls] == [2, 2, 1]
+    assert result == [[0.0], [1.0], [2.0], [3.0], [4.0]]
+
+
+async def test_embed_exact_multiple_has_no_trailing_empty_batch() -> None:
+    """texts length exactly divisible by embedding_batch_size -> no trailing empty call."""
+    stub = _BatchTrackingEmbeddings()
+    client = _make_stub_client(embeddings=stub)
+    provider = OpenAICompatibleProvider(client=client, embedding_batch_size=2)
+
+    texts = ["t0", "t1", "t2", "t3"]
+    result = await provider.embed(texts, model="nomic-embed-text")
+
+    assert len(stub.calls) == 2
+    assert [len(c) for c in stub.calls] == [2, 2]
+    assert result == [[0.0], [1.0], [2.0], [3.0]]
+
+
+async def test_embed_empty_input_makes_no_calls() -> None:
+    """texts=[] -> zero calls, returns []."""
+    stub = _BatchTrackingEmbeddings()
+    client = _make_stub_client(embeddings=stub)
+    provider = OpenAICompatibleProvider(client=client, embedding_batch_size=5)
+
+    result = await provider.embed([], model="nomic-embed-text")
+
+    assert stub.calls == []
+    assert result == []
+
+
+async def test_embed_mid_batch_error_stops_immediately() -> None:
+    """A failure on a non-first batch raises LLMError and issues no further calls."""
+    mock_request = MagicMock()
+    api_err = APIError(
+        message="upstream failure",
+        request=mock_request,
+        body={"error": "fail"},
+    )
+    stub = _BatchTrackingEmbeddings(raise_on_call_index=1, raise_error=api_err)
+    client = _make_stub_client(embeddings=stub)
+    provider = OpenAICompatibleProvider(client=client, embedding_batch_size=2)
+
+    texts = ["t0", "t1", "t2", "t3", "t4"]
+    with pytest.raises(LLMError):
+        await provider.embed(texts, model="nomic-embed-text")
+
+    # Only the first (successful) batch and the second (failing) batch ran --
+    # no batches after the failure (fail-fast, no silent partial result).
+    assert len(stub.calls) == 2
+
+
+async def test_embed_batching_defaults_to_single_call_when_unspecified() -> None:
+    """Default embedding_batch_size (5) with a small input keeps prior single-call behavior."""
+    stub = _StubEmbeddings(vectors=[[0.1, 0.2], [0.3, 0.4]])
+    client = _make_stub_client(embeddings=stub)
+    provider = OpenAICompatibleProvider(client=client)  # no embedding_batch_size override
+
+    result = await provider.embed(["hello", "world"], model="nomic-embed-text")
+
+    assert result == [[0.1, 0.2], [0.3, 0.4]]
+    assert set(stub.last_kwargs.keys()) == {"model", "input"}
+    assert stub.last_kwargs["input"] == ["hello", "world"]
 
 
 # -- upstream-error logging tests ----------------------------------------------

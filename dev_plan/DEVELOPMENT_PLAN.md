@@ -5,6 +5,10 @@
 > model the agents follow. `first_phase_chatbot/` is a **reference only** (different stack: NestJS/Prisma/TS).
 > We port its *flows and data model*, not its code — its "AI" was a deterministic stub (no real LLM, no real
 > vector search).
+>
+> **Cross-cutting brain/RAG/memory/observability decisions** (intent-gated answer tiers, website crawl-ingest,
+> hybrid+corrective RAG, working-memory+summary, in-house LLM tracing + sampled async judge) are locked in
+> [`DESIGN_DECISIONS_AI_BRAIN.md`](DESIGN_DECISIONS_AI_BRAIN.md) — cite it when specing P4/P5/P6/P10/P11/P12.
 
 ---
 
@@ -15,7 +19,7 @@ reviews; the user runs Qwen, tests manually, and owns git.
 
 | Role | Who | Responsibility |
 |------|-----|----------------|
-| **Planner / reviewer / fix-author / integrator** | **Opus** (this agent) | Writes the just-in-time **sprint spec** (`dev_plan/sprints/SX.md`); after Qwen implements, reviews as a **senior tester** (flag-only) — may dispatch a review/test agent whose model is chosen by complexity (Haiku=simple CRUD, Sonnet=auth/RAG/orchestrator/security); reads security-critical files; re-runs the suite via `venv/python.exe`; live-verifies new SQL; authors fix briefs for logic bugs. |
+| **Planner / reviewer / fix-author / integrator** | **Claude** (this agent — Fable 5 as of 2026-07-11; "Opus" in older sprint files means this role) | Writes the just-in-time **sprint spec** (`dev_plan/sprints/SX.md`); after Qwen implements, reviews as a **senior tester** (flag-only) — may dispatch a review/test agent whose model is chosen by complexity (Haiku=simple CRUD, Sonnet=auth/RAG/orchestrator/security); reads security-critical files; re-runs the suite via `venv/python.exe`; live-verifies new SQL; authors fix briefs for logic bugs. |
 | **Implementer** | **Qwen** (in opencode) | Reads `dev_plan/QWEN_IMPLEMENTATION_GUIDE.md` + the sprint spec; implements test-first; self-verifies `ruff`/`mypy`/`pytest`; reports. opencode loads `CLAUDE.md` + `.claude/skills/**` natively but does **not** run `.claude/hooks/` — the guide encodes those guardrail rules. |
 | **Manual tester / git owner** | **User** | Runs Qwen, performs the Postman/curl manual test, runs all git. |
 
@@ -73,6 +77,19 @@ Shortest end-to-end vertical slice (visitor chats, gets RAG-grounded answers):
 `P0 → P1 → P2 → P3 → P4 → P5 → P6 → P10.1`.
 
 ---
+
+## 3b. Status snapshot (audit-verified 2026-07-11 — see `PRODUCT_AUDIT_2026-07-11.md`)
+
+| Phase | Status |
+|-------|--------|
+| P0, P1, P2, P3, P4, P6, P7, P8 | **DONE** (all sprints; S1.3's stale IN-REVIEW marker superseded) |
+| P5 ingestion | DONE except **S5.2b pdf/OCR**, **S5.4 run-status endpoint**, D4 crawler source |
+| P9 notifications | S9.1 IN REVIEW · S9.2 DONE (uncommitted) · S9.3 not built |
+| P10 orchestrator | S10.1 IN REVIEW (uncommitted) · S10.2–S10.5 not built |
+| P11 observability | S11.1 + S11.3 DONE · S11.2 + D9/D10 tracing/judge not built |
+| P12 / P13 / P14 | not started |
+| Infra I.1–I.4 | not started beyond the dev compose |
+| **SR-1 remediation (§7)** | **TODO — runs next, before further P10 work** |
 
 ## 4. Sprint backlog
 
@@ -147,29 +164,50 @@ Shortest end-to-end vertical slice (visitor chats, gets RAG-grounded answers):
   stored encrypted via `common.crypto.SecretBox`. Default to the latest Claude model.
 - **Test (Postman):** seed a tenant LLM config; `POST /debug/llm/generate {prompt}` → real Claude completion.
 
-**S3.2 — `embed`** · Sonnet · depends: S3.1
-- Embeddings via the configured provider.
-- **Test (Postman):** `POST /debug/llm/embed {text}` → vector of expected dimension.
+**S3.2 — OpenAI-compatible provider (`generate`) + per-tenant `base_url`** · Qwen · depends: S3.1
+- Generic OpenAI-wire provider under `provider="openai"`, pointable anywhere via an optional per-tenant
+  `base_url` (migration 0005). Reaches **OpenCode Zen free models** now (run the bot for $0 in dev/test) and
+  real OpenAI / local Ollama later — one impl. Spec: `dev_plan/sprints/S3.2.md`; rationale: D11 in
+  `DESIGN_DECISIONS_AI_BRAIN.md`.
+- **Test (curl):** config a tenant `provider=openai`, `base_url=https://opencode.ai/zen/v1`, a free model id →
+  `POST /debug/llm/generate {prompt}` → real free-model completion + token counts; key stored encrypted.
 
-**S3.3 — `classify` + `stream`** · Sonnet · depends: S3.1
+**S3.3 — `embed` + upstream-error logging** · Qwen · depends: S3.1, S3.2 · spec: `dev_plan/sprints/S3.3.md`
+- `embed` on the provider Protocol + OpenAI-compatible impl (`/embeddings`); Anthropic embed raises (no
+  embeddings API — no fake vector). **Folded in:** providers log the upstream `APIError` status/detail
+  server-side on wrap → `LLMError` (correlation id, never the key) so a 502 is diagnosable. No schema change.
+- **Test (Postman + curl):** `POST /debug/llm/embed {texts, model}` → `{model, count, dimension}` (via local
+  Ollama `nomic-embed-text` free, or OpenAI `text-embedding-3-small`); bad model id → uvicorn WARNING with
+  upstream detail, client still generic 502.
+
+**S3.4 — `classify` + `stream`** · Sonnet · depends: S3.1
 - Classification helper + streaming generate.
 - **Test (Postman/curl):** `classify` → label+score; `stream` → chunked tokens.
 
-**S3.4 — OpenAI + Azure impls + retries/backoff + token/cost** · Sonnet (×2 parallel) · depends: S3.1
-- Two more impls behind the same Protocol; exponential backoff + jitter; token/cost capture.
-- **Test (Postman):** switch a tenant's provider config to OpenAI → same `/debug/llm/generate` now routes there.
+**S3.5 — Azure impl + retries/backoff + token/cost** · Sonnet · depends: S3.1, S3.2
+- Azure backend behind the same Protocol (OpenAI `generate` already delivered in S3.2); exponential backoff +
+  jitter; token/cost capture (feeds Update-4 observability).
+- **Test (Postman):** switch a tenant's provider config to Azure → same `/debug/llm/generate` routes there.
 
-### Phase 4 — Conversation store
+### Phase 4 — Conversation store  (working memory = windowed turns **+** running summary, D8)
 
-**S4.1 — Conversation + Message tables + repo** · Haiku · depends: S1.1
-- Tenant-scoped `conversations` + `messages` (role, content, intent, confidence, decision, metadata).
-- **Test (Postman):** debug endpoints to create a conversation + append messages; tenant isolation enforced.
+**S4.1 — Conversation + Message tables + repo** · review: Sonnet (tenancy) · depends: S1.1 · spec: `dev_plan/sprints/S4.1.md`
+- Tenant-scoped `conversations` + `messages` (role, content, intent, confidence, tokens, metadata); migration 0007;
+  repo with create / **idempotent** append / get, filtered by `claims.tenant_id` (VISITOR scoped to own conversation).
+- **Test (Postman):** debug endpoints to create a conversation + append messages; tenant isolation enforced;
+  re-append same message_id → no duplicate.
 
-**S4.2 — History windowing + fetch** · Haiku · depends: S4.1
-- Windowed history retrieval (last N) for context.
+**S4.2 — History windowing + fetch** · review: Sonnet · depends: S4.1
+- Windowed history retrieval (last N; then token-budget variant) for context.
 - **Test (Postman):** append >N messages → fetch returns the last N in order.
 
-**S4.3 — Retention/deletion + analytics hooks** · Haiku · depends: S4.1
+**S4.3 — Running conversation summary (D8)** · review: Sonnet · depends: S4.1, S3.3/S3.4
+- `summary` column on `conversations`; when the window would overflow the token budget, fold older turns into a
+  running summary via the per-tenant LLM provider (`generate`). `get_window` returns `(summary, recent_turns)`.
+  Cites D8 in `DESIGN_DECISIONS_AI_BRAIN.md`; implies the flagged `conversation-store` skill "summary" update.
+- **Test (Postman):** drive a conversation past the budget → summary populated; window returns summary + recent turns.
+
+**S4.4 — Retention/deletion + analytics hooks** · review: Haiku · depends: S4.1
 - GDPR delete/export by conversation; emit events for analytics.
 - **Test (Postman):** delete conversation → rows gone; export returns transcript.
 
@@ -179,11 +217,17 @@ Shortest end-to-end vertical slice (visitor chats, gets RAG-grounded answers):
 - `celery-worker` process + a no-op task; `celery-beat` placeholder.
 - **Test:** enqueue debug task via API → worker log shows completion; inspect ping.
 
-**S5.2 — Upload + object storage + parse (txt/docx, then pdf/OCR)** · Sonnet · depends: S5.1
-- Upload to object storage (local driver in dev); parse txt/docx (port phase-1 Q&A extraction); pdf/OCR.
-- **Test (Postman):** upload a doc → stored + parsed text returned in run record.
+**S5.2 — Upload + object storage + parse (txt/docx)** · Qwen · review: Sonnet · depends: S5.1 · spec: `dev_plan/sprints/S5.2.md`
+- Upload to object storage (local driver in dev); tenant-scoped storage; parse txt/docx (port phase-1 Q&A
+  extraction); `knowledge_docs` + `ingestion_runs` (migration 0010); async parse via the S5.1 worker (establishes
+  the **worker tenant-context** pattern); content-hash idempotent upload. **pdf/OCR split out → S5.2b.**
+- **Test (Postman):** upload a doc → stored + parsed text visible via `GET /admin/ingestion/docs/{id}` run record.
 
-**S5.3 — Chunk + embed + idempotent UPSERT to pgvector** · Sonnet · depends: S5.2, S3.2
+**S5.2b — pdf/OCR parsing** · Qwen · review: Sonnet · depends: S5.2
+- Add pdf (`pypdf`) + image OCR (Tesseract) parsers behind the S5.2 `parse()` dispatcher; no new pipeline.
+- **Test (Postman):** upload a pdf → parsed text visible.
+
+**S5.3 — Chunk + embed + idempotent UPSERT to pgvector** · Sonnet · depends: S5.2, S3.3
 - Sentence-aware chunking; embeddings via llm-provider; UPSERT into pgvector keyed for idempotency.
 - **Test (Postman):** ingest doc → pgvector rows present; re-ingest same doc → no duplicates (idempotent).
 
@@ -256,6 +300,9 @@ Shortest end-to-end vertical slice (visitor chats, gets RAG-grounded answers):
 
 **S10.2 — Intent classification + confidence + 3-way decision** · Sonnet · depends: S10.1, S6.2
 - Classify intent, score confidence, decide answer/clarify/escalate on per-tenant thresholds.
+- **Audit enrichment (2026-07-11):** implement the D3 intent gate exactly (chit-chat direct; client-specific
+  = grounded-or-escalate; general = bounded disclosed fallback, ~1–2 per conversation) and tag every answer
+  grounded/ungrounded on the stored message — this tag is what D9/D10 tracing consumes later.
 - **Test (Postman):** covered question → answer; vague question → clarify; off-topic → escalate.
 
 **S10.3 — Consent gating + guardrails** · Sonnet · depends: S10.2
@@ -266,7 +313,7 @@ Shortest end-to-end vertical slice (visitor chats, gets RAG-grounded answers):
 - When confidence stays low or turn count exceeds the cap, offer a scheduling CTA.
 - **Test (Postman):** drive a conversation past the turn cap → response offers booking a call.
 
-**S10.5 — Streaming responses** · Sonnet · depends: S10.1, S3.3
+**S10.5 — Streaming responses** · Sonnet · depends: S10.1, S3.4
 - Stream the assistant answer.
 - **Test (curl):** streamed token chunks for a chat message.
 
@@ -288,6 +335,9 @@ Shortest end-to-end vertical slice (visitor chats, gets RAG-grounded answers):
 
 **S12.1 — One-shot tenant onboarding** · Sonnet · depends: S1.1, S2.1
 - Create tenant + bot config + public client key (hash stored) + initial CLIENT_ADMIN user.
+- **Audit enrichment (2026-07-11):** this sprint also **migrates the existing plaintext
+  `tenants.client_key` to hashed storage + constant-time lookup** (audit P3-1) and adds a key-rotation
+  endpoint; consider a separate `visitor_session_secret` here too (audit P3-2).
 - **Test (Postman):** PLATFORM_ADMIN onboards a client → returns client key once; client admin can log in.
 
 **S12.2 — User mgmt + per-tenant settings** · Haiku · depends: S12.1
@@ -323,6 +373,22 @@ Shortest end-to-end vertical slice (visitor chats, gets RAG-grounded answers):
 **I.3** `docker-compose.prod.yml` + PgBouncer tuning — before first deploy.
 **I.4** CI pipeline (`lint → typecheck → unit → integration → build → smoke`, coverage thresholds) — after P1.
 
+> **Audit re-ordering (2026-07-11, P2-4):** the infra track is now the critical path to sellability.
+> **I.4 (CI) runs immediately after SR-1** — every subsequent sprint then lands against a red/green
+> gate instead of manual re-verification. I.2 + I.3 + I.1 land before the first paying tenant;
+> I.2's worker images must start **queue-dedicated workers** (`-Q ingestion` / `notifications` /
+> `scheduling`) per SR-1.5. Add to I.4: a smoke job that boots the app with the compose stack and
+> hits `/readyz` + one public flow (admission → chat) so "it deploys" is machine-checked.
+
+### Pre-sale hardening (new, after P12 — before first external tenant)
+
+**H.1 — Load & abuse test pass** · the public surface (admission, chat, leads, booking) under
+concurrency; verify rate tiers, PgBouncer sizing, and LLM-spend ceilings hold. **H.2 — Security
+pass** · dependency audit, OWASP checklist against the edge, secrets-rotation runbook
+(JWT/encryption-key rotation is designed-for but has no documented procedure). **H.3 — Tenant
+lifecycle runbook** · onboard → configure → ingest → verify → suspend → offboard (with GDPR
+export/purge), executed end-to-end on a staging tenant.
+
 ---
 
 ## 5. Porting notes from `first_phase_chatbot/` (reference only)
@@ -344,8 +410,64 @@ AiSuggestion → admin approve/edit → KnowledgeBase → reindex, with Training
 
 ---
 
-## 6. Immediate next action
+## 6. Immediate next action (updated 2026-07-11)
 
-Start **S0.1**. Opus writes `dev_plan/sprints/S0.1.md`, dispatches a Haiku subagent to author the compose +
-env + Postgres init, verifies containers come up healthy with the `vector` extension, then hands you the
-`docker compose up` + verification commands to confirm before S0.2.
+1. Close out the in-flight reviews: **S9.1** and **S10.1** (user manual test → DONE).
+2. Run **Sprint SR-1** (§7) — it unbreaks the suite and closes the audit's P1/P2 gaps.
+3. Then **I.4 (CI)**, then resume **S10.2**.
+
+---
+
+## 7. Sprint SR-1 — Audit remediation (2026-07-11) · `TODO` · runs before further P10 work
+
+> Source: `dev_plan/PRODUCT_AUDIT_2026-07-11.md` (finding IDs cited per item). One sprint, but each
+> item is independently testable and can be split into SR-1a/SR-1b if the diff grows. Planner specs
+> `dev_plan/sprints/SR1.md` just-in-time as usual; the items below are its scope contract.
+
+**SR-1.1 — Unbreak the unit suite + lazy Celery settings** *(P1-1)*
+- Give `test_notifications_reminder_sink.py` + `test_notifications_tasks.py` the `_TEST_ENV` /
+  `patch.dict` env-stub pattern used by `test_scheduling_reminder_tasks.py`/`test_celery_config.py`.
+- Make `api.tasks.celery_app` resolve settings lazily (no `get_api_settings()` at module import —
+  neither in the `Celery(...)` constructor args nor in `beat_schedule`).
+- Also fix the 6 in-flight failures measured 2026-07-11 (6 failed / 847 passed with the two broken
+  modules excluded): `test_conversation_repository.py::test_roll_summary_*` (S10.1 `sources` column
+  vs roll-summary path/stubs) and `test_rate_limiting.py::test_auth_password_reset_rate_limit`
+  (S9.2 reset-email enqueue in `auth/routes.py`; also clears the un-awaited `_run_dispatch` warning).
+  Timer-stub the tests that sleep through real rate-limit windows (suite is 12 min wall — too slow for CI).
+- **Test:** `pytest tests/unit` collects and passes **entirely** from a clean env (no `.env`), and with `.env`.
+
+**SR-1.2 — Meter the public chat surface** *(P1-2)*
+- `enforce_rate_limit` on `POST /public/chat/message`, keyed per-visitor **and** per-IP (new
+  `chat_rate_limit_*` settings); `max_length` on `message` (default 4000 chars) and on
+  `conversation_id`/`message_id`; per-conversation daily turn budget (setting, checked in
+  `answer_turn` before the LLM call — also the substrate for S10.4's turn cap).
+- **Test (Postman):** burst past the limit → 429 + Retry-After; oversize message → 422; budget
+  exhausted → explicit `TURN_BUDGET_EXCEEDED`, no LLM call, user turn still stored.
+
+**SR-1.3 — CSV formula-injection escaping** *(P2-1)*
+- Prefix-escape cell values starting with `=`, `+`, `-`, `@`, tab/CR in `_lead_to_csv_row`
+  (single quote prefix, per OWASP), applied to all visitor-controlled columns.
+- **Test:** unit — a lead named `=HYPERLINK("http://x","x")` exports as `'=HYPERLINK...`.
+
+**SR-1.4 — Per-tenant CORS binding** *(P2-2)*
+- Keep global known-origin check only for the pre-session admission endpoint; on routes with a
+  resolved session/claims, the Origin must belong to **that** tenant's allowlist.
+- **Test:** tenant-B origin + tenant-A visitor session → no CORS grant; same-tenant origin → grant.
+
+**SR-1.5 — Named Celery queues** *(P2-3)*
+- `task_routes`: `ingestion.*`→`ingestion`, `notifications.*`→`notifications`,
+  `scheduling.*`+beat→`scheduling`, rest→default; compose gains per-queue worker commands
+  (documented; prod images in I.2 inherit them).
+- **Test:** enqueue one task of each family → each lands on its named queue (inspect).
+
+**SR-1.6 — Document the shared-JWT-secret decision** *(P3-2)*
+- No code: record in S12.1's spec whether visitor sessions get their own signing secret at
+  onboarding-hardening time; capture the rotation story in H.2's runbook item.
+
+**SR-1.7 — GDPR endpoints for leads** *(P3-3)*
+- Tenant-scoped lead export (JSON) + delete (cascade activities), mirroring S4.4's conversation
+  shape; audit-trail both.
+- **Test (Postman):** export returns the lead + activities; delete → rows gone + audit row.
+
+**Definition of Done:** standard (§1) — plus `pytest tests/unit` green **from a clean environment**,
+which becomes the new baseline CI expectation for I.4.

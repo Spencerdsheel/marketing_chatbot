@@ -104,6 +104,9 @@ class _StubDatabase:
 
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
         q = query.strip().upper()
+        if "COUNT(*)" in q and "FROM LEADS" in q:
+            _, total = self._filtered_leads(query, args)
+            return {"count": total}
         if "FROM LEADS" in q and "WHERE TENANT_ID" in q:
             tenant_id = args[0]
             lead_id = args[1]
@@ -112,6 +115,42 @@ class _StubDatabase:
             user_id = args[0]
             return self._users.get(user_id)
         return None
+
+    def _filtered_leads(
+        self, query: str, args: tuple[Any, ...],
+    ) -> tuple[list[dict[str, Any]], int]:
+        q = query.upper()
+        idx = 0
+        tenant_id = args[idx]
+        idx += 1
+        rows = [row for row in self._leads.values() if row["tenant_id"] == tenant_id]
+
+        if "STAGE = $" in q:
+            rows = [r for r in rows if r["stage"] == args[idx]]
+            idx += 1
+        if "STATUS = $" in q:
+            rows = [r for r in rows if r["status"] == args[idx]]
+            idx += 1
+        if "ASSIGNED_AGENT_ID = $" in q:
+            rows = [r for r in rows if r["assigned_agent_id"] == args[idx]]
+            idx += 1
+        if "CREATED_AT >= $" in q:
+            rows = [r for r in rows if r["created_at"] >= args[idx]]
+            idx += 1
+        if "CREATED_AT < $" in q:
+            rows = [r for r in rows if r["created_at"] < args[idx]]
+            idx += 1
+
+        rows.sort(key=lambda r: (r["created_at"], r["lead_id"]), reverse=True)
+        total = len(rows)
+
+        if "LIMIT $" in q:
+            limit = args[idx]
+            idx += 1
+            offset = args[idx] if idx < len(args) else 0
+            rows = rows[offset : offset + limit]
+
+        return rows, total
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
         q = query.strip().upper()
@@ -124,6 +163,9 @@ class _StubDatabase:
                 if row["tenant_id"] == tenant_id and row["lead_id"] == lead_id
             ]
             rows.sort(key=lambda r: r["created_at"], reverse=True)
+            return rows
+        if "FROM LEADS" in q and "LIMIT $" in q:
+            rows, _ = self._filtered_leads(query, args)
             return rows
         if "FROM LEADS" in q:
             tenant_id = args[0]
@@ -899,3 +941,179 @@ async def test_export_not_matched_as_lead_id_path(app: Any, db: _StubDatabase) -
 
     # A 404 here would mean the route ordering treated "export" as a lead_id.
     assert response.status_code != 404
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/leads (S12.4 -- paginated, filterable list)
+# ---------------------------------------------------------------------------
+
+
+async def test_list_leads_happy_path_client_admin(app: Any, db: _StubDatabase) -> None:
+    db.seed(tenant_id=_TENANT_ID, lead_id="lead-l1", stage="captured", status="new", qualification_score=10)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        token = _token(Role.CLIENT_ADMIN)
+        response = await client.get("/admin/leads", cookies={"access_token": token})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert set(data.keys()) == {"items", "total", "limit", "offset"}
+    assert data["total"] == 1
+    assert data["limit"] == 50
+    assert data["offset"] == 0
+    item = data["items"][0]
+    assert item["lead_id"] == "lead-l1"
+    assert item["email"] == _PII_EMAIL
+    assert "created_at" in item
+    assert "tenant_id" not in item
+    assert "consent" not in item
+
+
+async def test_list_leads_client_agent_allowed(app: Any, db: _StubDatabase) -> None:
+    db.seed(tenant_id=_TENANT_ID, lead_id="lead-l2")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        token = _token(Role.CLIENT_AGENT)
+        response = await client.get("/admin/leads", cookies={"access_token": token})
+
+    assert response.status_code == 200
+
+
+async def test_list_leads_visitor_forbidden(app: Any, db: _StubDatabase) -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        token = _token(Role.VISITOR)
+        response = await client.get("/admin/leads", cookies={"access_token": token})
+
+    assert response.status_code == 403
+
+
+async def test_list_leads_no_auth_returns_401(app: Any, db: _StubDatabase) -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/admin/leads")
+
+    assert response.status_code == 401
+
+
+async def test_list_leads_platform_admin_forbidden(app: Any, db: _StubDatabase) -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        token = _token(Role.PLATFORM_ADMIN, tenant_id=None)
+        response = await client.get("/admin/leads", cookies={"access_token": token})
+
+    assert response.status_code == 403
+    assert response.json()["error_code"] == "ROLE_NOT_PERMITTED"
+
+
+async def test_list_leads_invalid_stage_returns_422(app: Any, db: _StubDatabase) -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        token = _token(Role.CLIENT_ADMIN)
+        response = await client.get("/admin/leads?stage=bogus", cookies={"access_token": token})
+
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "INVALID_LEAD_FILTER"
+
+
+async def test_list_leads_invalid_status_returns_422(app: Any, db: _StubDatabase) -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        token = _token(Role.CLIENT_ADMIN)
+        response = await client.get("/admin/leads?status=bogus", cookies={"access_token": token})
+
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "INVALID_LEAD_FILTER"
+
+
+async def test_list_leads_valid_stage_status_returns_200(app: Any, db: _StubDatabase) -> None:
+    db.seed(tenant_id=_TENANT_ID, lead_id="lead-l3", stage="qualified", status="open")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        token = _token(Role.CLIENT_ADMIN)
+        response = await client.get(
+            "/admin/leads?stage=qualified&status=open", cookies={"access_token": token},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 1
+    assert data["items"][0]["lead_id"] == "lead-l3"
+
+
+async def test_list_leads_assigned_agent_id_no_match_returns_empty_page(
+    app: Any, db: _StubDatabase,
+) -> None:
+    db.seed(tenant_id=_TENANT_ID, lead_id="lead-l4")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        token = _token(Role.CLIENT_ADMIN)
+        response = await client.get(
+            "/admin/leads?assigned_agent_id=no-such-agent", cookies={"access_token": token},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["items"] == []
+    assert data["total"] == 0
+
+
+async def test_list_leads_from_gte_to_returns_422(app: Any, db: _StubDatabase) -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        token = _token(Role.CLIENT_ADMIN)
+        response = await client.get(
+            "/admin/leads?from=2026-06-01T00:00:00Z&to=2026-01-01T00:00:00Z",
+            cookies={"access_token": token},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "INVALID_LIST_WINDOW"
+
+
+async def test_list_leads_limit_clamped_to_200(app: Any, db: _StubDatabase) -> None:
+    for i in range(3):
+        db.seed(tenant_id=_TENANT_ID, lead_id=f"lead-clamp-{i}")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        token = _token(Role.CLIENT_ADMIN)
+        response = await client.get("/admin/leads?limit=9999", cookies={"access_token": token})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["limit"] == 200
+    assert len(data["items"]) <= 200
+
+
+async def test_list_leads_limit_zero_clamped_to_1(app: Any, db: _StubDatabase) -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        token = _token(Role.CLIENT_ADMIN)
+        response = await client.get("/admin/leads?limit=0", cookies={"access_token": token})
+
+    assert response.status_code == 200
+    assert response.json()["limit"] == 1
+
+
+async def test_list_leads_negative_limit_clamped_to_1(app: Any, db: _StubDatabase) -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        token = _token(Role.CLIENT_ADMIN)
+        response = await client.get("/admin/leads?limit=-5", cookies={"access_token": token})
+
+    assert response.status_code == 200
+    assert response.json()["limit"] == 1
+
+
+async def test_list_leads_negative_offset_clamped_to_0(app: Any, db: _StubDatabase) -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        token = _token(Role.CLIENT_ADMIN)
+        response = await client.get("/admin/leads?offset=-5", cookies={"access_token": token})
+
+    assert response.status_code == 200
+    assert response.json()["offset"] == 0
+
+
+async def test_list_leads_cross_tenant_isolation(app: Any, db: _StubDatabase) -> None:
+    db.seed(tenant_id=_TENANT_ID, lead_id="lead-mine")
+    db.seed(tenant_id=_OTHER_TENANT_ID, lead_id="lead-other")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        token = _token(Role.CLIENT_AGENT, tenant_id=_TENANT_ID)
+        response = await client.get("/admin/leads", cookies={"access_token": token})
+
+    assert response.status_code == 200
+    ids = [item["lead_id"] for item in response.json()["items"]]
+    assert ids == ["lead-mine"]

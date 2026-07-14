@@ -295,6 +295,75 @@ async def list_leads_for_export(
     return [_row_to_lead(row) for row in rows]
 
 
+async def list_leads(
+    db: Database,
+    claims: AuthClaims,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    stage: str | None = None,
+    status: str | None = None,
+    assigned_agent_id: str | None = None,
+    created_from: datetime | None = None,
+    created_to: datetime | None = None,
+) -> tuple[list[Lead], int]:
+    """Fetch a paginated, filtered page of the caller's tenant leads.
+
+    Tenant-scoped (``WHERE tenant_id = $1``); each supplied filter appends
+    exactly one positional ``AND`` clause, values always bound (never
+    interpolated). Does **not** validate filter *values* -- the route
+    validates ``stage``/``status`` against ``api.leads.pipeline``'s canonical
+    sets before calling; this function trusts pre-validated inputs and only
+    enforces tenancy + parameterization. ``created_from``/``created_to``
+    filter ``created_at`` as a half-open ``[from, to)`` window.
+
+    Returns ``(rows, total)`` -- ``total`` is a ``count(*)`` over the same
+    filtered WHERE (minus LIMIT/OFFSET), newest first
+    (``ORDER BY created_at DESC, lead_id DESC``).
+    """
+    _reject_global(claims)
+
+    where = "WHERE tenant_id = $1"
+    params: list[Any] = [claims.tenant_id]
+
+    if stage is not None:
+        params.append(stage)
+        where += f" AND stage = ${len(params)}"
+    if status is not None:
+        params.append(status)
+        where += f" AND status = ${len(params)}"
+    if assigned_agent_id is not None:
+        params.append(assigned_agent_id)
+        where += f" AND assigned_agent_id = ${len(params)}"
+    if created_from is not None:
+        params.append(created_from)
+        where += f" AND created_at >= ${len(params)}"
+    if created_to is not None:
+        params.append(created_to)
+        where += f" AND created_at < ${len(params)}"
+
+    # Parameterized SQL; `where` is a safe constant clause built above.
+    # ruff: noqa: S608
+    count_row = await db.fetchrow(
+        "SELECT count(*) AS count FROM leads " + where, *params,
+    )
+    total = int(count_row["count"]) if count_row is not None else 0
+
+    clamped_limit = max(1, min(limit, 200))
+    page_params = [*params, clamped_limit, max(0, offset)]
+    limit_idx = len(page_params) - 1
+    offset_idx = len(page_params)
+    rows = await db.fetch(
+        "SELECT lead_id, visitor_id, name, email, phone, status, stage, "
+        "qualification_score, consent, assigned_agent_id, source, "
+        "created_at, updated_at "
+        "FROM leads " + where + " "
+        f"ORDER BY created_at DESC, lead_id DESC LIMIT ${limit_idx} OFFSET ${offset_idx}",
+        *page_params,
+    )
+    return [_row_to_lead(row) for row in rows], total
+
+
 def _rows_affected(command_tag: str) -> int:
     """Parse the row count from an asyncpg-style command tag (e.g. 'UPDATE 1')."""
     parts = command_tag.strip().split()

@@ -21,13 +21,20 @@ from typing import Any
 from common.auth import AuthClaims, Role
 from common.errors import NotFoundError, ValidationError
 from common.logging import get_logger
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from api.auth.dependencies import require_roles
 from api.auth.repository import get_user_by_id
-from api.leads.pipeline import compute_qualification_score, status_for_stage, validate_transition
+from api.leads.pipeline import (
+    _STATUS_BY_STAGE,
+    STAGE_ORDER,
+    TERMINAL_STAGES,
+    compute_qualification_score,
+    status_for_stage,
+    validate_transition,
+)
 from api.leads.repository import (
     Lead,
     LeadActivity,
@@ -35,6 +42,7 @@ from api.leads.repository import (
     assign_lead,
     get_lead,
     list_activities,
+    list_leads,
     list_leads_for_export,
     update_lead_stage,
 )
@@ -121,6 +129,44 @@ def _to_response(lead: Lead) -> LeadDetailResponse:
     )
 
 
+_VALID_STAGES: set[str] = set(STAGE_ORDER) | TERMINAL_STAGES
+_VALID_STATUSES: set[str] = set(_STATUS_BY_STAGE.values())
+
+
+class LeadListItem(LeadDetailResponse):
+    """A single row in the paginated ``GET /admin/leads`` list -- the same
+    leak-free ``LeadDetailResponse`` fields plus ``created_at``."""
+
+    created_at: datetime
+
+
+class LeadListResponse(BaseModel):
+    """Paginated envelope for ``GET /admin/leads`` -- reuses the
+    ``api/audit/routes.py`` limit/offset convention, extended with ``total``
+    (a review console needs the total to page, unlike audit's scrolling tail).
+    """
+
+    items: list[LeadListItem]
+    total: int
+    limit: int
+    offset: int
+
+
+def _to_list_item(lead: Lead) -> LeadListItem:
+    return LeadListItem(
+        lead_id=lead.lead_id,
+        name=lead.name,
+        email=lead.email,
+        phone=lead.phone,
+        status=lead.status,
+        stage=lead.stage,
+        qualification_score=lead.qualification_score,
+        assigned_agent_id=lead.assigned_agent_id,
+        source=lead.source,
+        created_at=lead.created_at,
+    )
+
+
 _EXPORT_COLUMNS = (
     "lead_id",
     "name",
@@ -148,6 +194,86 @@ def _lead_to_csv_row(lead: Lead) -> list[str]:
         lead.source,
         lead.created_at.isoformat(),
     ]
+
+
+@router.get("")
+async def list_leads_route(
+    request: Request,
+    limit: int = Query(default=50),
+    offset: int = Query(default=0),
+    stage: str | None = Query(default=None),
+    status_: str | None = Query(default=None, alias="status"),
+    assigned_agent_id: str | None = Query(default=None),
+    created_from: datetime | None = Query(default=None, alias="from"),  # noqa: B008
+    created_to: datetime | None = Query(default=None, alias="to"),  # noqa: B008
+    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> LeadListResponse:
+    """List/filter the caller's tenant leads, newest first, paginated (S12.4).
+
+    ``stage``/``status`` are validated against ``api.leads.pipeline``'s
+    canonical sets (422 ``INVALID_LEAD_FILTER`` on an unknown value).
+    ``assigned_agent_id`` is an exact-match pass-through (no matching lead ->
+    an honest empty page). ``from``/``to`` filter ``created_at`` as a
+    half-open ``[from, to)`` window (422 ``INVALID_LIST_WINDOW`` if
+    ``from >= to``). ``limit`` is clamped to ``[1, 200]``, ``offset`` to
+    ``>= 0`` -- identical clamp to ``list_audit``.
+    """
+    db = request.app.state.db
+
+    if stage is not None and stage not in _VALID_STAGES:
+        raise ValidationError(
+            f"Unknown stage filter {stage!r}.", code="INVALID_LEAD_FILTER",
+        )
+    if status_ is not None and status_ not in _VALID_STATUSES:
+        raise ValidationError(
+            f"Unknown status filter {status_!r}.", code="INVALID_LEAD_FILTER",
+        )
+    if created_from is not None and created_to is not None and created_from >= created_to:
+        raise ValidationError(
+            "`from` must be earlier than `to`.", code="INVALID_LIST_WINDOW",
+        )
+
+    clamped_limit = max(1, min(limit, 200))
+    clamped_offset = max(0, offset)
+
+    leads, total = await list_leads(
+        db,
+        claims,
+        limit=clamped_limit,
+        offset=clamped_offset,
+        stage=stage,
+        status=status_,
+        assigned_agent_id=assigned_agent_id,
+        created_from=created_from,
+        created_to=created_to,
+    )
+
+    _log.info(
+        "leads listed",
+        extra={
+            "event": "leads_listed",
+            "tenant_id": claims.tenant_id,
+            "filter_keys": sorted(
+                k
+                for k, v in {
+                    "stage": stage,
+                    "status": status_,
+                    "assigned_agent_id": assigned_agent_id,
+                    "from": created_from,
+                    "to": created_to,
+                }.items()
+                if v is not None
+            ),
+            "result_count": len(leads),
+        },
+    )
+
+    return LeadListResponse(
+        items=[_to_list_item(lead) for lead in leads],
+        total=total,
+        limit=clamped_limit,
+        offset=clamped_offset,
+    )
 
 
 @router.get("/export")

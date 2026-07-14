@@ -207,6 +207,25 @@ async def test_chat_router_registered() -> None:
     assert "/public/chat/message" in route_paths
 
 
+async def test_chat_stream_router_registered() -> None:
+    """POST /public/chat/message/stream route exists (S10.5) alongside the
+    unchanged POST /public/chat/message."""
+    app = _build_app()
+    route_paths: set[str] = set()
+    for r in app.routes:
+        path = getattr(r, "path", None)
+        if path is not None:
+            route_paths.add(path)
+        original_router = getattr(r, "original_router", None)
+        if original_router is not None:
+            for sub in original_router.routes:
+                sub_path = getattr(sub, "path", None)
+                if sub_path is not None:
+                    route_paths.add(sub_path)
+    assert "/public/chat/message/stream" in route_paths
+    assert "/public/chat/message" in route_paths
+
+
 # -- Error envelope ------------------------------------------------------------
 
 
@@ -347,3 +366,120 @@ async def test_lifespan_database_connect_called_with_register_vector_init() -> N
         "app.state.db must be connected with init=register_vector_init "
         "(S6.1 decision 1 -- the app-db codec wiring)"
     )
+
+
+# -- Router registration (S11.2) ------------------------------------------------
+
+
+async def test_admin_onboard_tenant_router_registered() -> None:
+    """POST /admin/tenants route exists (admin_router is registered, S12.1)."""
+    app = _build_app()
+    route_paths: set[str] = set()
+    for r in app.routes:
+        path = getattr(r, "path", None)
+        if path is not None:
+            route_paths.add(path)
+        original_router = getattr(r, "original_router", None)
+        if original_router is not None:
+            for sub in original_router.routes:
+                sub_path = getattr(sub, "path", None)
+                if sub_path is not None:
+                    route_paths.add(sub_path)
+    assert "/admin/tenants" in route_paths
+
+
+async def test_admin_rotate_key_router_registered() -> None:
+    """POST /admin/tenants/{tenant_id}/rotate-key route exists (S12.1)."""
+    app = _build_app()
+    route_paths: set[str] = set()
+    for r in app.routes:
+        path = getattr(r, "path", None)
+        if path is not None:
+            route_paths.add(path)
+        original_router = getattr(r, "original_router", None)
+        if original_router is not None:
+            for sub in original_router.routes:
+                sub_path = getattr(sub, "path", None)
+                if sub_path is not None:
+                    route_paths.add(sub_path)
+    assert "/admin/tenants/{tenant_id}/rotate-key" in route_paths
+
+
+async def test_analytics_overview_router_registered() -> None:
+    """GET /admin/analytics/overview route exists (analytics_router is registered)."""
+    app = _build_app()
+    route_paths: set[str] = set()
+    for r in app.routes:
+        path = getattr(r, "path", None)
+        if path is not None:
+            route_paths.add(path)
+        original_router = getattr(r, "original_router", None)
+        if original_router is not None:
+            for sub in original_router.routes:
+                sub_path = getattr(sub, "path", None)
+                if sub_path is not None:
+                    route_paths.add(sub_path)
+    assert "/admin/analytics/overview" in route_paths
+
+
+# -- Router registration (S12.2) ------------------------------------------------
+
+
+def _all_route_paths(app: Any) -> set[str]:
+    route_paths: set[str] = set()
+    for r in app.routes:
+        path = getattr(r, "path", None)
+        if path is not None:
+            route_paths.add(path)
+        original_router = getattr(r, "original_router", None)
+        if original_router is not None:
+            for sub in original_router.routes:
+                sub_path = getattr(sub, "path", None)
+                if sub_path is not None:
+                    route_paths.add(sub_path)
+    return route_paths
+
+
+async def test_admin_users_list_create_routes_registered() -> None:
+    """GET/POST /admin/users routes exist (admin_users_router registered, S12.2)."""
+    app = _build_app()
+    route_paths = _all_route_paths(app)
+    assert "/admin/users" in route_paths
+
+
+async def test_admin_users_patch_route_registered() -> None:
+    """PATCH /admin/users/{user_id} route exists (S12.2)."""
+    app = _build_app()
+    route_paths = _all_route_paths(app)
+    assert "/admin/users/{user_id}" in route_paths
+
+
+async def test_admin_settings_get_put_routes_registered() -> None:
+    """GET/PUT /admin/settings routes exist (admin_settings_router registered, S12.2)."""
+    app = _build_app()
+    route_paths = _all_route_paths(app)
+    assert "/admin/settings" in route_paths
+
+
+# -- Router registration (S12.4) ------------------------------------------------
+
+
+async def test_admin_leads_list_route_registered() -> None:
+    """GET /admin/leads route exists (S12.4 -- new sibling on leads_admin_router)."""
+    app = _build_app()
+    route_paths = _all_route_paths(app)
+    assert "/admin/leads" in route_paths
+
+
+async def test_admin_conversations_list_route_registered() -> None:
+    """GET /admin/conversations route exists (conversation_admin_router registered, S12.4)."""
+    app = _build_app()
+    route_paths = _all_route_paths(app)
+    assert "/admin/conversations" in route_paths
+
+
+async def test_admin_conversation_detail_route_registered() -> None:
+    """GET /admin/conversations/{conversation_id} route exists (S12.4)."""
+    app = _build_app()
+    route_paths = _all_route_paths(app)
+    assert "/admin/conversations/{conversation_id}" in route_paths

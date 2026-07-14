@@ -171,8 +171,13 @@ def create_app() -> FastAPI:
         return _error_response(exc, cid)
 
     # -- Routers ---------------------------------------------------------------
+    from api.admin.routes import router as admin_router
+    from api.admin.settings_routes import router as admin_settings_router
+    from api.admin.users_routes import router as admin_users_router
+    from api.analytics.routes import router as analytics_router
     from api.audit.routes import router as audit_router
     from api.auth.routes import router as auth_router
+    from api.conversation_store.admin_routes import router as conversation_admin_router
     from api.conversation_store.routes import router as conversation_router
     from api.crm.routes import router as crm_router
     from api.gateway.routes import router as gateway_router
@@ -189,8 +194,13 @@ def create_app() -> FastAPI:
     from api.tasks.routes import router as tasks_router
     from api.tenants.routes import router as tenants_router
 
+    app.include_router(admin_router)
+    app.include_router(admin_settings_router)
+    app.include_router(admin_users_router)
+    app.include_router(analytics_router)
     app.include_router(audit_router)
     app.include_router(auth_router)
+    app.include_router(conversation_admin_router)
     app.include_router(conversation_router)
     app.include_router(crm_router)
     app.include_router(gateway_router)

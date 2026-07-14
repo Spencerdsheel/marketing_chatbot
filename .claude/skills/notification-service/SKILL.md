@@ -58,3 +58,8 @@ class NotificationProvider(Protocol):
 - Idempotent, retryable tasks for every external call. (`02`, `06`)
 - Email via SES/SendGrid/Mailgun/Postmark; optional SMS/WhatsApp via Twilio; reminders at 3d/24h/1h.
   (solution_flow)
+
+## As-built & doctrine (audit 2026-07-11)
+- **Status: built through S9.2** (S9.1 IN REVIEW; **S9.3 SMS/WhatsApp pending**). Path: `services/api/src/api/notifications/` — same process-level carve-out as ingestion (named queue with SR-1.5). Migration 0021.
+- **As-built facts:** per-tenant provider config (no default — `NOTIFICATION_NOT_CONFIGURED` is deterministic-failed, not fallback); jobs are rows: enqueue → `pending`, exactly-once flip to `sent` guarded by `status='pending'` in the repo UPDATE; deterministic errors (config, auth, malformed address) → `failed`, transient (network) → raise for Celery retry under the same job_id. Templates/recipients/reminder-sink live beside the tasks. Log lines carry job_id/tenant_id/status — **never recipient/subject/body**.
+- **Think here:** the double-send is this module's cardinal sin — every new channel or trigger must show where its exactly-once guard lives (row status flip) before it ships. Classify each new failure mode deterministic-vs-transient explicitly; "retry everything" silently spams customers.

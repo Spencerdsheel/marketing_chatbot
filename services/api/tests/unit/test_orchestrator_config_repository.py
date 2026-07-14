@@ -53,12 +53,14 @@ def _claims(tenant_id: str | None, role: Role = Role.CLIENT_ADMIN) -> AuthClaims
 
 
 async def test_get_returns_row_thresholds_when_present() -> None:
-    db = _RecordingDatabase(rows=[{"answer_threshold": 0.7, "escalate_threshold": 0.4}])
+    db = _RecordingDatabase(
+        rows=[{"answer_threshold": 0.7, "escalate_threshold": 0.4, "turn_cap": 8}]
+    )
     claims = _claims("tenant-a")
 
     cfg = await get_orchestrator_config(db, claims)
 
-    assert cfg == OrchestratorConfig(answer_threshold=0.7, escalate_threshold=0.4)
+    assert cfg == OrchestratorConfig(answer_threshold=0.7, escalate_threshold=0.4, turn_cap=8)
     assert db.last_params[0] == "tenant-a"
     assert "tenant_orchestrator_configs" in db.last_sql.lower()
 
@@ -74,6 +76,23 @@ async def test_get_returns_settings_defaults_when_no_row() -> None:
     assert cfg is not None
     assert cfg.answer_threshold == settings.orchestrator_default_answer_threshold
     assert cfg.escalate_threshold == settings.orchestrator_default_escalate_threshold
+    assert cfg.turn_cap == settings.orchestrator_default_turn_cap
+
+
+async def test_get_returns_settings_default_turn_cap_when_row_turn_cap_null() -> None:
+    """A row with turn_cap IS NULL (an S10.2-era row predating the column) ->
+    the settings default, never None -- same resolution as no row at all."""
+    db = _RecordingDatabase(
+        rows=[{"answer_threshold": 0.7, "escalate_threshold": 0.4, "turn_cap": None}]
+    )
+    claims = _claims("tenant-a")
+    settings = get_api_settings()
+
+    cfg = await get_orchestrator_config(db, claims)
+
+    assert cfg.answer_threshold == 0.7
+    assert cfg.escalate_threshold == 0.4
+    assert cfg.turn_cap == settings.orchestrator_default_turn_cap
 
 
 async def test_get_rejects_global_caller() -> None:
@@ -95,9 +114,44 @@ async def test_upsert_binds_tenant_and_thresholds_positionally() -> None:
         db, claims, answer_threshold=0.6, escalate_threshold=0.3,
     )
 
-    assert db.last_params == ("tenant-a", 0.6, 0.3)
+    assert db.last_params == ("tenant-a", 0.6, 0.3, None)
     assert "ON CONFLICT (tenant_id)" in db.last_sql
     assert "tenant_orchestrator_configs" in db.last_sql.lower()
+
+
+async def test_upsert_binds_turn_cap_positionally() -> None:
+    db = _RecordingDatabase()
+    claims = _claims("tenant-a")
+
+    await upsert_orchestrator_config(
+        db, claims, answer_threshold=0.6, escalate_threshold=0.3, turn_cap=8,
+    )
+
+    assert db.last_params == ("tenant-a", 0.6, 0.3, 8)
+    assert "turn_cap" in db.last_sql
+
+
+async def test_upsert_rejects_turn_cap_below_one() -> None:
+    db = _RecordingDatabase()
+    claims = _claims("tenant-a")
+
+    with pytest.raises(ValidationError) as exc_info:
+        await upsert_orchestrator_config(
+            db, claims, answer_threshold=0.6, escalate_threshold=0.3, turn_cap=0,
+        )
+    assert exc_info.value.code == "INVALID_TURN_CAP"
+
+
+async def test_upsert_turn_cap_none_clears_to_default() -> None:
+    """turn_cap=None is a valid, explicit clear-to-default -- always bound."""
+    db = _RecordingDatabase()
+    claims = _claims("tenant-a")
+
+    await upsert_orchestrator_config(
+        db, claims, answer_threshold=0.6, escalate_threshold=0.3, turn_cap=None,
+    )
+
+    assert db.last_params == ("tenant-a", 0.6, 0.3, None)
 
 
 async def test_upsert_rejects_escalate_greater_than_answer() -> None:
@@ -137,7 +191,7 @@ async def test_upsert_allows_equal_thresholds() -> None:
     await upsert_orchestrator_config(
         db, claims, answer_threshold=0.5, escalate_threshold=0.5,
     )
-    assert db.last_params == ("tenant-a", 0.5, 0.5)
+    assert db.last_params == ("tenant-a", 0.5, 0.5, None)
 
 
 async def test_upsert_rejects_global_caller() -> None:

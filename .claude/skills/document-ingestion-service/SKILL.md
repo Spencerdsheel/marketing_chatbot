@@ -57,3 +57,8 @@ object storage file → parser/OCR → transform/normalize (tenant context)
 - UPSERT is the key to idempotent loading; extraction/transform must be idempotent. (`06`)
 - Design every background task as if it will be retried 3 times. (`02`)
 - Ingestion: parser/OCR → chunking & embeddings → vector DB. (solution_flow)
+
+## As-built & doctrine (audit 2026-07-11)
+- **Status: partially built** (S5.1–S5.3 done; **S5.2b pdf/OCR and S5.4 run-status endpoint pending; D4 website-crawler source pending**). Path: `services/api/src/api/ingestion/` — a module of the monolith; the "carved-out worker" is the Celery *process* (named `ingestion` queue arrives with SR-1.5).
+- **As-built facts:** upload → local object storage (`storage.py`, `STORAGE_LOCAL_ROOT` fail-fast) → content-hash idempotent `knowledge_docs` + `ingestion_runs` (0010) → parse (txt/docx) → sentence-aware chunking → embed via the tenant's provider → idempotent UPSERT into `knowledge_chunks` (0011). Worker tasks re-scope tenant context from the enqueuer's claims.
+- **Think here:** idempotency is the contract — re-ingesting the same doc must be a no-op at every stage (hash, UPSERT key), because retries and redeliveries are normal life. Parser additions go behind the existing `parse()` dispatcher; a new *source* (crawler) is a new intake, same pipeline. Ingestion failures are per-run records an admin can read, never silent.

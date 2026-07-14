@@ -21,15 +21,23 @@ S5.3 additions:
 - EMBEDDING_NOT_CONFIGURED (no embedding_model): run failed, no embed call, no retry.
 - Dimension mismatch (stub returns wrong-length vector): run failed
   EMBEDDING_DIM_MISMATCH, no chunk write, no retry.
-- embed raises LLMError: propagates (retryable), run not marked succeeded.
+- embed raises LLMError with retries remaining: propagates so Celery's
+  autoretry_for schedules the next attempt; run not marked succeeded/failed.
 - Empty parsed text: chunks_out=0 succeeded.
 - Tenant-scoped system:ingestion claims asserted.
 - Database.connect called with init=register_vector_init.
+
+S12.6 additions (dev_plan/HANDOFF_embedding_batch_timeout_fix.md §7):
+- embed raises LLMError with retries exhausted: run/doc marked 'failed',
+  task returns cleanly (no uncaught exception).
+- ingest_document's autoretry_for/retry_backoff/retry_jitter/max_retries are
+  actually configured on the task decorator.
 """
 from __future__ import annotations
 
 import sys
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -752,8 +760,23 @@ async def test_s53_dimension_mismatch_deterministic_fail() -> None:
     ), "EMBEDDING_DIM_MISMATCH must be in the errors"
 
 
-async def test_s53_llm_error_propagates_for_retry() -> None:
-    """LLMError from embed propagates (not caught), so Celery retries."""
+class _ErrorEmbeddingProvider:
+    """Stub provider whose embed() always raises LLMError (imported lazily by callers)."""
+
+    def __init__(self, message: str = "Network error.") -> None:
+        self._message = message
+
+    async def embed(self, texts: list[str], *, model: str) -> list[list[float]]:
+        from api.llm.provider import LLMError  # noqa: PLC0415
+        raise LLMError(self._message)
+
+    async def generate(self, *args: Any, **kwargs: Any) -> Any: ...
+    async def classify(self, *args: Any, **kwargs: Any) -> Any: ...
+    def stream(self, *args: Any, **kwargs: Any) -> Any: ...
+
+
+async def test_s53_llm_error_propagates_when_retries_remain() -> None:
+    """LLMError from embed, retries remaining -> propagates so Celery's autoretry_for retries."""
     _reset_modules()
 
     raw_bytes = b"Hello world. Content to embed."
@@ -772,17 +795,14 @@ async def test_s53_llm_error_propagates_for_retry() -> None:
 
         from api.llm.provider import LLMError  # noqa: PLC0415
 
-        class _ErrorProvider:
-            async def embed(self, texts: list[str], *, model: str) -> list[list[float]]:
-                raise LLMError("Network error.")
-            async def generate(self, *args: Any, **kwargs: Any) -> Any: ...
-            async def classify(self, *args: Any, **kwargs: Any) -> Any: ...
-            def stream(self, *args: Any, **kwargs: Any) -> Any: ...
-
         class _FakeTask:
-            pass
+            max_retries = 3
+            request = SimpleNamespace(retries=0)  # first attempt -- retries remain
 
-        with patch("api.ingestion.tasks.provider_for", return_value=_ErrorProvider()):
+        with patch(
+            "api.ingestion.tasks.provider_for",
+            return_value=_ErrorEmbeddingProvider("Network error."),
+        ):
             from common.auth import AuthClaims, Role  # noqa: PLC0415
 
             from api.ingestion.tasks import _execute  # noqa: PLC0415
@@ -792,8 +812,7 @@ async def test_s53_llm_error_propagates_for_retry() -> None:
                 role=Role.CLIENT_ADMIN,
                 tenant_id=_TENANT_ID,
             )
-            import pytest as _pytest  # noqa: PLC0415
-            with _pytest.raises(LLMError, match="Network error"):
+            with pytest.raises(LLMError, match="Network error"):
                 await _execute(
                     _FakeTask(),  # type: ignore[arg-type]
                     db,  # type: ignore[arg-type]
@@ -803,10 +822,98 @@ async def test_s53_llm_error_propagates_for_retry() -> None:
                     storage,
                 )
 
-    # run must NOT have been marked succeeded.
+    # run must NOT have been marked succeeded or failed -- retries remain,
+    # so Celery's autoretry_for is expected to re-run the task from the top.
     run_updates = [e for e in db.executions if "INGESTION_RUNS" in e[0].upper()]
-    succeeded = [e for e in run_updates if e[1][0] == "succeeded"]
-    assert succeeded == [], "run must not be marked succeeded when LLMError propagates"
+    statuses = [e[1][0] for e in run_updates]
+    assert "succeeded" not in statuses, "run must not be marked succeeded when LLMError propagates"
+    assert "failed" not in statuses, "run must not be marked failed while retries remain"
+
+
+async def test_s12_6_llm_error_after_retries_exhausted_marks_run_failed() -> None:
+    """LLMError from embed, retries exhausted -> run/doc marked 'failed', task returns cleanly."""
+    _reset_modules()
+
+    raw_bytes = b"Hello world. Content to embed."
+    storage_key = f"{_TENANT_ID}/{_DOC_ID}/sample.txt"
+    storage = _InMemoryStorage({storage_key: raw_bytes})
+
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.config import get_api_settings  # noqa: PLC0415
+        get_api_settings.cache_clear()
+
+        llm_config_row = _make_llm_config_row()
+        db = _RecordingDatabase(
+            doc_row=_make_doc_row(storage_key=storage_key),
+            llm_config_row=llm_config_row,
+        )
+
+        class _FakeTask:
+            max_retries = 3
+            request = SimpleNamespace(retries=3)  # final attempt -- retries exhausted
+
+        with patch(
+            "api.ingestion.tasks.provider_for",
+            return_value=_ErrorEmbeddingProvider("Upstream timed out."),
+        ):
+            from common.auth import AuthClaims, Role  # noqa: PLC0415
+
+            from api.ingestion.tasks import _execute  # noqa: PLC0415
+
+            claims = AuthClaims(
+                subject="system:ingestion",
+                role=Role.CLIENT_ADMIN,
+                tenant_id=_TENANT_ID,
+            )
+            # Must NOT raise -- the final LLMError is caught and the task
+            # returns a clean 'failed' result instead of an uncaught exception.
+            result = await _execute(
+                _FakeTask(),  # type: ignore[arg-type]
+                db,  # type: ignore[arg-type]
+                claims,
+                _DOC_ID,
+                _RUN_ID,
+                storage,
+            )
+
+    assert result["status"] == "failed"
+    assert result["doc_id"] == _DOC_ID
+    assert result["run_id"] == _RUN_ID
+
+    # run must be marked failed with an EMBEDDING_FAILED error entry.
+    run_updates = [e for e in db.executions if "INGESTION_RUNS" in e[0].upper()]
+    failed_updates = [e for e in run_updates if e[1][0] == "failed"]
+    assert failed_updates, "run must reach failed once retries are exhausted"
+    assert any(
+        isinstance(arg, dict) and arg.get("code") == "EMBEDDING_FAILED"
+        for e in failed_updates
+        for arg in e[1]
+    ), "EMBEDDING_FAILED must be in the errors"
+    assert "succeeded" not in [e[1][0] for e in run_updates]
+
+    # doc must be marked failed.
+    doc_updates = [e for e in db.executions if "KNOWLEDGE_DOCS" in e[0].upper()]
+    assert any(e[1][0] == "failed" for e in doc_updates)
+
+
+def test_ingest_document_autoretry_for_llm_error_is_configured() -> None:
+    """ingest_document declares autoretry_for=(LLMError,) with backoff+jitter+bounded retries.
+
+    Regression guard for the S5.3 stale-comment bug: the old Step 8 comment
+    claimed LLMError 'propagates (transient/retryable)' but no autoretry_for
+    was ever configured, so an exhausted/uncaught LLMError left
+    ingestion_runs.status stuck at 'running' forever (S12.6 fix).
+    """
+    _reset_modules()
+
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.ingestion.tasks import ingest_document  # noqa: PLC0415
+        from api.llm.provider import LLMError  # noqa: PLC0415
+
+        assert ingest_document.autoretry_for == (LLMError,)
+        assert ingest_document.retry_backoff is True
+        assert ingest_document.retry_jitter is True
+        assert ingest_document.max_retries == 3
 
 
 async def test_s53_empty_text_succeeds_with_zero_chunks() -> None:

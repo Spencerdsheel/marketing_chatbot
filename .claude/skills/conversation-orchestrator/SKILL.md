@@ -70,3 +70,8 @@ receive message (VISITOR claims)
 ## Reusable insights (knowledge_base / solution_flow)
 - No silent fallbacks: explicit escalation beats a confident wrong answer. (ADR-010, `CLAUDE.md`)
 - Lead capture early; escalate to scheduling on low confidence or 6–7 turns. (solution_flow)
+
+## As-built & doctrine (audit 2026-07-11)
+- **Status: S10.1 built (IN REVIEW)** — `answer_turn`'s 8-step pipeline (config fail-fast → get/create conversation → replay check → durable user turn → working memory → hybrid RAG → grounded generate → assistant turn). Path: `services/api/src/api/orchestrator/`. **Pending:** S10.2 intent gate + 3-way decision (D3/D5), S10.3 consent + guardrails, S10.4 scheduling fallback, S10.5 streaming; chat rate/length/turn-budget metering lands in SR-1.2.
+- **As-built facts:** misconfiguration fails BEFORE any store write; runtime RAG/LLM failure fails loud AFTER the user turn is durable; empty retrieval → honest empty-context prompt, never fabricated context; replies never leak tenant/visitor ids; turn idempotency via client `message_id` (+`-a` assistant twin).
+- **Think here:** this module *composes*, it never re-implements — if a capability is missing, it belongs in the owning module behind its contract. Every future decision point (intent, confidence, consent, turn budget) must be a **tagged, stored fact on the message** (grounded/ungrounded, intent, decision) — D9/D10 observability consumes what you record now. Prompt text reaching the LLM is a security surface: visitor input never overrides system instructions (D5).

@@ -6,6 +6,7 @@ an optional ``base_url``.
 """
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -31,6 +32,11 @@ _CLASSIFY_REPLY_LOG_LIMIT = 120
 class OpenAICompatibleProvider:
     """OpenAI-wire backend for ``LLMProvider.generate``, ``embed``, ``classify``, and ``stream``."""
 
+    # Class-level default so subclasses that override __init__ without calling
+    # super().__init__() (e.g. AzureOpenAIProvider) still have this attribute
+    # set -- see api/llm/azure_provider.py. Overridden per-instance below.
+    _embedding_batch_size: int = 5
+
     def __init__(
         self,
         *,
@@ -38,8 +44,10 @@ class OpenAICompatibleProvider:
         base_url: str | None = None,
         max_retries: int = 2,
         timeout: float = 30.0,
+        embedding_batch_size: int = 5,
         client: Any | None = None,
     ) -> None:
+        self._embedding_batch_size = embedding_batch_size
         if client is not None:
             self._client = client
         else:
@@ -93,24 +101,59 @@ class OpenAICompatibleProvider:
         *,
         model: str,
     ) -> list[Vector]:
-        try:
-            resp = await self._client.embeddings.create(
-                model=model,
-                input=texts,
-            )
-        except APIError as exc:
-            _log.warning(
-                "LLM upstream call failed: provider=openai op=embed model=%s status=%s detail=%s",
+        """Embed ``texts`` in fixed-size sub-batches, preserving order.
+
+        Sending an entire document's chunk list as one unbatched
+        ``embeddings.create()`` call was the root cause of ingestion timeouts
+        on large documents (see
+        dev_plan/HANDOFF_embedding_batch_timeout_fix.md). Each batch is
+        capped at ``self._embedding_batch_size`` texts; batches are issued
+        sequentially (not concurrently) to keep at most one upstream request
+        in flight, matching prior behavior and avoiding rate-limit pressure.
+        Any batch failure fails the whole call immediately (fail-fast, no
+        partial/silently-incomplete vector list) -- see the handoff doc §6b
+        for why the handbook's "retry chunk / mark failed / continue"
+        fallback was explicitly rejected.
+        """
+        vectors: list[Vector] = []
+        batch_size = self._embedding_batch_size
+        total_batches = -(-len(texts) // batch_size) if batch_size > 0 else 0
+
+        for batch_index, start in enumerate(range(0, len(texts), batch_size)):
+            batch = texts[start : start + batch_size]
+            batch_t0 = time.monotonic()
+            try:
+                resp = await self._client.embeddings.create(
+                    model=model,
+                    input=batch,
+                )
+            except APIError as exc:
+                _log.warning(
+                    "LLM upstream call failed: provider=openai op=embed model=%s"
+                    " status=%s detail=%s",
+                    model,
+                    getattr(exc, "status_code", None),
+                    str(exc),
+                )
+                raise LLMError("LLM request failed.") from exc
+
+            if not resp.data:
+                raise LLMError("LLM request failed.")
+
+            vectors.extend(d.embedding for d in resp.data)
+
+            elapsed_ms = int((time.monotonic() - batch_t0) * 1000)
+            _log.info(
+                "LLM embed batch completed: provider=openai model=%s"
+                " batch_index=%d batch_size=%d total_batches=%d elapsed_ms=%d",
                 model,
-                getattr(exc, "status_code", None),
-                str(exc),
+                batch_index,
+                len(batch),
+                total_batches,
+                elapsed_ms,
             )
-            raise LLMError("LLM request failed.") from exc
 
-        if not resp.data:
-            raise LLMError("LLM request failed.")
-
-        return [d.embedding for d in resp.data]
+        return vectors
 
     async def classify(
         self,

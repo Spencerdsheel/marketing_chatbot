@@ -228,6 +228,14 @@ sample.docx
 sample.png
 sample.txt
 sample_2.docx
+agent_plan.txt
+agent_jar.txt
+jar_acme.txt
+jar_agent.txt
+jar_pa.txt
+kickbacks.vsix
+live_pass_S12.1_S12.2_S10.5.cmd
+Chatbot - Roofing Questions.md
 
 # Local dev data (storage root for document ingestion; never commit uploads)
 .devdata/

@@ -51,3 +51,7 @@ description: Use when building or modifying the admin console web app for the ch
 ## Reusable insights (knowledge_base)
 - Server components by default; push boundaries to the leaves; server actions for mutations. (`04`, ADR-001)
 - shadcn/ui for accessible, owned primitives. (`05`, ADR-007) · Measure before optimizing. (frontend guide)
+
+## As-built & doctrine (audit 2026-07-11)
+- **Status: NOT BUILT** — Phase 13 (S13.1–S13.6); `apps/` does not exist yet. Blocked on P12 admin-api surface.
+- **Think here when it starts:** server-first (RSC + server actions) means the browser never holds tenant data it didn't render — keep client components thin and RBAC-aware routing in middleware, mirroring the API's role model exactly (the API remains the enforcement point; the UI only *hides*). The D9 per-tenant observability dashboard lands here — design list/detail screens around the trace/analytics endpoints S11.2 defines, don't invent parallel aggregates.

@@ -86,6 +86,17 @@ class ApiSettings(Settings):
     chunk_max_chars: int = 1000
     chunk_overlap_chars: int = 150
 
+    # Embedding batching (S12.6).
+    # embedding_batch_size: max number of texts sent per embeddings.create()
+    #   call. Keeps each upstream request small/fast regardless of document
+    #   size -- a single oversized request was the root cause of ingestion
+    #   timeouts on large documents (see
+    #   dev_plan/HANDOFF_embedding_batch_timeout_fix.md). Default 5 per
+    #   knowledge_base/AI_CHATBOT_ENGINEERING_HANDBOOK.md §8/§9's 3-5-chunk
+    #   recommendation -- conservative for CPU-bound local embedding backends
+    #   (e.g. Ollama), fully overridable via env for hosted providers.
+    embedding_batch_size: int = 5
+
     # RAG retrieval (S6.1).
     # rag_default_top_k: used when the caller does not specify k.
     # rag_max_top_k: hard upper bound k is clamped to -- an unbounded/huge k
@@ -176,6 +187,20 @@ class ApiSettings(Settings):
     # api.orchestrator.service._decide).
     orchestrator_default_answer_threshold: float = 0.5
     orchestrator_default_escalate_threshold: float = 0.35
+
+    # Orchestrator turn-count cap default (S10.4). Used by
+    # get_orchestrator_config when a tenant has no explicit turn_cap (no row,
+    # or a row with turn_cap IS NULL) -- the per-conversation visitor-turn
+    # cap; the Nth user turn still answers normally, the (N+1)th is
+    # redirected to a scheduling CTA / lead form (strict `>`, S10.4 decision
+    # 1). Overridable per-tenant via tenant_orchestrator_configs.turn_cap.
+    orchestrator_default_turn_cap: int = 6
+
+    # Conversation analytics (S11.2). Used by GET /admin/analytics/overview
+    # when from/to are omitted: default look-back window (days) and the hard
+    # cap on the window span so a caller-supplied range can't scan unbounded.
+    analytics_default_window_days: int = 30
+    analytics_max_window_days: int = 366
 
 
 @lru_cache(maxsize=1)

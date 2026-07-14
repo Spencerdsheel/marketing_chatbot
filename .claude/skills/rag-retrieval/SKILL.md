@@ -53,3 +53,8 @@ description: Use when building or modifying retrieval-augmented generation for t
 ## Reusable insights (knowledge_base / solution_flow)
 - Cache-aside with tenant-scoped keys + invalidate after ingestion. (`02`, `03`)
 - RAG: retrieve client-specific content; if confidence low, escalate rather than hallucinate. (solution_flow)
+
+## As-built & doctrine (audit 2026-07-11)
+- **Status: built** (S6.1–S6.2). Path: `services/api/src/api/rag/` — `service.retrieve_hybrid` (vector + Postgres FTS legs fused by RRF), `repository` (tenant-scoped pgvector top-k over HNSW index 0012 + GIN FTS index 0013).
+- **As-built facts:** k is clamped (`rag_max_top_k`); confidence = weighted top-similarity + margin + coverage (`rag_conf_w_*`, floor `rag_confidence_floor`); the FTS regconfig is a bound param that must match migration 0013's literal or the index is skipped. Embeddings come from the tenant's provider — no embedding config is a deterministic `RAG_EMBEDDING_NOT_CONFIGURED`.
+- **Think here:** empty or low-confidence retrieval is a **normal outcome the orchestrator must decide on**, never an error and never an excuse to invent context. Ranking changes must show their work: verify live that the indexes are actually used (EXPLAIN), not just that tests pass. Reranking + agentic retrieval layer on later (D7) — same store, no rebuild.

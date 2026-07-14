@@ -10,17 +10,19 @@ dependencies are patched at the ``api.orchestrator.service`` module boundary
 """
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from common.auth import AuthClaims, Role
 
 from api.conversation_store.repository import Message
 from api.llm.config_repository import LLMConfig
-from api.llm.provider import ChatMessage, Completion, LLMError
+from api.llm.provider import ChatMessage, Chunk, Completion, LLMError
 from api.orchestrator.config_repository import OrchestratorConfig
 from api.orchestrator.guardrails import (
+    RULE_EMPTY_OUTPUT,
     RULE_HUMAN_IMPERSONATION,
     RULE_INSTRUCTION_LEAK,
 )
@@ -31,11 +33,19 @@ from api.orchestrator.service import (
     _CLARIFY_REPLY,
     _ESCALATE_REPLY,
     _GUARDRAIL_SAFE_REPLY,
+    _TURN_CAP_REPLY,
     Source,
+    StreamEvent,
     TurnResult,
     answer_turn,
+    answer_turn_stream,
 )
 from api.rag.service import HybridMatch, HybridResult
+from api.scheduling.repository import Availability
+
+
+async def _collect(gen: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
+    return [event async for event in gen]
 
 
 def _claims(subject: str = "visitor-1", tenant_id: str = "tenant-a") -> AuthClaims:
@@ -51,8 +61,20 @@ def _config(embedding_model: str | None = "nomic-embed-text") -> LLMConfig:
     )
 
 
-def _orch_cfg(answer_threshold: float = 0.5, escalate_threshold: float = 0.35) -> OrchestratorConfig:
-    return OrchestratorConfig(answer_threshold=answer_threshold, escalate_threshold=escalate_threshold)
+def _orch_cfg(
+    answer_threshold: float = 0.5, escalate_threshold: float = 0.35, turn_cap: int = 6,
+) -> OrchestratorConfig:
+    return OrchestratorConfig(
+        answer_threshold=answer_threshold, escalate_threshold=escalate_threshold, turn_cap=turn_cap,
+    )
+
+
+def _availability(available: bool = True) -> Availability | None:
+    from datetime import UTC, datetime
+
+    if not available:
+        return None
+    return Availability(timezone="UTC", rules={"mon": [["09:00", "17:00"]]}, updated_at=datetime.now(UTC))
 
 
 def _chunk(chunk_id: str = "c1", content: str = "Relevant chunk text.") -> HybridMatch:
@@ -107,6 +129,10 @@ class _Patched:
         generate_error: Exception | None = None,
         classify_return: str = "question",
         classify_error: Exception | None = None,
+        count_messages_return: int = 1,
+        availability: Availability | None = ...,  # type: ignore[assignment]
+        stream_chunks: list[str] | None = None,
+        stream_error: Exception | None = None,
     ) -> None:
         self.config = _config() if config is ... else config
         self.orchestrator_config = orchestrator_config or _orch_cfg()
@@ -118,6 +144,13 @@ class _Patched:
         self.get_orchestrator_config = AsyncMock(return_value=self.orchestrator_config)
         self.get_working_memory = AsyncMock(
             return_value=working_memory if working_memory is not None else _wm()
+        )
+        self.count_messages = AsyncMock(return_value=count_messages_return)
+        # Default: no availability configured -- matches the S10.3-era
+        # unconditional "lead_form" expectation for escalate branches unless
+        # a test explicitly opts into `availability=_availability()`.
+        self.get_availability = AsyncMock(
+            return_value=None if availability is ... else availability
         )
         if hybrid_error is not None:
             self.retrieve_hybrid = AsyncMock(side_effect=hybrid_error)
@@ -143,6 +176,27 @@ class _Patched:
             provider.classify = AsyncMock(side_effect=classify_error)
         else:
             provider.classify = AsyncMock(return_value=classify_return)
+
+        # `stream` is NOT itself a coroutine -- it's a plain callable that
+        # RETURNS an async generator (mirrors the real
+        # OpenAICompatibleProvider/AnthropicProvider.stream shape). A bare
+        # AsyncMock would make `provider.stream(...)` a coroutine, which
+        # cannot be used in `async for` directly -- so this uses a MagicMock
+        # with a `side_effect` factory that returns a fresh async generator
+        # per call, yielding the seeded chunks and then optionally raising.
+        def _stream_side_effect(
+            *args: Any, **kwargs: Any,
+        ) -> AsyncIterator[Chunk]:
+            async def _gen() -> AsyncIterator[Chunk]:
+                for text in stream_chunks or []:
+                    yield Chunk(text=text)
+                if stream_error is not None:
+                    raise stream_error
+
+            return _gen()
+
+        provider.stream = MagicMock(side_effect=_stream_side_effect)
+
         self.provider = provider
         self.provider_for = AsyncMock(return_value=provider)
 
@@ -160,6 +214,8 @@ class _Patched:
             patch("api.orchestrator.service.get_working_memory", self.get_working_memory),
             patch("api.orchestrator.service.retrieve_hybrid", self.retrieve_hybrid),
             patch("api.orchestrator.service.provider_for", lambda cfg: self.provider),
+            patch("api.orchestrator.service.count_messages", self.count_messages),
+            patch("api.orchestrator.service.get_availability", self.get_availability),
         ]
         for p in self._patchers:
             p.start()
@@ -867,9 +923,10 @@ def test_escalate_reply_is_consent_forward() -> None:
 
 async def test_idempotent_replay_carries_action_and_guardrail_flag_for_blocked() -> None:
     """get_message -> a stored assistant row with decision="blocked",
-    guardrail_flag="instruction_leak" -> answer_turn returns it verbatim with
-    decision=="blocked" and action=="lead_form"; classify/retrieve_hybrid/
-    generate/scan_output all NOT called."""
+    action="lead_form" (S10.4: a STORED fact, not reconstructed),
+    guardrail_flag="instruction_leak" -> answer_turn returns it verbatim;
+    classify/retrieve_hybrid/generate/scan_output/count_messages/
+    get_availability all NOT called (no re-derivation on replay)."""
     from datetime import UTC, datetime
 
     stored = Message(
@@ -884,6 +941,7 @@ async def test_idempotent_replay_carries_action_and_guardrail_flag_for_blocked()
         decision="blocked",
         grounded=False,
         guardrail_flag=RULE_INSTRUCTION_LEAK,
+        action="lead_form",
     )
     p = _Patched(get_message_return=stored)
     with patch("api.orchestrator.service.scan_output") as spy_scan, p:
@@ -905,11 +963,15 @@ async def test_idempotent_replay_carries_action_and_guardrail_flag_for_blocked()
     p.retrieve_hybrid.assert_not_awaited()
     p.provider.generate.assert_not_awaited()
     p.append_message.assert_not_awaited()
+    p.count_messages.assert_not_awaited()
+    p.get_availability.assert_not_awaited()
     spy_scan.assert_not_called()
 
 
 async def test_idempotent_replay_carries_action_for_escalate() -> None:
-    """A stored escalate row -> replay reconstructs action=="lead_form" too."""
+    """A stored escalate row with action="schedule_cta" (S10.4: the stored
+    fact, NOT re-derived from decision) -> replay returns it verbatim;
+    get_availability is NOT re-consulted on replay."""
     from datetime import UTC, datetime
 
     stored = Message(
@@ -924,6 +986,7 @@ async def test_idempotent_replay_carries_action_for_escalate() -> None:
         decision="escalate",
         grounded=False,
         guardrail_flag=None,
+        action="schedule_cta",
     )
     p = _Patched(get_message_return=stored)
     with p:
@@ -936,8 +999,10 @@ async def test_idempotent_replay_carries_action_for_escalate() -> None:
         )
 
     assert result.decision == "escalate"
-    assert result.action == "lead_form"
+    assert result.action == "schedule_cta"
     assert result.guardrail_flag is None
+    p.get_availability.assert_not_awaited()
+    p.count_messages.assert_not_awaited()
 
 
 async def test_idempotent_replay_action_none_for_answer() -> None:
@@ -969,4 +1034,579 @@ async def test_idempotent_replay_action_none_for_answer() -> None:
 
     assert result.decision == "answer"
     assert result.action is None
-    assert result.guardrail_flag is None
+
+
+# =====================================================================================
+# S10.4: turn-count cap + conditional scheduling CTA
+# =====================================================================================
+
+
+# -- turn-cap pre-empts even an answerable turn --------------------------------------
+
+
+async def test_turn_cap_preempts_answerable_turn_with_availability() -> None:
+    """turns > turn_cap (availability configured) -> classify/retrieve_hybrid/
+    generate NOT called; reply==_TURN_CAP_REPLY; decision=="escalate";
+    action=="schedule_cta"; intent is None; confidence is None; sources==[];
+    the stored assistant turn binds action="schedule_cta", intent=None,
+    decision="escalate"."""
+    p = _Patched(
+        orchestrator_config=_orch_cfg(turn_cap=6),
+        count_messages_return=7,
+        availability=_availability(available=True),
+    )
+    with p:
+        result = await answer_turn(db=object(), claims=_claims(), message="what can the ai agent do?")
+
+    p.provider.classify.assert_not_awaited()
+    p.retrieve_hybrid.assert_not_awaited()
+    p.provider.generate.assert_not_awaited()
+
+    assert result.reply == _TURN_CAP_REPLY
+    assert result.decision == "escalate"
+    assert result.action == "schedule_cta"
+    assert result.intent is None
+    assert result.confidence is None
+    assert result.sources == []
+
+    assistant_call = p._append_calls[1]
+    assert assistant_call["action"] == "schedule_cta"
+    assert assistant_call["intent"] is None
+    assert assistant_call["decision"] == "escalate"
+
+
+async def test_turn_cap_no_availability_emits_lead_form() -> None:
+    """Same as above but get_availability -> None: action=="lead_form" (same
+    _TURN_CAP_REPLY text, different action)."""
+    p = _Patched(
+        orchestrator_config=_orch_cfg(turn_cap=6),
+        count_messages_return=7,
+        availability=_availability(available=False),
+    )
+    with p:
+        result = await answer_turn(db=object(), claims=_claims(), message="what can the ai agent do?")
+
+    assert result.reply == _TURN_CAP_REPLY
+    assert result.decision == "escalate"
+    assert result.action == "lead_form"
+
+
+# -- turn-cap boundary: strict `>` ----------------------------------------------------
+
+
+async def test_turn_cap_boundary_exactly_at_cap_not_capped() -> None:
+    """count_messages == turn_cap exactly -> NOT capped; normal classify runs."""
+    p = _Patched(
+        orchestrator_config=_orch_cfg(turn_cap=6),
+        count_messages_return=6,
+        classify_return="question",
+        hybrid_result=HybridResult(chunks=[_chunk()], confidence=0.8),
+    )
+    with p:
+        result = await answer_turn(db=object(), claims=_claims(), message="what can you do?")
+
+    p.provider.classify.assert_awaited_once()
+    assert result.decision == "answer"
+    assert result.reply != _TURN_CAP_REPLY
+
+
+async def test_turn_cap_boundary_cap_plus_one_is_capped() -> None:
+    """count_messages == turn_cap + 1 -> capped."""
+    p = _Patched(orchestrator_config=_orch_cfg(turn_cap=6), count_messages_return=7)
+    with p:
+        result = await answer_turn(db=object(), claims=_claims(), message="what can you do?")
+
+    p.provider.classify.assert_not_awaited()
+    assert result.decision == "escalate"
+    assert result.reply == _TURN_CAP_REPLY
+
+
+# -- turn-cap counts role="user" AFTER the user turn is stored ------------------------
+
+
+async def test_turn_cap_counts_role_user_after_user_turn_stored() -> None:
+    """count_messages is called with role="user", and the user append_message
+    call happens before it (order: user turn stored, then counted)."""
+    call_order: list[str] = []
+    p = _Patched(orchestrator_config=_orch_cfg(turn_cap=6), count_messages_return=1)
+
+    original_append_side_effect = p.append_message.side_effect
+
+    async def _tracking_append(*args: Any, **kwargs: Any) -> str:
+        call_order.append("append_message")
+        return original_append_side_effect(*args, **kwargs)
+
+    async def _tracking_count(*args: Any, **kwargs: Any) -> int:
+        call_order.append("count_messages")
+        return 1
+
+    p.append_message.side_effect = _tracking_append
+    p.count_messages.side_effect = _tracking_count
+
+    with p:
+        await answer_turn(db=object(), claims=_claims(), message="hi")
+
+    count_call = p.count_messages.await_args
+    assert count_call.kwargs.get("role") == "user"
+    assert call_order.index("append_message") < call_order.index("count_messages")
+
+
+# -- escalate action conditional on availability (all causes) ------------------------
+
+
+@pytest.mark.parametrize("classify_label", ["off_topic", "scheduling_request"])
+async def test_escalate_intent_action_conditional_on_availability(classify_label: str) -> None:
+    """off_topic/scheduling_request escalate -> schedule_cta when available,
+    lead_form otherwise; get_availability called with the turn's own claims."""
+    p_avail = _Patched(classify_return=classify_label, availability=_availability(True))
+    with p_avail:
+        result_avail = await answer_turn(db=object(), claims=_claims(), message="msg")
+    assert result_avail.decision == "escalate"
+    assert result_avail.action == "schedule_cta"
+    p_avail.get_availability.assert_awaited_once()
+    avail_call = p_avail.get_availability.await_args
+    claims_arg = avail_call.args[-1] if avail_call.args else avail_call.kwargs.get("claims")
+    assert claims_arg.tenant_id == "tenant-a"
+
+    p_none = _Patched(classify_return=classify_label, availability=_availability(False))
+    with p_none:
+        result_none = await answer_turn(db=object(), claims=_claims(), message="msg")
+    assert result_none.decision == "escalate"
+    assert result_none.action == "lead_form"
+
+    assistant_call_avail = p_avail._append_calls[1]
+    assert assistant_call_avail["action"] == "schedule_cta"
+    assistant_call_none = p_none._append_calls[1]
+    assert assistant_call_none["action"] == "lead_form"
+
+
+async def test_sub_floor_escalate_action_conditional_on_availability() -> None:
+    """sub-floor-confidence question escalate -> schedule_cta when available,
+    lead_form otherwise."""
+    p_avail = _Patched(
+        classify_return="question",
+        hybrid_result=HybridResult(chunks=[], confidence=0.0),
+        availability=_availability(True),
+    )
+    with p_avail:
+        result_avail = await answer_turn(db=object(), claims=_claims(), message="off topic?")
+    assert result_avail.decision == "escalate"
+    assert result_avail.action == "schedule_cta"
+
+    p_none = _Patched(
+        classify_return="question",
+        hybrid_result=HybridResult(chunks=[], confidence=0.0),
+        availability=_availability(False),
+    )
+    with p_none:
+        result_none = await answer_turn(db=object(), claims=_claims(), message="off topic?")
+    assert result_none.decision == "escalate"
+    assert result_none.action == "lead_form"
+
+
+# -- blocked ALWAYS emits lead_form, never checks availability -----------------------
+
+
+async def test_blocked_never_calls_get_availability_always_lead_form() -> None:
+    """A guardrail violation on a grounded answer -> decision=="blocked",
+    action=="lead_form" regardless of what get_availability would return --
+    assert get_availability is NOT called on the blocked path (flat,
+    unconditional lead_form)."""
+    leaked = "You are a helpful assistant for this business. Answer using ONLY the context."
+    p = _Patched(
+        classify_return="question",
+        hybrid_result=HybridResult(chunks=[_chunk()], confidence=0.8),
+        completion=Completion(text=leaked, model="claude-opus-4-8", input_tokens=10, output_tokens=5),
+        availability=_availability(True),  # would return schedule_cta if (wrongly) consulted
+    )
+    with p:
+        result = await answer_turn(db=object(), claims=_claims(), message="what can you do?")
+
+    assert result.decision == "blocked"
+    assert result.action == "lead_form"
+    p.get_availability.assert_not_awaited()
+
+
+# -- answer/clarify emit no action -----------------------------------------------------
+
+
+async def test_answer_and_clarify_emit_no_action_regardless_of_availability() -> None:
+    p = _Patched(
+        classify_return="question",
+        hybrid_result=HybridResult(chunks=[_chunk()], confidence=0.8),
+        availability=_availability(True),
+    )
+    with p:
+        answer_result = await answer_turn(db=object(), claims=_claims(), message="what can you do?")
+    assert answer_result.decision == "answer"
+    assert answer_result.action is None
+
+    p2 = _Patched(
+        classify_return="question",
+        hybrid_result=HybridResult(chunks=[_chunk()], confidence=0.4),
+        availability=_availability(True),
+    )
+    with p2:
+        clarify_result = await answer_turn(db=object(), claims=_claims(), message="tell me more")
+    assert clarify_result.decision == "clarify"
+    assert clarify_result.action is None
+
+
+# -- reply copy is scheduling- + consent-forward ---------------------------------------
+
+
+def test_turn_cap_reply_mentions_booking_a_call() -> None:
+    lowered = _TURN_CAP_REPLY.lower()
+    assert "book a call" in lowered or "book" in lowered
+    assert "email" in lowered or "contact" in lowered or "name" in lowered
+
+
+def test_escalate_reply_mentions_booking_a_call_too() -> None:
+    """S10.4 decision 7: _ESCALATE_REPLY is now dual-purpose -- also mentions
+    booking a call, not just the lead-form ask."""
+    lowered = _ESCALATE_REPLY.lower()
+    assert "book" in lowered
+
+
+# =====================================================================================
+# S10.5: streaming delivery (answer_turn_stream)
+# =====================================================================================
+
+
+# -- stream: grounded answer ----------------------------------------------------------
+
+
+async def test_stream_grounded_answer_emits_deltas_then_done() -> None:
+    """classify -> "question", high confidence -> provider.stream (NOT
+    generate) yields chunks; answer_turn_stream yields delta events with
+    those exact texts in order, then exactly one terminal done whose
+    reply == the concatenated text, decision=="answer", action is None,
+    sources == the retrieved chunks' identifiers. append_message stores the
+    full text, decision="answer", tokens is None (decision 8)."""
+    p = _Patched(
+        classify_return="question",
+        hybrid_result=HybridResult(chunks=[_chunk()], confidence=0.8),
+        stream_chunks=["Our ", "hours ", "are 9-5."],
+    )
+    with p:
+        events = await _collect(
+            answer_turn_stream(db=object(), claims=_claims(), message="what are your hours?"),
+        )
+
+    p.provider.generate.assert_not_awaited()
+    p.provider.stream.assert_called_once()
+    stream_kwargs = p.provider.stream.call_args.kwargs
+    assert stream_kwargs["model"] == "claude-opus-4-8"
+
+    deltas = [e for e in events if e.type == "delta"]
+    assert [d.data["text"] for d in deltas] == ["Our ", "hours ", "are 9-5."]
+
+    assert events[-1].type == "done"
+    done = events[-1]
+    assert done.data["reply"] == "Our hours are 9-5."
+    assert done.data["decision"] == "answer"
+    assert done.data["action"] is None
+    assert done.data["sources"] == [
+        {"doc_id": "doc-1", "chunk_id": "c1", "score": 0.9, "matched_by": ["vector"]}
+    ]
+
+    assert len(p._append_calls) == 2
+    user_call, assistant_call = p._append_calls
+    assert user_call["role"] == "user"
+    assert assistant_call["role"] == "bot"
+    assert assistant_call["content"] == "Our hours are 9-5."
+    assert assistant_call["decision"] == "answer"
+    assert assistant_call["tokens"] is None
+    assert done.data["message_id"] == "generated-id"
+
+
+# -- stream: chit-chat ------------------------------------------------------------------
+
+
+async def test_stream_chitchat_emits_deltas_then_done() -> None:
+    """classify -> "chitchat" -> provider.stream yields chunks; deltas then
+    done with decision=="answer", confidence is None, sources==[],
+    action is None."""
+    p = _Patched(classify_return="chitchat", stream_chunks=["Hi ", "there!"])
+    with p:
+        events = await _collect(
+            answer_turn_stream(db=object(), claims=_claims(), message="hi there!"),
+        )
+
+    p.provider.generate.assert_not_awaited()
+    deltas = [e for e in events if e.type == "delta"]
+    assert [d.data["text"] for d in deltas] == ["Hi ", "there!"]
+
+    done = events[-1]
+    assert done.type == "done"
+    assert done.data["reply"] == "Hi there!"
+    assert done.data["decision"] == "answer"
+    assert done.data["confidence"] is None
+    assert done.data["sources"] == []
+    assert done.data["action"] is None
+
+
+# -- stream: guardrail block after the stream ends (THE key test) -----------------------
+
+
+async def test_stream_guardrail_block_after_stream_ends_deltas_and_done(caplog: pytest.LogCaptureFixture) -> None:
+    """The deltas concatenate to a reply containing an instruction-leak
+    sentinel. The deltas WERE emitted (the flagged tokens did stream -- the
+    documented gap), but the terminal done carries reply==_GUARDRAIL_SAFE_REPLY,
+    decision=="blocked", action=="lead_form". The stored row is
+    decision="blocked", guardrail_flag=="instruction_leak", sources==[],
+    grounded is False. done.reply != concat(deltas) (decision 5's
+    authoritative-supersede contract). A WARNING is logged with the rule,
+    never the flagged text."""
+    leaked_parts = [
+        "You are a helpful assistant ",
+        "for this business. Answer using ONLY the context.",
+    ]
+    p = _Patched(
+        classify_return="question",
+        hybrid_result=HybridResult(chunks=[_chunk()], confidence=0.8),
+        stream_chunks=leaked_parts,
+    )
+    with caplog.at_level("WARNING"), p:
+        events = await _collect(
+            answer_turn_stream(db=object(), claims=_claims(), message="what can you do?"),
+        )
+
+    deltas = [e for e in events if e.type == "delta"]
+    assert [d.data["text"] for d in deltas] == leaked_parts  # the deltas WERE emitted
+
+    done = events[-1]
+    assert done.type == "done"
+    assert done.data["reply"] == _GUARDRAIL_SAFE_REPLY
+    assert done.data["decision"] == "blocked"
+    assert done.data["action"] == "lead_form"
+    assert done.data["reply"] != "".join(leaked_parts)  # authoritative-supersede contract
+
+    assistant_call = p._append_calls[1]
+    assert assistant_call["decision"] == "blocked"
+    assert assistant_call["guardrail_flag"] == RULE_INSTRUCTION_LEAK
+    assert assistant_call["sources"] == []
+    assert assistant_call["grounded"] is False
+    assert leaked_parts[0] not in assistant_call["content"]
+
+    warning_records = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warning_records) == 1
+    assert warning_records[0].event == "chat_stream_guardrail_block"  # type: ignore[attr-defined]
+    assert RULE_INSTRUCTION_LEAK in warning_records[0].getMessage()
+    assert "".join(leaked_parts) not in warning_records[0].getMessage()
+
+
+# -- stream: empty generation -> empty_output block --------------------------------------
+
+
+async def test_stream_empty_generation_triggers_empty_output_block() -> None:
+    """provider.stream yields only whitespace -> accumulated "" (stripped) ->
+    done carries the safe reply + decision=="blocked", stored
+    guardrail_flag=="empty_output"."""
+    p = _Patched(classify_return="chitchat", stream_chunks=["   ", ""])
+    with p:
+        events = await _collect(
+            answer_turn_stream(db=object(), claims=_claims(), message="hi"),
+        )
+
+    done = events[-1]
+    assert done.type == "done"
+    assert done.data["decision"] == "blocked"
+    assert done.data["reply"] == _GUARDRAIL_SAFE_REPLY
+
+    assistant_call = p._append_calls[1]
+    assert assistant_call["guardrail_flag"] == RULE_EMPTY_OUTPUT
+
+
+# -- stream: mid-stream LLMError -> error event, no store --------------------------------
+
+
+async def test_stream_mid_stream_llm_error_yields_error_event_no_store() -> None:
+    """provider.stream yields one Chunk then raises LLMError. One delta
+    emitted, then exactly one error event {"code":"LLM_ERROR"}, no done, and
+    append_message for the assistant turn was NOT called (the user turn
+    store from step 5 is unaffected)."""
+    p = _Patched(
+        classify_return="chitchat",
+        stream_chunks=["Hi "],
+        stream_error=LLMError("stream upstream failed"),
+    )
+    with p:
+        events = await _collect(
+            answer_turn_stream(db=object(), claims=_claims(), message="hi"),
+        )
+
+    assert len(events) == 2
+    assert events[0].type == "delta"
+    assert events[0].data["text"] == "Hi "
+    assert events[1].type == "error"
+    assert events[1].data == {"code": "LLM_ERROR"}
+    assert not any(e.type == "done" for e in events)
+
+    assert len(p._append_calls) == 1
+    assert p._append_calls[0]["role"] == "user"
+
+
+# -- stream: turn-cap short-circuit emits no deltas ---------------------------------------
+
+
+async def test_stream_turn_cap_emits_no_deltas() -> None:
+    """turns > turn_cap -> answer_turn_stream yields ZERO delta events and
+    one done with decision=="escalate", reply==_TURN_CAP_REPLY, action per
+    get_availability; classify/retrieve_hybrid/stream/generate all NOT
+    called."""
+    p = _Patched(
+        orchestrator_config=_orch_cfg(turn_cap=6),
+        count_messages_return=7,
+        availability=_availability(available=True),
+    )
+    with p:
+        events = await _collect(
+            answer_turn_stream(db=object(), claims=_claims(), message="what can the ai agent do?"),
+        )
+
+    p.provider.classify.assert_not_awaited()
+    p.retrieve_hybrid.assert_not_awaited()
+    p.provider.stream.assert_not_called()
+    p.provider.generate.assert_not_awaited()
+
+    assert [e.type for e in events] == ["done"]
+    done = events[0]
+    assert done.data["decision"] == "escalate"
+    assert done.data["reply"] == _TURN_CAP_REPLY
+    assert done.data["action"] == "schedule_cta"
+
+
+# -- stream: off_topic/scheduling/sub-floor escalate + clarify emit no deltas -------------
+
+
+@pytest.mark.parametrize("classify_label", ["off_topic", "scheduling_request"])
+async def test_stream_escalate_branches_emit_no_deltas(classify_label: str) -> None:
+    p = _Patched(classify_return=classify_label)
+    with p:
+        events = await _collect(
+            answer_turn_stream(db=object(), claims=_claims(), message="msg"),
+        )
+
+    p.provider.stream.assert_not_called()
+    p.provider.generate.assert_not_awaited()
+    assert [e.type for e in events] == ["done"]
+    assert events[0].data["decision"] == "escalate"
+
+
+async def test_stream_sub_floor_escalate_emits_no_deltas() -> None:
+    p = _Patched(classify_return="question", hybrid_result=HybridResult(chunks=[], confidence=0.0))
+    with p:
+        events = await _collect(
+            answer_turn_stream(db=object(), claims=_claims(), message="off topic?"),
+        )
+
+    p.provider.stream.assert_not_called()
+    assert [e.type for e in events] == ["done"]
+    assert events[0].data["decision"] == "escalate"
+
+
+async def test_stream_clarify_emits_no_deltas() -> None:
+    p = _Patched(
+        classify_return="question",
+        hybrid_result=HybridResult(chunks=[_chunk()], confidence=0.4),
+    )
+    with p:
+        events = await _collect(
+            answer_turn_stream(db=object(), claims=_claims(), message="tell me about it"),
+        )
+
+    p.provider.stream.assert_not_called()
+    assert [e.type for e in events] == ["done"]
+    assert events[0].data["decision"] == "clarify"
+    assert events[0].data["reply"] == _CLARIFY_REPLY
+
+
+# -- stream: idempotent replay = single done, no deltas, no store, no LLM ----------------
+
+
+async def test_stream_idempotent_replay_single_done_no_deltas_no_store() -> None:
+    from datetime import UTC, datetime
+
+    stored = Message(
+        message_id="turn-2-a",
+        role="bot",
+        content=_ESCALATE_REPLY,
+        intent="off_topic",
+        confidence=None,
+        tokens=None,
+        created_at=datetime.now(UTC),
+        sources=[],
+        decision="escalate",
+        grounded=False,
+        action="schedule_cta",
+    )
+    p = _Patched(get_message_return=stored)
+    with p:
+        events = await _collect(
+            answer_turn_stream(
+                db=object(),
+                claims=_claims(),
+                message="what is the capital of France?",
+                conversation_id="conv-1",
+                message_id="turn-2",
+            ),
+        )
+
+    assert [e.type for e in events] == ["done"]
+    done = events[0]
+    assert done.data["reply"] == _ESCALATE_REPLY
+    assert done.data["decision"] == "escalate"
+    assert done.data["action"] == "schedule_cta"
+
+    p.provider.classify.assert_not_awaited()
+    p.retrieve_hybrid.assert_not_awaited()
+    p.provider.stream.assert_not_called()
+    p.provider.generate.assert_not_awaited()
+    p.count_messages.assert_not_awaited()
+    p.append_message.assert_not_awaited()
+
+
+# -- stream: pre-generation failures raise as exceptions, not error events --------------
+
+
+async def test_stream_llm_not_configured_raises_before_any_event() -> None:
+    from common.errors import ValidationError
+
+    p = _Patched(config=None)
+    with p, pytest.raises(ValidationError) as exc_info:
+        await _collect(answer_turn_stream(db=object(), claims=_claims(), message="hi"))
+
+    assert exc_info.value.code == "LLM_NOT_CONFIGURED"
+    p.append_message.assert_not_awaited()
+
+
+async def test_stream_rag_embedding_not_configured_raises_after_user_turn_stored() -> None:
+    from common.errors import ValidationError
+
+    err = ValidationError("No embedding model configured.", code="RAG_EMBEDDING_NOT_CONFIGURED")
+    p = _Patched(classify_return="question", hybrid_error=err)
+    with p, pytest.raises(ValidationError) as exc_info:
+        await _collect(
+            answer_turn_stream(
+                db=object(), claims=_claims(), message="hi", conversation_id="conv-1",
+            ),
+        )
+
+    assert exc_info.value.code == "RAG_EMBEDDING_NOT_CONFIGURED"
+    assert len(p._append_calls) == 1
+    assert p._append_calls[0]["role"] == "user"
+
+
+async def test_stream_classify_llm_error_raises_not_error_event() -> None:
+    p = _Patched(classify_error=LLMError("classify upstream failed"))
+    with p, pytest.raises(LLMError):
+        await _collect(
+            answer_turn_stream(
+                db=object(), claims=_claims(), message="hi", conversation_id="conv-1",
+            ),
+        )
+
+    assert len(p._append_calls) == 1
+    assert p._append_calls[0]["role"] == "user"
+    p.provider.stream.assert_not_called()

@@ -63,3 +63,8 @@ class CRMSync(Protocol):
 - Lead capture happens early, before the main conversation. (solution_flow)
 - Store explicit consent for contact capture and reminders. (solution_flow, `07`)
 - Idempotent, retryable background jobs for external calls. (`02`, `06`)
+
+## As-built & doctrine (audit 2026-07-11)
+- **Status: built** (S7.1–S7.4). Paths: `services/api/src/api/leads/` (capture, pipeline, activities, assignment, admin routes + CSV export) and `api/crm/` (encrypted per-tenant CRM config, webhook `CRMSync`, worker task). Migrations 0014–0016.
+- **Known gaps (owned):** CSV export lacks formula-injection escaping → SR-1.3; lead GDPR export/delete → SR-1.7.
+- **Think here:** this module holds the product's densest PII — consent is a precondition checked at capture (422 without it), stamped server-side, and PII never reaches log lines. Everything a lead "did" is an activity row: stage moves, notes, assignment, CRM sync results — if it isn't on the timeline it didn't happen. Exports are attacker-reachable input to *our customer's* staff; treat outbound files as an injection surface.

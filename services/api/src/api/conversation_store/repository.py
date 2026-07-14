@@ -49,6 +49,21 @@ class Message:
     decision: str | None = None
     grounded: bool | None = None
     guardrail_flag: str | None = None
+    action: str | None = None
+
+
+@dataclass(frozen=True)
+class ConversationSummaryRow:
+    """A single row in the ``GET /admin/conversations`` list (S12.4)."""
+
+    conversation_id: str
+    status: str
+    channel: str
+    visitor_id: str | None
+    started_at: datetime
+    ended_at: datetime | None
+    message_count: int
+    summary: str | None
 
 
 def _reject_global(claims: AuthClaims) -> None:
@@ -140,6 +155,7 @@ async def append_message(
     decision: str | None = None,
     grounded: bool | None = None,
     guardrail_flag: str | None = None,
+    action: str | None = None,
 ) -> str:
     """Append a message to a conversation (idempotent by ``message_id``).
 
@@ -148,7 +164,9 @@ async def append_message(
     the list of cited chunks for an assistant turn. ``decision``/``grounded``
     (S10.2) tag the 3-way decision + whether the reply was grounded in
     retrieved context. ``guardrail_flag`` (S10.3) tags the violated output-
-    guardrail rule name on a blocked turn, ``NULL`` on a clean one. Existing
+    guardrail rule name on a blocked turn, ``NULL`` on a clean one. ``action``
+    (S10.4) tags the CTA signal (``"schedule_cta"``/``"lead_form"``/``NULL``)
+    as a stored fact, so idempotent replay returns it verbatim. Existing
     callers that omit any of these bind ``NULL``, unchanged.
     """
     _reject_global(claims)
@@ -159,8 +177,9 @@ async def append_message(
     await db.execute(
         "INSERT INTO messages "
         "(message_id, tenant_id, conversation_id, role, content, "
-        " intent, confidence, tokens, sources, decision, grounded, guardrail_flag) "
-        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) "
+        " intent, confidence, tokens, sources, decision, grounded, "
+        " guardrail_flag, action) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) "
         "ON CONFLICT (tenant_id, conversation_id, message_id) DO NOTHING",
         message_id,
         claims.tenant_id,
@@ -174,6 +193,7 @@ async def append_message(
         decision,
         grounded,
         guardrail_flag,
+        action,
     )
     return message_id
 
@@ -208,7 +228,8 @@ async def get_message(
     # ruff: noqa: S608
     sql = (
         "SELECT message_id, role, content, intent, confidence, tokens, "
-        "created_at, sources, decision, grounded, guardrail_flag FROM messages "
+        "created_at, sources, decision, grounded, guardrail_flag, action "
+        "FROM messages "
         "WHERE tenant_id = $1 AND conversation_id = $2 AND message_id = $3" + extra
     )
     row = await db.fetchrow(sql, *params)
@@ -227,7 +248,53 @@ async def get_message(
         decision=row.get("decision"),
         grounded=row.get("grounded"),
         guardrail_flag=row.get("guardrail_flag"),
+        action=row.get("action"),
     )
+
+
+async def count_messages(
+    db: Database,
+    claims: AuthClaims,
+    conversation_id: str,
+    *,
+    role: str | None = None,
+) -> int:
+    """Count messages in a conversation, tenant- (+ VISITOR-) scoped (S10.4).
+
+    Used by the orchestrator's turn-cap check --
+    ``count_messages(db, claims, conversation_id, role="user")`` counts this
+    conversation's visitor turns. ``messages`` carries no ``visitor_id``
+    column of its own (migration 0007); VISITOR callers are scoped via the
+    same ``EXISTS (SELECT 1 FROM conversations ...)`` join
+    ``get_message``/``get_messages``/``get_window`` use -- NOT the older,
+    broken ``_scope_filter`` bare-column pattern (that raises
+    ``asyncpg.UndefinedColumnError`` against ``messages``). Parameterized,
+    positional placeholders, built in order (never a hardcoded index).
+    Raises ``ValidationError`` for global (PLATFORM_ADMIN) callers.
+    """
+    _reject_global(claims)
+
+    params: list[Any] = [claims.tenant_id, conversation_id]
+    where = "WHERE tenant_id = $1 AND conversation_id = $2"
+
+    if role is not None:
+        params.append(role)
+        where += f" AND role = ${len(params)}"
+
+    if claims.role == Role.VISITOR:
+        params.append(claims.subject)
+        where += (
+            " AND EXISTS (SELECT 1 FROM conversations c "
+            "WHERE c.conversation_id = messages.conversation_id "
+            "AND c.tenant_id = messages.tenant_id "
+            f"AND c.visitor_id = ${len(params)})"
+        )
+
+    # Parameterized SQL; `where` is a safe constant clause built above.
+    # ruff: noqa: S608
+    sql = "SELECT count(*) AS count FROM messages " + where
+    row = await db.fetchrow(sql, *params)
+    return int(row["count"]) if row is not None else 0
 
 
 async def get_conversation(
@@ -311,6 +378,96 @@ async def get_messages(
         )
         for r in rows
     ]
+
+
+async def list_conversations(
+    db: Database,
+    claims: AuthClaims,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    started_from: datetime | None = None,
+    started_to: datetime | None = None,
+    status: str | None = None,
+    channel: str | None = None,
+    escalated: bool | None = None,
+) -> tuple[list[ConversationSummaryRow], int]:
+    """Fetch a paginated, filtered page of the caller's tenant conversations.
+
+    Tenant-scoped (``WHERE c.tenant_id = $1``); each supplied filter appends
+    exactly one positional clause, values always bound (never interpolated).
+    ``escalated`` toggles a fixed constant ``EXISTS``/``NOT EXISTS``
+    sub-select on ``messages`` (bot turn with ``decision='escalate'``) in
+    Python -- the sub-select text itself carries no bound values.
+    VISITOR scoping is not relevant here -- this is an admin/agent-only
+    surface reached via ``require_roles(CLIENT_ADMIN, CLIENT_AGENT)``, which
+    excludes VISITOR; ``_reject_global`` excludes PLATFORM_ADMIN.
+
+    Returns ``(rows, total)`` -- ``total`` is a ``count(*)`` over the same
+    filtered WHERE (minus LIMIT/OFFSET), newest first
+    (``ORDER BY c.started_at DESC, c.conversation_id DESC``).
+    """
+    _reject_global(claims)
+
+    where = "WHERE c.tenant_id = $1"
+    params: list[Any] = [claims.tenant_id]
+
+    if started_from is not None:
+        params.append(started_from)
+        where += f" AND c.started_at >= ${len(params)}"
+    if started_to is not None:
+        params.append(started_to)
+        where += f" AND c.started_at < ${len(params)}"
+    if status is not None:
+        params.append(status)
+        where += f" AND c.status = ${len(params)}"
+    if channel is not None:
+        params.append(channel)
+        where += f" AND c.channel = ${len(params)}"
+
+    _escalate_sub = (
+        "SELECT 1 FROM messages m WHERE m.tenant_id = c.tenant_id "
+        "AND m.conversation_id = c.conversation_id "
+        "AND m.role = 'bot' AND m.decision = 'escalate'"
+    )
+    if escalated is True:
+        where += f" AND EXISTS ({_escalate_sub})"
+    elif escalated is False:
+        where += f" AND NOT EXISTS ({_escalate_sub})"
+
+    # Parameterized SQL; `where` is a safe constant clause built above --
+    # filter values are always bound, never interpolated.
+    # ruff: noqa: S608
+    count_row = await db.fetchrow(
+        "SELECT count(*) AS count FROM conversations c " + where, *params,
+    )
+    total = int(count_row["count"]) if count_row is not None else 0
+
+    clamped_limit = max(1, min(limit, 200))
+    page_params = [*params, clamped_limit, max(0, offset)]
+    rows = await db.fetch(
+        "SELECT c.conversation_id, c.status, c.channel, c.visitor_id, "
+        "c.started_at, c.ended_at, c.summary, "
+        "(SELECT count(*) FROM messages m WHERE m.tenant_id = c.tenant_id "
+        "AND m.conversation_id = c.conversation_id) AS message_count "
+        "FROM conversations c " + where + " "
+        f"ORDER BY c.started_at DESC, c.conversation_id DESC "
+        f"LIMIT ${len(page_params) - 1} OFFSET ${len(page_params)}",
+        *page_params,
+    )
+    return [
+        ConversationSummaryRow(
+            conversation_id=str(r["conversation_id"]),
+            status=str(r["status"]),
+            channel=str(r["channel"]),
+            visitor_id=r["visitor_id"],
+            started_at=r["started_at"],
+            ended_at=r["ended_at"],
+            message_count=int(r["message_count"]),
+            summary=r["summary"],
+        )
+        for r in rows
+    ], total
 
 
 def _estimate_tokens(content: str) -> int:

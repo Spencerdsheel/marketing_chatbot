@@ -11,8 +11,20 @@ This task implements S5.2 decision 6 (preserved) and S5.3 decisions 3, 5, 6:
      + doc ``failed``. Do NOT raise; do NOT retry — the file will never parse.
   8. On ``EMBEDDING_NOT_CONFIGURED`` / ``EMBEDDING_DIM_MISMATCH`` (deterministic) →
      run ``failed`` + doc ``failed``. Do NOT raise; do NOT retry.
-  9. On transient infra error (storage/DB, or ``LLMError`` from embed) → let it
-     propagate so Celery retries with backoff (S5.1 ``acks_late``). Never swallow.
+  9. On transient infra error (storage/DB) → let it propagate so Celery
+     retries via worker-crash redelivery (``task_acks_late`` /
+     ``task_reject_on_worker_lost``, S5.1). Never swallow.
+
+S12.6 (embed failure handling -- see dev_plan/HANDOFF_embedding_batch_timeout_fix.md §7):
+  ``LLMError`` from the embed step (Step 8) is auto-retried by Celery
+  (``autoretry_for=(LLMError,)`` on the task decorator, bounded, with
+  backoff+jitter). Once retries are exhausted, the final ``LLMError`` is
+  caught in ``_execute`` and marks the run/doc ``failed`` (mirroring the
+  ``EMBEDDING_DIM_MISMATCH`` handling immediately below it) instead of
+  leaving ``ingestion_runs.status`` stuck at ``running`` forever. Step 10's
+  chunk replace (DELETE + INSERT, deterministic chunk_ids) is idempotent, so
+  a retried run re-running the full parse/chunk/embed pipeline from the top
+  is safe.
 
 Worker tenant context (decision 1):
   The upload route passes ``tenant_id`` — which came from the admin JWT — as an
@@ -48,6 +60,7 @@ from api.ingestion.parsers import parse
 from api.ingestion.storage import StorageProvider, get_storage
 from api.llm.config_repository import get_llm_config
 from api.llm.factory import provider_for
+from api.llm.provider import LLMError
 from api.tasks.celery_app import _CorrelationTask, celery_app
 
 _log = get_logger(__name__)
@@ -57,6 +70,15 @@ _log = get_logger(__name__)
     bind=True,
     name="ingestion.ingest_document",
     base=_CorrelationTask,
+    # S12.6: embedding failures are retry-worthy (distinct from generation,
+    # which is "transient only" -- see handoff doc §6b's handbook §18
+    # cross-check). max_retries=3 matches the existing _CorrelationTask base
+    # convention (api/tasks/celery_app.py) -- no other task in this codebase
+    # overrides it, so this keeps the same bound explicit on this task too.
+    autoretry_for=(LLMError,),
+    retry_backoff=True,
+    retry_jitter=True,
+    max_retries=3,
 )
 def ingest_document(
     self: _CorrelationTask,
@@ -272,9 +294,43 @@ async def _execute(
         )
         return {"doc_id": doc_id, "run_id": run_id, "status": "succeeded"}
 
-    # Step 8 — embed chunks.  LLMError propagates (transient/retryable).
+    # Step 8 — embed chunks. LLMError is auto-retried by Celery (bounded,
+    # backoff+jitter via autoretry_for on the task decorator); once retries
+    # are exhausted, the final LLMError is caught below and marks the run
+    # failed instead of leaving it stuck at "running" (S12.6 fix).
     llm_provider = provider_for(config)
-    vectors = await llm_provider.embed(chunks, model=config.embedding_model)
+    try:
+        vectors = await llm_provider.embed(chunks, model=config.embedding_model)
+    except LLMError as exc:
+        if task.request.retries < task.max_retries:
+            # Retries remain -- propagate so Celery's autoretry_for schedules
+            # the next attempt with backoff+jitter.
+            raise
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        error_entry = {
+            "code": "EMBEDDING_FAILED",
+            "message": str(exc),
+        }
+        await repo.update_run(
+            db,
+            claims,
+            run_id,
+            status="failed",
+            errors=error_entry,
+            duration_ms=duration_ms,
+        )
+        await repo.update_doc_status(db, claims, doc_id, "failed")
+        _log.warning(
+            "ingest_document embedding failed (retries exhausted)",
+            extra={
+                "task": "ingestion.ingest_document",
+                "event": "task_embedding_failed",
+                "doc_id": doc_id,
+                "run_id": run_id,
+                "retries": task.request.retries,
+            },
+        )
+        return {"doc_id": doc_id, "run_id": run_id, "status": "failed"}
 
     # Step 9 — validate every vector dimension.
     for i, vec in enumerate(vectors):

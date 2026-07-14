@@ -131,3 +131,8 @@ async def invalidate(pattern: str): ...   # used on mutations only
 - Protocol defines the interface; implementations swap via env. (`02`, ADR-002)
 - Fail fast on missing config; JSON logs from day one; correlation IDs everywhere. (`02`, `03`, `08`)
 - Encrypt secrets at rest; never roll your own crypto. (`07`, ADR-009)
+
+## As-built & doctrine (audit 2026-07-11)
+- **Status: built and stable** since P0–P2; every later module consumes it. Path: `services/common/src/common/`.
+- **Entry points:** `auth.AuthClaims/Role` · `tenancy.tenant_filter/assert_tenant_access/require_role/resolve_write_tenant_id` · `errors.*` · `settings.Settings` (extended by `api.config.ApiSettings`) · `crypto.SecretBox/hash_password/verify_password` · `cache.build_cache/cache_key` · `db.Database` (`statement_cache_size=0` behind PgBouncer) · `pgvector.similarity_search/register_vector_init` · `health.*` · `logging.get_logger/log_context` (extras must be in `_ALLOWED_EXTRA`).
+- **Think here:** a change to this package is a platform-wide contract change — only with an explicit sprint instruction, and its full test suite runs too. Keep modules import-pure: nothing here may touch env/DB/network at import time. If a repository needs a tenancy shape these helpers don't offer, extend the helper (once, tested) — never hand-roll a filter at the call site.

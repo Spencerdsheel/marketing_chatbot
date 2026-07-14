@@ -192,6 +192,30 @@ chatbot/
 
 ---
 
+## 5b. As-built reality (audit 2026-07-11 — trust this over §5's intended layout)
+
+The core landed as planned — a modular monolith in `services/api` — but module paths differ from the
+intended sketch. **Agents navigate by this table, not §5:**
+
+| Module | Actual path (`services/api/src/api/…`) |
+|--------|-----------------------------------------|
+| gateway/edge | `gateway/` + `edge.py` + `ratelimit.py` |
+| auth + RBAC | `auth/`, `rbac/` |
+| orchestrator | `orchestrator/` |
+| conversation store | `conversation_store/` |
+| RAG / LLM | `rag/`, `llm/` |
+| leads + CRM sync | `leads/`, `crm/` |
+| scheduling | `scheduling/` |
+| ingestion (worker module) | `ingestion/` |
+| notifications (worker module) | `notifications/` |
+| observability + audit | `observability/`, `audit/` |
+| tenants / seed / Celery plumbing | `tenants/`, `seed.py`, `tasks/` |
+
+Ingestion and notifications are **process-level** carve-outs (same package, separate Celery
+worker/beat processes; named queues arrive with SR-1.5) — not separate packages yet. Progress,
+statuses, and the audit's findings live in `dev_plan/DEVELOPMENT_PLAN.md` §3b/§7 and
+`dev_plan/PRODUCT_AUDIT_2026-07-11.md`.
+
 ## 6. How to work
 
 1. **Before building or modifying a service, load its skill** via the Skill tool
@@ -201,6 +225,53 @@ chatbot/
 4. Keep module seams strict — cross-module access goes through repositories/contracts, never reaching into
    another module's internals or tables directly.
 5. Process work first, then implementation: brainstorm/plan, then TDD where applicable.
+
+### 6b. Operating doctrine — how every agent here thinks, plans, and decides
+
+This is the reasoning contract, added 2026-07-11. The standards in §3 say *what* must be true;
+this section says *how to work so it becomes true*. It applies to planner, implementer, and
+reviewer alike.
+
+**Thinking**
+- **Evidence before belief.** Never assert what a file, column, endpoint, or test does — open it.
+  Never claim work is done — run the verification and read the real output. A confident guess that
+  happens to be right is still a process failure, because the next one won't be.
+- **Reality outranks documentation.** When spec, plan, or skill disagrees with the code, the code is
+  the fact and the doc is the bug: work against reality, then fix (or flag) the doc in the same
+  breath. Stale docs are defects with a blast radius, not clutter.
+- **Find the load-bearing constraint first.** Before designing anything, name the one or two things
+  that must not break (here, almost always: tenant isolation, no-silent-fallback, cost of the LLM
+  path). Evaluate every option against those first; most alternatives die there, cheaply.
+- **Distrust green that you didn't understand.** A passing suite after a change you can't explain is
+  a red flag (see the stub-DB column-drift lesson). Know *why* it passed.
+
+**Planning**
+- **Plan in thin, independently verifiable slices** — each with a concrete observable outcome (a
+  Postman/curl recipe, a live SQL check), sized so review can actually hold it in one head. If a
+  slice can't be demonstrated on the running system, it isn't a slice; split or re-shape it.
+- **Sequence by dependency and by risk, not by interest.** Do the enabling/most-uncertain piece
+  first; never build on an unreviewed layer. When an audit or incident lands, remediation outranks
+  the next feature (SR-1 before S10.2 is the standing example).
+- **Decide once, write it down, cite it.** Design choices become numbered decisions (sprint-spec
+  decisions, D1–D11) with the *why* attached. Later work cites them instead of re-arguing them;
+  overturning one requires new evidence, stated explicitly.
+- **Plan for the failure path as a first-class feature.** Every slice states what happens when its
+  dependency is down or its input is hostile — *where* it fails (before vs after durable writes)
+  and *how loudly* — before it states the happy path.
+
+**Deciding**
+- **Default to the smallest change that fully solves the problem.** No opportunistic refactors, no
+  speculative generality. But "fully" is load-bearing: a fix that leaves the class of bug alive
+  (fixing one call site of an import-time landmine) is not smaller, it's incomplete.
+- **Bias to reversible; escalate the irreversible.** Choose options that can be undone by config or
+  a small diff. Genuinely one-way doors — schema semantics, public API contracts, secrets handling,
+  anything touching tenant isolation — get surfaced to the user with a recommendation, not decided
+  silently. Everything else: decide, note it, move.
+- **When uncertain, instrument instead of arguing.** Prefer the option that produces evidence
+  (a metric, a trace, a live check) over the option that produces debate. Revisit with data.
+- **Report outcomes, not effort.** Lead with what is true now (works/fails/unknown), show the real
+  output, list deviations unprompted. A skipped step stated plainly beats a completed step implied
+  falsely — the reviewer's trust is the product's actual foundation.
 
 ### Skill index
 

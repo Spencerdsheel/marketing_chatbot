@@ -64,3 +64,7 @@ script loads with public client key
 - Server-first: keep logic/secrets server-side, widget is presentation + interaction. (`01`, `04`)
 - Self-contained bundle / Web Component, CSS isolation via Shadow DOM, anonymous visitor ID, a11y,
   TTS greeting. (solution_flow)
+
+## As-built & doctrine (audit 2026-07-11)
+- **Status: NOT BUILT** — Phase 14 (S14.1–S14.6); `apps/` does not exist yet. The backend it talks to is live: `POST /widget/session` (admission) and `POST /public/chat/message` (turns; metering arrives in SR-1.2 — build the widget's 429/`Retry-After` and `TURN_BUDGET_EXCEEDED` UX against it from day one).
+- **Think here when it starts:** the widget runs on *someone else's* page — Shadow DOM isolation, zero globals, zero third-party leakage, and it must fail invisible (a broken bot never breaks the host site). The client key is public by design; the session token is the only credential and lives in memory, not storage. Accessibility and the TTS greeting are launch features, not polish (S14.5).

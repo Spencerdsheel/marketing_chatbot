@@ -65,3 +65,8 @@ def provider_for(claims: AuthClaims, settings) -> LLMProvider:
 - Model-agnostic abstraction layer for the LLM. (solution_flow)
 - When building with Claude, use current model IDs (e.g. Opus 4.8 `claude-opus-4-8`, Haiku 4.5
   `claude-haiku-4-5`); verify via the claude-api reference rather than memory.
+
+## As-built & doctrine (audit 2026-07-11)
+- **Status: built** (S3.1–S3.5b). Path: `services/api/src/api/llm/` — `provider.py` (Protocol: generate/classify/stream/embed), `anthropic_provider`, `openai_provider` (any `base_url` — OpenCode Zen/Ollama/real OpenAI), `azure_provider`, `metered_provider` (token/cost capture), `factory.provider_for`, `config_repository` (per-tenant provider+model+key, key encrypted via `SecretBox`).
+- **As-built facts:** no default provider — an unconfigured tenant is a deterministic `LLM_NOT_CONFIGURED`, never a fallback. Anthropic gets no `temperature` (rejects it) and has no embeddings API (`embed` raises — no fake vectors). Upstream errors are logged server-side with status/detail (never the key), surfaced as generic `LLMError`.
+- **Think here:** every LLM call is tenant money — new call sites must be metered, bounded (`max_tokens`, timeout, bounded retries), and attributable (correlation id). A provider quirk is handled inside that provider's impl, never leaked into callers.

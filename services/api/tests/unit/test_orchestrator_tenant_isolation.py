@@ -8,19 +8,36 @@ retrieve_hybrid, and generate never reached.
 """
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from collections.abc import AsyncIterator
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from common.auth import AuthClaims, Role
 from common.errors import NotFoundError
 
 from api.llm.config_repository import LLMConfig
-from api.llm.provider import Completion
+from api.llm.provider import Chunk, Completion
 from api.orchestrator.config_repository import OrchestratorConfig
-from api.orchestrator.service import answer_turn
+from api.orchestrator.service import answer_turn, answer_turn_stream
 from api.rag.service import HybridMatch, HybridResult
 
 _TENANT_A = "tenant-a"
+
+
+def _stream_stub(chunks: list[str]) -> MagicMock:
+    """A ``provider.stream`` stand-in -- a plain (sync) callable returning a
+    fresh async generator per call, mirroring the real provider shape (NOT a
+    coroutine -- see test_orchestrator_service.py's identical stub)."""
+
+    def _side_effect(*args: Any, **kwargs: Any) -> AsyncIterator[Chunk]:
+        async def _gen() -> AsyncIterator[Chunk]:
+            for text in chunks:
+                yield Chunk(text=text)
+
+        return _gen()
+
+    return MagicMock(side_effect=_side_effect)
 
 
 def _claims_a(subject: str = "visitor-a") -> AuthClaims:
@@ -36,16 +53,19 @@ def _config() -> LLMConfig:
 
 async def test_every_downstream_call_carries_tenant_a_claims() -> None:
     """A visitor of tenant A drives a turn -- every downstream call receives
-    claims with tenant_id == tenant A, including get_orchestrator_config and
-    provider.classify (called with tenant A's own model)."""
+    claims with tenant_id == tenant A, including get_orchestrator_config,
+    count_messages, get_availability, and provider.classify (called with
+    tenant A's own model)."""
     get_llm_config = AsyncMock(return_value=_config())
     get_orchestrator_config = AsyncMock(
-        return_value=OrchestratorConfig(answer_threshold=0.5, escalate_threshold=0.35)
+        return_value=OrchestratorConfig(answer_threshold=0.5, escalate_threshold=0.35, turn_cap=6)
     )
     create_conversation = AsyncMock(return_value="conv-a")
     get_message = AsyncMock(return_value=None)
     append_message = AsyncMock(return_value="msg-1")
     get_working_memory = AsyncMock(return_value={"summary": None, "summary_message_count": 0, "messages": []})
+    count_messages = AsyncMock(return_value=1)
+    get_availability = AsyncMock(return_value=None)
     retrieve_hybrid = AsyncMock(
         return_value=HybridResult(
             chunks=[
@@ -58,7 +78,7 @@ async def test_every_downstream_call_carries_tenant_a_claims() -> None:
         )
     )
     provider = AsyncMock()
-    provider.classify = AsyncMock(return_value="question")
+    provider.classify = AsyncMock(return_value="off_topic")
     provider.generate = AsyncMock(
         return_value=Completion(text="answer", model="claude-opus-4-8", input_tokens=1, output_tokens=1)
     )
@@ -71,6 +91,8 @@ async def test_every_downstream_call_carries_tenant_a_claims() -> None:
         patch("api.orchestrator.service.get_message", get_message),
         patch("api.orchestrator.service.append_message", append_message),
         patch("api.orchestrator.service.get_working_memory", get_working_memory),
+        patch("api.orchestrator.service.count_messages", count_messages),
+        patch("api.orchestrator.service.get_availability", get_availability),
         patch("api.orchestrator.service.retrieve_hybrid", retrieve_hybrid),
         patch("api.orchestrator.service.provider_for", provider_for),
     ):
@@ -82,6 +104,8 @@ async def test_every_downstream_call_carries_tenant_a_claims() -> None:
         create_conversation,
         append_message,
         get_working_memory,
+        count_messages,
+        get_availability,
         retrieve_hybrid,
     ):
         for call in mock.await_args_list:
@@ -92,6 +116,8 @@ async def test_every_downstream_call_carries_tenant_a_claims() -> None:
 
     provider.classify.assert_awaited_once()
     assert provider.classify.await_args.kwargs["model"] == "claude-opus-4-8"
+    count_messages.assert_awaited_once()
+    get_availability.assert_awaited_once()
 
 
 async def test_guardrail_block_still_carries_tenant_a_claims_scan_output_tenant_agnostic() -> None:
@@ -100,12 +126,14 @@ async def test_guardrail_block_still_carries_tenant_a_claims_scan_output_tenant_
     ONLY the reply text -- never claims/tenant data (MANDATORY assertion)."""
     get_llm_config = AsyncMock(return_value=_config())
     get_orchestrator_config = AsyncMock(
-        return_value=OrchestratorConfig(answer_threshold=0.5, escalate_threshold=0.35)
+        return_value=OrchestratorConfig(answer_threshold=0.5, escalate_threshold=0.35, turn_cap=6)
     )
     create_conversation = AsyncMock(return_value="conv-a")
     get_message = AsyncMock(return_value=None)
     append_message = AsyncMock(return_value="msg-1")
     get_working_memory = AsyncMock(return_value={"summary": None, "summary_message_count": 0, "messages": []})
+    count_messages = AsyncMock(return_value=1)
+    get_availability = AsyncMock(return_value=None)
     retrieve_hybrid = AsyncMock(
         return_value=HybridResult(
             chunks=[
@@ -135,6 +163,8 @@ async def test_guardrail_block_still_carries_tenant_a_claims_scan_output_tenant_
         patch("api.orchestrator.service.get_message", get_message),
         patch("api.orchestrator.service.append_message", append_message),
         patch("api.orchestrator.service.get_working_memory", get_working_memory),
+        patch("api.orchestrator.service.count_messages", count_messages),
+        patch("api.orchestrator.service.get_availability", get_availability),
         patch("api.orchestrator.service.retrieve_hybrid", retrieve_hybrid),
         patch("api.orchestrator.service.provider_for", provider_for),
         patch("api.orchestrator.service.scan_output", wraps=real_scan_output) as spy_scan,
@@ -148,6 +178,9 @@ async def test_guardrail_block_still_carries_tenant_a_claims_scan_output_tenant_
     assert claims_arg is not None
     assert claims_arg.tenant_id == _TENANT_A
     assert assistant_call.kwargs["guardrail_flag"] == "human_impersonation"
+
+    # blocked NEVER checks availability (S10.4 decision 4) -- MANDATORY.
+    get_availability.assert_not_awaited()
 
     # scan_output is tenant-agnostic: called with ONLY the reply text -- no
     # claims/tenant_id/visitor_id ever passed to it.
@@ -165,7 +198,7 @@ async def test_cross_tenant_conversation_id_invisible_404_no_classify_rag_or_gen
     retrieve_hybrid, and generate are never reached."""
     get_llm_config = AsyncMock(return_value=_config())
     get_orchestrator_config = AsyncMock(
-        return_value=OrchestratorConfig(answer_threshold=0.5, escalate_threshold=0.35)
+        return_value=OrchestratorConfig(answer_threshold=0.5, escalate_threshold=0.35, turn_cap=6)
     )
     create_conversation = AsyncMock(return_value="conv-a")
     get_message = AsyncMock(return_value=None)
@@ -173,6 +206,8 @@ async def test_cross_tenant_conversation_id_invisible_404_no_classify_rag_or_gen
         side_effect=NotFoundError("Conversation not found.", code="CONVERSATION_NOT_FOUND"),
     )
     get_working_memory = AsyncMock()
+    count_messages = AsyncMock()
+    get_availability = AsyncMock()
     retrieve_hybrid = AsyncMock()
     provider = AsyncMock()
     provider.classify = AsyncMock()
@@ -186,6 +221,8 @@ async def test_cross_tenant_conversation_id_invisible_404_no_classify_rag_or_gen
         patch("api.orchestrator.service.get_message", get_message),
         patch("api.orchestrator.service.append_message", append_message),
         patch("api.orchestrator.service.get_working_memory", get_working_memory),
+        patch("api.orchestrator.service.count_messages", count_messages),
+        patch("api.orchestrator.service.get_availability", get_availability),
         patch("api.orchestrator.service.retrieve_hybrid", retrieve_hybrid),
         patch("api.orchestrator.service.provider_for", provider_for),
     ):
@@ -200,3 +237,140 @@ async def test_cross_tenant_conversation_id_invisible_404_no_classify_rag_or_gen
     retrieve_hybrid.assert_not_awaited()
     provider.generate.assert_not_awaited()
     get_working_memory.assert_not_awaited()
+    count_messages.assert_not_awaited()
+    get_availability.assert_not_awaited()
+
+
+# =====================================================================================
+# S10.5: the STREAMING path carries the same tenant-A claims + isolation
+# =====================================================================================
+
+
+async def test_stream_every_downstream_call_carries_tenant_a_claims() -> None:
+    """The streaming path (answer_turn_stream) carries tenant-A claims into
+    every downstream call in _resolve_turn AND into the provider.stream
+    call for the generate branch."""
+    get_llm_config = AsyncMock(return_value=_config())
+    get_orchestrator_config = AsyncMock(
+        return_value=OrchestratorConfig(answer_threshold=0.5, escalate_threshold=0.35, turn_cap=6)
+    )
+    create_conversation = AsyncMock(return_value="conv-a")
+    get_message = AsyncMock(return_value=None)
+    append_message = AsyncMock(return_value="msg-1")
+    get_working_memory = AsyncMock(return_value={"summary": None, "summary_message_count": 0, "messages": []})
+    count_messages = AsyncMock(return_value=1)
+    get_availability = AsyncMock(return_value=None)
+    retrieve_hybrid = AsyncMock(
+        return_value=HybridResult(
+            chunks=[
+                HybridMatch(
+                    doc_id="d1", chunk_id="c1", content="text", score=0.9,
+                    rrf_score=0.5, matched_by=["vector"],
+                )
+            ],
+            confidence=0.9,
+        )
+    )
+    provider = AsyncMock()
+    provider.classify = AsyncMock(return_value="question")
+    provider.stream = _stream_stub(["The ", "answer."])
+    provider_for = lambda cfg: provider  # noqa: E731
+
+    with (
+        patch("api.orchestrator.service.get_llm_config", get_llm_config),
+        patch("api.orchestrator.service.get_orchestrator_config", get_orchestrator_config),
+        patch("api.orchestrator.service.create_conversation", create_conversation),
+        patch("api.orchestrator.service.get_message", get_message),
+        patch("api.orchestrator.service.append_message", append_message),
+        patch("api.orchestrator.service.get_working_memory", get_working_memory),
+        patch("api.orchestrator.service.count_messages", count_messages),
+        patch("api.orchestrator.service.get_availability", get_availability),
+        patch("api.orchestrator.service.retrieve_hybrid", retrieve_hybrid),
+        patch("api.orchestrator.service.provider_for", provider_for),
+    ):
+        events = [
+            event
+            async for event in answer_turn_stream(
+                db=object(), claims=_claims_a(), message="hello", message_id="turn-1",
+            )
+        ]
+
+    assert any(e.type == "delta" for e in events)
+    assert events[-1].type == "done"
+
+    for mock in (
+        get_llm_config,
+        get_orchestrator_config,
+        create_conversation,
+        append_message,
+        get_working_memory,
+        count_messages,
+        get_availability,
+        retrieve_hybrid,
+    ):
+        for call in mock.await_args_list:
+            claims_arg = call.args[1] if len(call.args) > 1 else call.kwargs.get("claims")
+            assert claims_arg is not None
+            assert claims_arg.tenant_id == _TENANT_A
+            assert claims_arg.role == Role.VISITOR
+
+    provider.classify.assert_awaited_once()
+    assert provider.classify.await_args.kwargs["model"] == "claude-opus-4-8"
+    provider.stream.assert_called_once()
+    assert provider.stream.call_args.kwargs["model"] == "claude-opus-4-8"
+    count_messages.assert_awaited_once()
+    get_availability.assert_not_awaited()  # answer branch never checks availability
+
+
+async def test_stream_cross_tenant_conversation_id_invisible_404_before_any_stream() -> None:
+    """A conversation_id belonging to another tenant/visitor is invisible ->
+    NotFoundError (404 CONVERSATION_NOT_FOUND) raised during _resolve_turn,
+    BEFORE any delta/stream/store; classify, retrieve_hybrid, and stream are
+    never reached."""
+    get_llm_config = AsyncMock(return_value=_config())
+    get_orchestrator_config = AsyncMock(
+        return_value=OrchestratorConfig(answer_threshold=0.5, escalate_threshold=0.35, turn_cap=6)
+    )
+    create_conversation = AsyncMock(return_value="conv-a")
+    get_message = AsyncMock(return_value=None)
+    append_message = AsyncMock(
+        side_effect=NotFoundError("Conversation not found.", code="CONVERSATION_NOT_FOUND"),
+    )
+    get_working_memory = AsyncMock()
+    count_messages = AsyncMock()
+    get_availability = AsyncMock()
+    retrieve_hybrid = AsyncMock()
+    provider = AsyncMock()
+    provider.classify = AsyncMock()
+    provider.stream = _stream_stub([])
+    provider_for = lambda cfg: provider  # noqa: E731
+
+    with (
+        patch("api.orchestrator.service.get_llm_config", get_llm_config),
+        patch("api.orchestrator.service.get_orchestrator_config", get_orchestrator_config),
+        patch("api.orchestrator.service.create_conversation", create_conversation),
+        patch("api.orchestrator.service.get_message", get_message),
+        patch("api.orchestrator.service.append_message", append_message),
+        patch("api.orchestrator.service.get_working_memory", get_working_memory),
+        patch("api.orchestrator.service.count_messages", count_messages),
+        patch("api.orchestrator.service.get_availability", get_availability),
+        patch("api.orchestrator.service.retrieve_hybrid", retrieve_hybrid),
+        patch("api.orchestrator.service.provider_for", provider_for),
+    ):
+        with pytest.raises(NotFoundError) as exc_info:
+            events = [
+                event
+                async for event in answer_turn_stream(
+                    db=object(), claims=_claims_a(), message="hello",
+                    conversation_id="conv-belongs-to-tenant-b",
+                )
+            ]
+            del events
+
+    assert exc_info.value.code == "CONVERSATION_NOT_FOUND"
+    provider.classify.assert_not_awaited()
+    retrieve_hybrid.assert_not_awaited()
+    provider.stream.assert_not_called()
+    get_working_memory.assert_not_awaited()
+    count_messages.assert_not_awaited()
+    get_availability.assert_not_awaited()

@@ -17,6 +17,8 @@ from common.crypto import hash_password
 from common.ratelimit import InMemoryRateLimiter, build_rate_limiter
 from httpx import ASGITransport, AsyncClient
 
+from api.admin.repository import _hash_client_key
+
 # -- Constants -----------------------------------------------------------------
 
 _TEST_JWT_SECRET = "x" * 48
@@ -52,10 +54,12 @@ class _StubDatabase:
 
     async def fetchrow(self, query: str, *args: object) -> dict[str, Any] | None:
         if args:
-            arg0 = str(args[0]).lower()
-            if arg0 == _CLIENT_KEY:
+            arg0 = str(args[0])
+            # S12.1: gateway lookups bind the SHA-256 hash of the client key,
+            # never the raw value.
+            if arg0 == _hash_client_key(_CLIENT_KEY):
                 return dict(_TENANT_ROW)
-            if arg0 == "admin@example.com":
+            if arg0.lower() == "admin@example.com":
                 return dict(_ACTIVE_USER_ROW)
         return None
 

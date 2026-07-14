@@ -7,15 +7,17 @@ session -- never the request body.
 """
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Literal
 
 from common.auth import AuthClaims
 from common.logging import get_logger
 from fastapi import APIRouter, Depends, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 
 from api.gateway.dependencies import get_visitor_claims
-from api.orchestrator.service import answer_turn
+from api.orchestrator.service import StreamEvent, answer_turn, answer_turn_stream
 
 _log = get_logger(__name__)
 
@@ -51,9 +53,11 @@ class ChatMessageResponse(BaseModel):
 
     ``intent``/``grounded``/``guardrail_flag`` are stored (analytics) but
     never surfaced here -- keep the public surface minimal; still leak-free
-    (never ``tenant_id``/``visitor_id``). ``action`` (S10.3) IS surfaced --
-    it tells the widget to render the consent-gated lead form on either
-    ``decision`` value that means "offer a human" (``escalate``/``blocked``).
+    (never ``tenant_id``/``visitor_id``). ``action`` (S10.3, widened S10.4)
+    IS surfaced -- it tells the widget whether to render the S8.1 scheduling
+    CTA (``"schedule_cta"``) or the S7.1 consent-gated lead form
+    (``"lead_form"``) on a ``decision`` that means "offer a human"
+    (``escalate``/``blocked``).
     """
 
     conversation_id: str
@@ -62,7 +66,7 @@ class ChatMessageResponse(BaseModel):
     decision: Literal["answer", "clarify", "escalate", "blocked"]
     confidence: float | None
     sources: list[ChatSource]
-    action: Literal["lead_form"] | None = None
+    action: Literal["lead_form", "schedule_cta"] | None = None
 
 
 @router.post("/message")
@@ -91,8 +95,8 @@ async def post_message(
     )
 
     # -- Log the event (PII-safe: never the message text, reply, or raw
-    # intent free text -- decision/intent/guardrail_flag are closed-set,
-    # non-PII labels) --------------------------------------------------------
+    # intent free text -- decision/intent/guardrail_flag/action are
+    # closed-set, non-PII labels) ---------------------------------------------
     _log.info(
         "chat turn",
         extra={
@@ -103,6 +107,7 @@ async def post_message(
             "decision": result.decision,
             "intent": result.intent,
             "guardrail_flag": result.guardrail_flag,
+            "action": result.action,
         },
     )
 
@@ -118,3 +123,109 @@ async def post_message(
         ],
         action=result.action,  # type: ignore[arg-type]
     )
+
+
+@router.post("/message/stream")
+async def post_message_stream(
+    body: ChatMessageRequest,
+    request: Request,
+    claims: AuthClaims = Depends(get_visitor_claims),  # noqa: B008
+) -> StreamingResponse:
+    """Stream one visitor turn over Server-Sent Events (S10.5).
+
+    Same visitor auth, same ``ChatMessageRequest`` body, same tenant/visitor
+    scoping as ``POST /public/chat/message`` -- this is a NEW, separate
+    endpoint (decision 6); the existing JSON endpoint above is untouched.
+
+    Three named SSE events (decision 5): zero or more ``delta``
+    (``{"text": "<chunk>"}``, only while a grounded-answer/chit-chat
+    generation streams), exactly one terminal ``done`` (the same leak-free
+    field set as ``ChatMessageResponse`` -- never ``tenant_id``/
+    ``visitor_id``/``intent``/``grounded``/``guardrail_flag``) on every
+    successful turn, or one ``error`` (``{"code": "LLM_ERROR"}``) on a
+    mid-stream provider failure (no ``done`` follows an ``error``).
+
+    **Client contract:** render ``delta``s progressively, but treat
+    ``done.reply``/``done.decision``/``done.action`` as authoritative and
+    reconcile (replace) the displayed text with ``done.reply`` when it
+    arrives -- on a guardrail block, ``done.reply`` is the safe reply and
+    *supersedes* any deltas that already streamed (decision 4/5).
+
+    **Failure taxonomy (decision 7 -- CRITICAL):** ``answer_turn_stream`` is
+    an async generator whose very first statement (before any ``yield``) is
+    ``await _resolve_turn(...)`` -- the same pre-generation pipeline
+    ``answer_turn`` runs (config fail-fast, get-or-create, idempotent
+    replay, user-turn store, turn-cap, classify, RAG/decide/schedule-action).
+    Calling the generator function does NOT execute any of that -- Python
+    only runs an async generator's body up to its first ``yield`` (or a
+    raised exception) once the FIRST item is pulled. So this handler
+    deliberately "primes" the generator with one ``__anext__()`` call
+    BEFORE constructing ``StreamingResponse``: any exception from
+    ``_resolve_turn`` (``LLM_NOT_CONFIGURED`` 422, ``RAG_EMBEDDING_NOT_CONFIGURED``
+    422, a ``classify`` ``LLMError`` -> 502, ``CONVERSATION_NOT_FOUND`` 404)
+    propagates right here, before HTTP 200 + headers are committed, and
+    surfaces as a normal JSON error response via the centralized error
+    middleware -- never as an ``error`` SSE frame. Only a `provider.stream`
+    failure that occurs AFTER this priming step (i.e. after the first delta,
+    mid-generation) becomes an ``error`` event, because by then the 200 body
+    is already open and the status code can no longer change.
+    """
+    db = request.app.state.db
+
+    events = answer_turn_stream(
+        db,
+        claims,
+        message=body.message,
+        conversation_id=body.conversation_id,
+        message_id=body.message_id,
+    )
+
+    # Prime the generator: this executes _resolve_turn (and everything up to
+    # the first `yield`) NOW, synchronously within the route coroutine --
+    # before StreamingResponse is ever constructed. Any pre-generation
+    # exception raised inside _resolve_turn propagates from this `await` as
+    # a normal exception, handled by the centralized error middleware with
+    # the correct HTTP status -- decision 7's hard requirement.
+    try:
+        first_event: StreamEvent | None = await events.__anext__()
+    except StopAsyncIteration:
+        first_event = None
+
+    async def _frames() -> AsyncIterator[str]:
+        last_event = first_event
+        if first_event is not None:
+            yield first_event.render()
+        async for ev in events:
+            last_event = ev
+            yield ev.render()
+
+        # PII-safe exit log (never the message/reply/flagged text -- only
+        # closed-set, non-PII fields: decision/action/intent/guardrail_flag).
+        if last_event is not None and last_event.type == "done":
+            fields = last_event.log_fields or {}
+            _log.info(
+                "chat stream turn",
+                extra={
+                    "event": "chat_stream_turn",
+                    "tenant_id": claims.tenant_id,
+                    "conversation_id": last_event.data.get("conversation_id"),
+                    "decision": fields.get("decision"),
+                    "intent": fields.get("intent"),
+                    "action": fields.get("action"),
+                    "guardrail_flag": fields.get("guardrail_flag"),
+                },
+            )
+        elif last_event is not None and last_event.type == "error":
+            _log.info(
+                "chat stream turn",
+                extra={
+                    "event": "chat_stream_turn",
+                    "tenant_id": claims.tenant_id,
+                    "decision": None,
+                    "intent": None,
+                    "action": None,
+                    "guardrail_flag": None,
+                },
+            )
+
+    return StreamingResponse(_frames(), media_type="text/event-stream")

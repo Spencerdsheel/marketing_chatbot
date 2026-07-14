@@ -23,6 +23,8 @@ from uuid import uuid4
 import asyncpg
 from common.crypto import hash_password
 
+from api.admin.repository import _hash_client_key
+
 _REQUIRED_ENV = (
     "SEED_TENANT_NAME",
     "SEED_TENANT_SLUG",
@@ -141,19 +143,24 @@ async def _seed() -> None:
         if not any([tenant_inserted, pa_inserted, ca_inserted]):
             print("  Nothing inserted (idempotent).")
 
-        # -- Widget admission: backfill client_key + allowed_origins ------------
-        existing_key: str | None = await conn.fetchval(
-            "SELECT client_key FROM tenants WHERE id = $1", actual_tenant_id
+        # -- Widget admission: backfill client_key_hash + allowed_origins -------
+        # S12.1 (migration 0030): tenants.client_key_hash stores a SHA-256 hash,
+        # never the raw key. The raw key is still printed once below (unchanged
+        # UX) but only its hash is ever persisted.
+        existing_key_hash: str | None = await conn.fetchval(
+            "SELECT client_key_hash FROM tenants WHERE id = $1", actual_tenant_id
         )
-        if existing_key is None:
+        if existing_key_hash is None:
             client_key = f"pk_{secrets.token_urlsafe(24)}"
             await conn.execute(
-                "UPDATE tenants SET client_key = $1 WHERE id = $2",
-                client_key,
+                "UPDATE tenants SET client_key_hash = $1 WHERE id = $2",
+                _hash_client_key(client_key),
                 actual_tenant_id,
             )
         else:
-            client_key = existing_key
+            # Already seeded in a prior run -- the raw key is gone (only its
+            # hash is stored), so there is nothing new to print here.
+            client_key = "<already set -- raw key was only shown once>"
 
         origins_env = os.environ.get("SEED_TENANT_ALLOWED_ORIGINS", "").strip()
         if origins_env:

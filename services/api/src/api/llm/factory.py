@@ -2,7 +2,10 @@
 
 Reads ``llm_max_retries`` and ``llm_timeout_seconds`` from ``ApiSettings``
 and threads them into each provider constructor (SDK-level resilience).
-Wraps the concrete provider in ``MeteredProvider`` so every call is metered.
+Also threads ``embedding_batch_size`` into ``OpenAICompatibleProvider`` (S12.6
+sub-batching fix; Azure/Anthropic do not take this kwarg -- see those
+providers' modules). Wraps the concrete provider in ``MeteredProvider`` so
+every call is metered.
 """
 from __future__ import annotations
 
@@ -35,6 +38,7 @@ def provider_for(config: LLMConfig) -> LLMProvider:
             base_url=config.base_url,
             max_retries=settings.llm_max_retries,
             timeout=settings.llm_timeout_seconds,
+            embedding_batch_size=settings.embedding_batch_size,
         )
     elif config.provider == "azure":
         if not config.base_url or not config.api_version:

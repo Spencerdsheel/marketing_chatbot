@@ -53,3 +53,8 @@ description: Use when building or modifying observability and analytics for the 
 - Metrics answer "what"; logs answer "why" — you need both. JSON logs + correlation IDs from day one. (`08`)
 - Health ≠ readiness. (`03`) · Audit security-relevant events; redact PII. (`07`)
 - Admin views fallback rates and schedule conversion. (solution_flow)
+
+## As-built & doctrine (audit 2026-07-11)
+- **Status: partially built** — S11.1 audit trail (0017, `api/audit/`) and S11.3 HTTP metrics + optional Sentry (`api/observability/`) are DONE; **S11.2 conversation-analytics endpoints and the D9/D10 in-house LLM trace store + sampled async judge are pending**.
+- **As-built facts:** correlation id is minted in `app.py` middleware and propagates through Celery via `_CorrelationTask` — D9 reuses it as `trace_id`. Metric labels are method/route-template/status only (no raw ids/PII); logger extras must be allowlisted in `_ALLOWED_EXTRA`.
+- **Think here:** PII lives in tenant-scoped trace *tables*, never in JSON logs or metric labels — that boundary is the whole reason D9 is built in-house. Every new domain event should answer "which dashboard/question does this feed?" before it's emitted; unqueried telemetry is cost. The audit trail is an evidence log for a paying customer dispute — append-only, tenant-scoped, boring on purpose.
