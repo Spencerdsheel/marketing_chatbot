@@ -491,6 +491,7 @@ class _StubSummaryProvider:
     def __init__(self, *, text: str = "Rolled summary.", error: LLMError | None = None) -> None:
         self._text = text
         self._error = error
+        self.aclose_calls = 0
 
     async def generate(
         self, messages: list[ChatMessage], *, model: str, max_tokens: int,
@@ -498,6 +499,9 @@ class _StubSummaryProvider:
         if self._error is not None:
             raise self._error
         return Completion(text=self._text, model=model, input_tokens=1, output_tokens=1)
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
 
 
 def _summary_conv_row(
@@ -550,11 +554,12 @@ async def test_summary_post_returns_200_rolled() -> None:
     app = _build_app(db=db)
     token = _mint_cookie(role=Role.CLIENT_ADMIN)
 
+    provider = _StubSummaryProvider(text="Rolled summary.")
     with (
         patch("api.conversation_store.routes.get_llm_config", return_value=_STUB_LLM_CONFIG),
         patch(
             "api.conversation_store.routes.provider_for",
-            return_value=_StubSummaryProvider(text="Rolled summary."),
+            return_value=provider,
         ),
     ):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
@@ -565,6 +570,8 @@ async def test_summary_post_returns_200_rolled() -> None:
             )
     assert resp.status_code == 200
     assert resp.json() == {"rolled": True}
+    # Resource-leak fix: the provider must be closed after roll_summary.
+    assert provider.aclose_calls == 1
 
 
 async def test_summary_post_no_llm_config_returns_422() -> None:
@@ -600,7 +607,7 @@ async def test_summary_post_provider_error_returns_502_no_summary_written() -> N
         patch("api.conversation_store.routes.get_llm_config", return_value=_STUB_LLM_CONFIG),
         patch(
             "api.conversation_store.routes.provider_for",
-            return_value=_StubSummaryProvider(error=LLMError("upstream failed")),
+            return_value=(provider := _StubSummaryProvider(error=LLMError("upstream failed"))),
         ),
     ):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
@@ -612,6 +619,9 @@ async def test_summary_post_provider_error_returns_502_no_summary_written() -> N
     assert resp.status_code == 502
     assert resp.json()["error_code"] == "LLM_ERROR"
     assert db.execute_calls == []
+    # Resource-leak fix: the provider must be closed even though generate()
+    # raised inside roll_summary -- the route's try/finally must still run.
+    assert provider.aclose_calls == 1
 
 
 async def test_summary_post_client_agent_returns_403() -> None:

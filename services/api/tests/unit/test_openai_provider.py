@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from openai import APIError
@@ -862,3 +862,21 @@ async def test_openai_forwards_max_retries_and_timeout() -> None:
             max_retries=5,
             timeout=45.0,
         )
+
+
+# -- aclose ----------------------------------------------------------------
+
+
+async def test_aclose_calls_underlying_client_close() -> None:
+    """aclose() awaits the injected client's close() exactly once (resource-leak fix).
+
+    Verified against the installed SDK: ``AsyncOpenAI`` exposes ``async def
+    close(self) -> None`` at ``openai/_base_client.py`` (``AsyncAPIClient.close``).
+    """
+    client = MagicMock()
+    client.close = AsyncMock()
+    provider = OpenAICompatibleProvider(client=client)
+
+    await provider.aclose()
+
+    client.close.assert_awaited_once_with()

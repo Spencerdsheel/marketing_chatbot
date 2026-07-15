@@ -275,6 +275,10 @@ async def test_question_high_confidence_answers_grounded() -> None:
     assert result.confidence == 0.8
     assert result.sources == [Source(doc_id="doc-1", chunk_id="c1", score=0.9, matched_by=["vector"])]
 
+    # Resource-leak fix: the provider used for classify + generate must be
+    # closed exactly once after generate completes.
+    p.provider.aclose.assert_awaited_once()
+
 
 # -- question -> clarify -------------------------------------------------------------
 
@@ -303,6 +307,10 @@ async def test_question_middle_confidence_clarifies_no_generate() -> None:
     assert result.reply == _CLARIFY_REPLY
     assert result.confidence == 0.4
     assert result.sources == []
+
+    # Resource-leak fix: no _GeneratePlan carries the provider onward for
+    # the clarify branch, so _resolve_turn must close it itself.
+    p.provider.aclose.assert_awaited_once()
 
 
 # -- question -> escalate (sub-floor) -------------------------------------------------
@@ -335,6 +343,10 @@ async def test_question_low_confidence_escalates_no_generate() -> None:
     assert result.reply == _ESCALATE_REPLY
     assert result.confidence == 0.1
     assert result.sources == []
+
+    # Resource-leak fix: sub-floor escalate never reaches generate/stream,
+    # so _resolve_turn must close the provider itself.
+    p.provider.aclose.assert_awaited_once()
 
 
 async def test_question_empty_retrieval_zero_confidence_escalates() -> None:
@@ -409,6 +421,10 @@ async def test_off_topic_escalates_no_rag_no_generate() -> None:
     assert result.reply == _ESCALATE_REPLY
     assert result.confidence is None
 
+    # Resource-leak fix: classify ran on `provider` but no _GeneratePlan
+    # carries it onward for off_topic -- _resolve_turn must close it itself.
+    p.provider.aclose.assert_awaited_once()
+
 
 # -- scheduling_request -> escalate -------------------------------------------------
 
@@ -428,6 +444,9 @@ async def test_scheduling_request_escalates_no_rag_no_generate() -> None:
     assistant_call = p._append_calls[1]
     assert assistant_call["intent"] == "scheduling_request"
     assert assistant_call["decision"] == "escalate"
+
+    # Resource-leak fix: same reasoning as off_topic above.
+    p.provider.aclose.assert_awaited_once()
 
 
 # -- other -> grounded path (same as question) --------------------------------------
@@ -611,6 +630,11 @@ async def test_generate_llm_error_propagates_user_turn_preserved() -> None:
 
     assert len(p._append_calls) == 1
     assert p._append_calls[0]["role"] == "user"
+
+    # Resource-leak fix: the provider must be closed even though generate()
+    # raised -- the try/finally around plan.provider.generate() must still
+    # run its finally on the exception path.
+    p.provider.aclose.assert_awaited_once()
 
 
 # -- No message_id: no dedup gate -----------------------------------------------------
@@ -1074,6 +1098,10 @@ async def test_turn_cap_preempts_answerable_turn_with_availability() -> None:
     assert assistant_call["intent"] is None
     assert assistant_call["decision"] == "escalate"
 
+    # Resource-leak fix: turn-cap resolves `provider` (before classify) but
+    # never uses it -- _resolve_turn must still close it.
+    p.provider.aclose.assert_awaited_once()
+
 
 async def test_turn_cap_no_availability_emits_lead_form() -> None:
     """Same as above but get_availability -> None: action=="lead_form" (same
@@ -1319,6 +1347,12 @@ async def test_stream_grounded_answer_emits_deltas_then_done() -> None:
     assert assistant_call["tokens"] is None
     assert done.data["message_id"] == "generated-id"
 
+    # Resource-leak fix: the provider must be closed only AFTER the stream
+    # is fully consumed (not before/during) -- verified here by asserting
+    # it happened exactly once, after all deltas + the terminal done were
+    # already collected above.
+    p.provider.aclose.assert_awaited_once()
+
 
 # -- stream: chit-chat ------------------------------------------------------------------
 
@@ -1445,6 +1479,11 @@ async def test_stream_mid_stream_llm_error_yields_error_event_no_store() -> None
 
     assert len(p._append_calls) == 1
     assert p._append_calls[0]["role"] == "user"
+
+    # Resource-leak fix: the provider must be closed even on a mid-stream
+    # LLMError -- the outer try/finally around the stream loop must still
+    # run its finally when the except branch returns.
+    p.provider.aclose.assert_awaited_once()
 
 
 # -- stream: turn-cap short-circuit emits no deltas ---------------------------------------

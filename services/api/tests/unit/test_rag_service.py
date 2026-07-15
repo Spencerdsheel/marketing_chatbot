@@ -68,12 +68,16 @@ class _StubProvider:
         self._vector = vector
         self._error = error
         self.embed_calls: list[tuple[list[str], str]] = []
+        self.aclose_calls = 0
 
     async def embed(self, texts: list[str], *, model: str) -> list[list[float]]:
         self.embed_calls.append((texts, model))
         if self._error is not None:
             raise self._error
         return [self._vector]
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
 
 
 async def test_retrieve_success_orders_chunks_and_confidence_is_top_score() -> None:
@@ -104,6 +108,8 @@ async def test_retrieve_success_orders_chunks_and_confidence_is_top_score() -> N
     assert result.chunks == matches
     assert result.confidence == pytest.approx(0.9)
     assert provider.embed_calls == [(["what can it do?"], "nomic-embed-text")]
+    # Resource-leak fix: _embed_query must close the provider after use.
+    assert provider.aclose_calls == 1
 
 
 async def test_retrieve_no_embedding_model_raises_422_and_provider_not_called() -> None:
@@ -168,6 +174,9 @@ async def test_retrieve_embed_llm_error_propagates() -> None:
                 await retrieve(object(), _claims(), "hello", k=5)
 
     search_mock.assert_not_awaited()
+    # Resource-leak fix: the provider must be closed even though embed()
+    # raised -- the try/finally must still run its finally on the error path.
+    assert provider.aclose_calls == 1
 
 
 async def test_retrieve_empty_result_set_confidence_zero_no_exception() -> None:

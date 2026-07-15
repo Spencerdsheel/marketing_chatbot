@@ -185,3 +185,14 @@ class AnthropicProvider:
                 str(exc),
             )
             raise LLMError("LLM request failed.") from exc
+
+    async def aclose(self) -> None:
+        """Close the underlying ``AsyncAnthropic`` client.
+
+        Verified against the installed SDK: ``AsyncAnthropic`` overrides
+        ``async def close(self) -> None`` at ``anthropic/_client.py``
+        (calling ``super().close()``, i.e. ``AsyncAPIClient.close`` in
+        ``anthropic/_base_client.py``, which calls ``await
+        self._client.aclose()`` on the wrapped ``httpx.AsyncClient``).
+        """
+        await self._client.close()

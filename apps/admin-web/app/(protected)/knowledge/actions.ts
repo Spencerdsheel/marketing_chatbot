@@ -1,0 +1,246 @@
+"use server";
+
+/**
+ * Knowledge upload + status-poll server actions (S13.3 decisions 3, 4, 6).
+ *
+ * `uploadKnowledge` forwards the picked file as multipart/form-data to
+ * `POST /admin/ingestion/upload` via `adminApiFetch` -- server-to-server, so
+ * the httpOnly JWT cookie never needs to reach the browser (decision 3).
+ *
+ * `getDocStatus` reads `GET /admin/ingestion/docs/{doc_id}` for the client
+ * poll loop (decision 4) -- the browser cannot call admin-api directly (the
+ * JWT is server-only), so every poll tick round-trips through this action.
+ */
+import { AdminApiError, adminApiFetch } from "@/lib/api";
+import {
+  ALLOWED_CONTENT_TYPES,
+  formatBytes,
+  MAX_UPLOAD_BYTES,
+} from "@/lib/knowledge-constants";
+
+const GENERIC_NETWORK_ERROR = "Unable to reach the server. Please try again.";
+
+// ---------------------------------------------------------------------------
+// uploadKnowledge
+// ---------------------------------------------------------------------------
+
+export interface UploadIdleState {
+  status: "idle";
+}
+
+export interface UploadErrorState {
+  status: "error";
+  message: string;
+  correlationId: string | null;
+}
+
+export interface UploadedState {
+  status: "uploaded";
+  docId: string;
+  /** `null` signals an idempotent re-upload (decision 6) -- no new run was
+   * enqueued; `docStatus` reflects the existing doc's current status. */
+  runId: string | null;
+  docStatus: string;
+  idempotent: boolean;
+}
+
+export type UploadState = UploadIdleState | UploadErrorState | UploadedState;
+
+interface AdminUploadResponseBody {
+  doc_id: string;
+  run_id: string | null;
+  status: string;
+}
+
+export async function uploadKnowledge(
+  _prevState: UploadState,
+  formData: FormData
+): Promise<UploadState> {
+  const file = formData.get("file");
+
+  if (!(file instanceof File) || file.size === 0) {
+    return {
+      status: "error",
+      message: "Choose a .txt or .docx file to upload.",
+      correlationId: null,
+    };
+  }
+
+  // Client-side pre-check already ran in the browser (Decision 5); this is
+  // the server-action re-check -- courtesy only, the backend is the real
+  // gate and still enforces both limits itself.
+  if (file.size > MAX_UPLOAD_BYTES) {
+    return {
+      status: "error",
+      message: `That file is too large (${formatBytes(file.size)}). The limit is ${formatBytes(MAX_UPLOAD_BYTES)}.`,
+      correlationId: null,
+    };
+  }
+
+  const contentType = (file.type || "").split(";")[0].trim().toLowerCase();
+  if (
+    contentType &&
+    !(ALLOWED_CONTENT_TYPES as readonly string[]).includes(contentType)
+  ) {
+    return {
+      status: "error",
+      message: `Unsupported file type: "${file.type}". Only .txt and .docx files are accepted.`,
+      correlationId: null,
+    };
+  }
+
+  const uploadForm = new FormData();
+  uploadForm.append("file", file, file.name);
+
+  let response: Response;
+  try {
+    // No manual Content-Type -- adminApiFetch/fetch sets the multipart
+    // boundary automatically for a FormData body.
+    response = await adminApiFetch("/admin/ingestion/upload", {
+      method: "POST",
+      body: uploadForm,
+    });
+  } catch (err) {
+    if (err instanceof AdminApiError) {
+      return mapUploadError(err);
+    }
+    return {
+      status: "error",
+      message: GENERIC_NETWORK_ERROR,
+      correlationId: null,
+    };
+  }
+
+  const body = (await response.json()) as AdminUploadResponseBody;
+
+  return {
+    status: "uploaded",
+    docId: body.doc_id,
+    runId: body.run_id,
+    docStatus: body.status,
+    idempotent: body.run_id === null,
+  };
+}
+
+function mapUploadError(err: AdminApiError): UploadErrorState {
+  if (err.errorCode === "UNSUPPORTED_CONTENT_TYPE") {
+    return {
+      status: "error",
+      message: "Unsupported file type. Only .txt and .docx files are accepted.",
+      correlationId: err.correlationId || null,
+    };
+  }
+
+  if (err.status === 413 || err.errorCode === "FILE_TOO_LARGE") {
+    return {
+      status: "error",
+      message: `That file is too large. The limit is ${formatBytes(MAX_UPLOAD_BYTES)}.`,
+      correlationId: err.correlationId || null,
+    };
+  }
+
+  if (err.status === 403 || err.errorCode === "ROLE_NOT_PERMITTED") {
+    return {
+      status: "error",
+      message: "You do not have permission to upload knowledge documents.",
+      correlationId: err.correlationId || null,
+    };
+  }
+
+  if (err.status === 401) {
+    return {
+      status: "error",
+      message: "Your session has expired. Please sign in again.",
+      correlationId: err.correlationId || null,
+    };
+  }
+
+  return {
+    status: "error",
+    message: `${err.message} (correlation ID: ${err.correlationId || "unknown"})`,
+    correlationId: err.correlationId || null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// getDocStatus
+// ---------------------------------------------------------------------------
+
+export interface DocStatusRun {
+  runId: string;
+  status: string;
+  charsOut: number | null;
+  errors: unknown;
+  durationMs: number | null;
+}
+
+export interface DocStatusOk {
+  status: "ok";
+  docId: string;
+  docStatus: string;
+  run: DocStatusRun | null;
+  parsedPreview: string | null;
+}
+
+export interface DocStatusError {
+  status: "error";
+  errorCode: string | null;
+  message: string;
+}
+
+export type DocStatusResult = DocStatusOk | DocStatusError;
+
+interface AdminDocStatusResponseBody {
+  doc_id: string;
+  filename: string;
+  content_type: string;
+  status: string;
+  content_hash: string;
+  latest_run: {
+    run_id: string;
+    status: string;
+    chars_out: number | null;
+    errors: unknown;
+    duration_ms: number | null;
+  } | null;
+  parsed_preview: string | null;
+}
+
+export async function getDocStatus(docId: string): Promise<DocStatusResult> {
+  let response: Response;
+  try {
+    response = await adminApiFetch(`/admin/ingestion/docs/${encodeURIComponent(docId)}`, {
+      method: "GET",
+    });
+  } catch (err) {
+    if (err instanceof AdminApiError) {
+      return {
+        status: "error",
+        errorCode: err.errorCode || null,
+        message:
+          err.errorCode === "DOC_NOT_FOUND"
+            ? "Document not found."
+            : `${err.message} (correlation ID: ${err.correlationId || "unknown"})`,
+      };
+    }
+    return { status: "error", errorCode: null, message: GENERIC_NETWORK_ERROR };
+  }
+
+  const body = (await response.json()) as AdminDocStatusResponseBody;
+
+  return {
+    status: "ok",
+    docId: body.doc_id,
+    docStatus: body.status,
+    run: body.latest_run
+      ? {
+          runId: body.latest_run.run_id,
+          status: body.latest_run.status,
+          charsOut: body.latest_run.chars_out,
+          errors: body.latest_run.errors,
+          durationMs: body.latest_run.duration_ms,
+        }
+      : null,
+    parsedPreview: body.parsed_preview,
+  };
+}

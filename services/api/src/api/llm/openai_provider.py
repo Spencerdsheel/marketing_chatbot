@@ -252,3 +252,14 @@ class OpenAICompatibleProvider:
                 str(exc),
             )
             raise LLMError("LLM request failed.") from exc
+
+    async def aclose(self) -> None:
+        """Close the underlying ``AsyncOpenAI``/``AsyncAzureOpenAI`` client.
+
+        Verified against the installed SDK: ``AsyncOpenAI`` (and its
+        subclass ``AsyncAzureOpenAI``) expose ``async def close(self) ->
+        None`` at ``openai/_base_client.py`` (``AsyncAPIClient.close``),
+        which calls ``await self._client.aclose()`` on the wrapped
+        ``httpx.AsyncClient``.
+        """
+        await self._client.close()

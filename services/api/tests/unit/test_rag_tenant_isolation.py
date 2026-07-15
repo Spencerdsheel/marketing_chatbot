@@ -67,9 +67,13 @@ class _StubConfig:
 class _StubProvider:
     def __init__(self, dim: int) -> None:
         self._dim = dim
+        self.aclose_calls = 0
 
     async def embed(self, texts: list[str], *, model: str) -> list[list[float]]:
         return [[0.1] * self._dim]
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
 
 
 async def _fake_similarity_search(

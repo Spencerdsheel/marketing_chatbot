@@ -112,3 +112,7 @@ class MeteredProvider:
                 ).observe(elapsed)
 
         return _gen()
+
+    async def aclose(self) -> None:
+        """Delegate to the wrapped provider's ``aclose`` -- no metrics needed."""
+        await self._delegate.aclose()

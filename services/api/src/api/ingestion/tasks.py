@@ -300,37 +300,40 @@ async def _execute(
     # failed instead of leaving it stuck at "running" (S12.6 fix).
     llm_provider = provider_for(config)
     try:
-        vectors = await llm_provider.embed(chunks, model=config.embedding_model)
-    except LLMError as exc:
-        if task.request.retries < task.max_retries:
-            # Retries remain -- propagate so Celery's autoretry_for schedules
-            # the next attempt with backoff+jitter.
-            raise
-        duration_ms = int((time.monotonic() - t0) * 1000)
-        error_entry = {
-            "code": "EMBEDDING_FAILED",
-            "message": str(exc),
-        }
-        await repo.update_run(
-            db,
-            claims,
-            run_id,
-            status="failed",
-            errors=error_entry,
-            duration_ms=duration_ms,
-        )
-        await repo.update_doc_status(db, claims, doc_id, "failed")
-        _log.warning(
-            "ingest_document embedding failed (retries exhausted)",
-            extra={
-                "task": "ingestion.ingest_document",
-                "event": "task_embedding_failed",
-                "doc_id": doc_id,
-                "run_id": run_id,
-                "retries": task.request.retries,
-            },
-        )
-        return {"doc_id": doc_id, "run_id": run_id, "status": "failed"}
+        try:
+            vectors = await llm_provider.embed(chunks, model=config.embedding_model)
+        except LLMError as exc:
+            if task.request.retries < task.max_retries:
+                # Retries remain -- propagate so Celery's autoretry_for schedules
+                # the next attempt with backoff+jitter.
+                raise
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            error_entry = {
+                "code": "EMBEDDING_FAILED",
+                "message": str(exc),
+            }
+            await repo.update_run(
+                db,
+                claims,
+                run_id,
+                status="failed",
+                errors=error_entry,
+                duration_ms=duration_ms,
+            )
+            await repo.update_doc_status(db, claims, doc_id, "failed")
+            _log.warning(
+                "ingest_document embedding failed (retries exhausted)",
+                extra={
+                    "task": "ingestion.ingest_document",
+                    "event": "task_embedding_failed",
+                    "doc_id": doc_id,
+                    "run_id": run_id,
+                    "retries": task.request.retries,
+                },
+            )
+            return {"doc_id": doc_id, "run_id": run_id, "status": "failed"}
+    finally:
+        await llm_provider.aclose()
 
     # Step 9 — validate every vector dimension.
     for i, vec in enumerate(vectors):

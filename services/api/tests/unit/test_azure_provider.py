@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from openai import APIError
@@ -274,3 +274,20 @@ async def test_azure_constructs_async_azure_openai_with_correct_args() -> None:
             max_retries=3,
             timeout=60.0,
         )
+
+
+# -- aclose (inherited from OpenAICompatibleProvider) ---------------------------
+
+
+async def test_azure_aclose_calls_underlying_client_close() -> None:
+    """aclose() awaits the injected client's close() exactly once -- inherited
+    unchanged from OpenAICompatibleProvider (AsyncAzureOpenAI shares the same
+    AsyncAPIClient.close() as AsyncOpenAI -- no override exists in
+    ``openai/lib/azure.py``)."""
+    client = MagicMock()
+    client.close = AsyncMock()
+    provider = AzureOpenAIProvider(client=client)
+
+    await provider.aclose()
+
+    client.close.assert_awaited_once_with()

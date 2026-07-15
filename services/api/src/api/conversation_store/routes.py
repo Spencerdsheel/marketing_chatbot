@@ -215,14 +215,17 @@ async def roll_conv_summary(
         )
 
     provider = provider_for(config)
-    rolled = await roll_summary(
-        db,
-        claims,
-        conversation_id,
-        provider=provider,
-        model=config.model,
-        keep_recent=body.keep_recent,
-    )
+    try:
+        rolled = await roll_summary(
+            db,
+            claims,
+            conversation_id,
+            provider=provider,
+            model=config.model,
+            keep_recent=body.keep_recent,
+        )
+    finally:
+        await provider.aclose()
     _log.info(
         "Conversation summary rolled",
         extra={

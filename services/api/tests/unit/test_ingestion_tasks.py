@@ -226,11 +226,15 @@ class _StubEmbeddingProvider:
         self._dim = dim
         self.called_texts: list[list[str]] = []
         self.called_model: list[str] = []
+        self.aclose_calls = 0
 
     async def embed(self, texts: list[str], *, model: str) -> list[list[float]]:
         self.called_texts.append(texts)
         self.called_model.append(model)
         return [[0.1] * self._dim for _ in texts]
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
 
     async def generate(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError
@@ -635,6 +639,9 @@ async def test_s53_success_path_embeds_and_stores_chunks() -> None:
     doc_updates = [e for e in db.executions if "KNOWLEDGE_DOCS" in e[0].upper()]
     assert any(e[1][0] == "parsed" for e in doc_updates)
 
+    # Resource-leak fix: the provider must be closed on the success path too.
+    assert stub_provider.aclose_calls == 1, "llm_provider.aclose() must be called on success"
+
 
 async def test_s53_embedding_not_configured_deterministic_fail() -> None:
     """No embedding_model → run failed EMBEDDING_NOT_CONFIGURED, no embed, no retry."""
@@ -765,6 +772,7 @@ class _ErrorEmbeddingProvider:
 
     def __init__(self, message: str = "Network error.") -> None:
         self._message = message
+        self.aclose_calls = 0
 
     async def embed(self, texts: list[str], *, model: str) -> list[list[float]]:
         from api.llm.provider import LLMError  # noqa: PLC0415
@@ -773,6 +781,9 @@ class _ErrorEmbeddingProvider:
     async def generate(self, *args: Any, **kwargs: Any) -> Any: ...
     async def classify(self, *args: Any, **kwargs: Any) -> Any: ...
     def stream(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
 
 
 async def test_s53_llm_error_propagates_when_retries_remain() -> None:
@@ -799,9 +810,10 @@ async def test_s53_llm_error_propagates_when_retries_remain() -> None:
             max_retries = 3
             request = SimpleNamespace(retries=0)  # first attempt -- retries remain
 
+        error_provider = _ErrorEmbeddingProvider("Network error.")
         with patch(
             "api.ingestion.tasks.provider_for",
-            return_value=_ErrorEmbeddingProvider("Network error."),
+            return_value=error_provider,
         ):
             from common.auth import AuthClaims, Role  # noqa: PLC0415
 
@@ -829,6 +841,13 @@ async def test_s53_llm_error_propagates_when_retries_remain() -> None:
     assert "succeeded" not in statuses, "run must not be marked succeeded when LLMError propagates"
     assert "failed" not in statuses, "run must not be marked failed while retries remain"
 
+    # Resource-leak fix: the provider (and its underlying SDK client
+    # connection pool) must be closed even though the LLMError propagated
+    # out of the temporary event loop this Celery task runs in.
+    assert error_provider.aclose_calls == 1, (
+        "llm_provider.aclose() must be called even when embed() raises and re-propagates"
+    )
+
 
 async def test_s12_6_llm_error_after_retries_exhausted_marks_run_failed() -> None:
     """LLMError from embed, retries exhausted -> run/doc marked 'failed', task returns cleanly."""
@@ -852,9 +871,10 @@ async def test_s12_6_llm_error_after_retries_exhausted_marks_run_failed() -> Non
             max_retries = 3
             request = SimpleNamespace(retries=3)  # final attempt -- retries exhausted
 
+        error_provider = _ErrorEmbeddingProvider("Upstream timed out.")
         with patch(
             "api.ingestion.tasks.provider_for",
-            return_value=_ErrorEmbeddingProvider("Upstream timed out."),
+            return_value=error_provider,
         ):
             from common.auth import AuthClaims, Role  # noqa: PLC0415
 
@@ -879,6 +899,14 @@ async def test_s12_6_llm_error_after_retries_exhausted_marks_run_failed() -> Non
     assert result["status"] == "failed"
     assert result["doc_id"] == _DOC_ID
     assert result["run_id"] == _RUN_ID
+
+    # Resource-leak fix (the observed symptom): llm_provider.aclose() must
+    # be called even on the caught-and-handled retries-exhausted path, so
+    # the abandoned httpx.AsyncClient never GCs on this task's already-closed
+    # temporary event loop.
+    assert error_provider.aclose_calls == 1, (
+        "llm_provider.aclose() must be called when embed() raises and retries are exhausted"
+    )
 
     # run must be marked failed with an EMBEDDING_FAILED error entry.
     run_updates = [e for e in db.executions if "INGESTION_RUNS" in e[0].upper()]

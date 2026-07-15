@@ -419,6 +419,10 @@ async def _resolve_turn(
 
     if turns > cfg.turn_cap:
         action = await _schedule_action(db, claims)
+        # Turn-cap short-circuits before classify -- provider was resolved
+        # but never used; close it here since no _GeneratePlan will carry it
+        # onward for the caller to close.
+        await provider.aclose()
         return _FixedOutcome(
             conversation_id=conversation_id,
             assistant_id=assistant_id,
@@ -464,6 +468,9 @@ async def _resolve_turn(
         # has availability configured, else lead_form (the ONE read-only
         # api/scheduling/** check the orchestrator ever makes).
         action = await _schedule_action(db, claims)
+        # classify already ran on `provider`; no _GeneratePlan will carry it
+        # onward, so close it before returning the fixed-template reply.
+        await provider.aclose()
         return _FixedOutcome(
             conversation_id=conversation_id,
             assistant_id=assistant_id,
@@ -503,6 +510,8 @@ async def _resolve_turn(
 
     if decision == "clarify":
         # Fixed-template branch -- our own trusted constant, never scanned.
+        # No _GeneratePlan will carry `provider` onward, so close it here.
+        await provider.aclose()
         return _FixedOutcome(
             conversation_id=conversation_id,
             assistant_id=assistant_id,
@@ -518,6 +527,7 @@ async def _resolve_turn(
 
     # escalate (sub-floor confidence) -- fixed-template, never scanned.
     action = await _schedule_action(db, claims)
+    await provider.aclose()
     return _FixedOutcome(
         conversation_id=conversation_id,
         assistant_id=assistant_id,
@@ -645,9 +655,15 @@ async def answer_turn(
         )
 
     # _GeneratePlan -- the two generate branches (grounded answer, chitchat).
-    completion = await plan.provider.generate(
-        plan.prompt, model=plan.model, max_tokens=settings.llm_max_tokens,
-    )
+    # `plan.provider` is this call's sole owner from here on -- close it
+    # after generate regardless of success/failure (LLMError still needs the
+    # connection pool released before propagating).
+    try:
+        completion = await plan.provider.generate(
+            plan.prompt, model=plan.model, max_tokens=settings.llm_max_tokens,
+        )
+    finally:
+        await plan.provider.aclose()
     final = _finalize_generation(completion.text, plan)
 
     stored_message_id = await append_message(
@@ -824,20 +840,26 @@ async def answer_turn_stream(
         return
 
     # _GeneratePlan -- stream, accumulate, finalize (decisions 2/3/4/5).
+    # `plan.provider` is this call's sole owner from here on -- close it only
+    # AFTER the stream is fully consumed or has failed (never mid-stream, so
+    # a partial-consumer never severs the connection under a live chunk).
     settings = get_api_settings()
     parts: list[str] = []
     try:
-        async for chunk in plan.provider.stream(
-            plan.prompt, model=plan.model, max_tokens=settings.llm_max_tokens,
-        ):
-            parts.append(chunk.text)
-            yield StreamEvent.delta(chunk.text)
-    except LLMError:
-        # Mid-stream failure: the 200 body is already open, so this cannot
-        # become an HTTP status (decision 7). No assistant turn is stored --
-        # only the user turn (step 5, already durable) persists (decision 10).
-        yield StreamEvent.error("LLM_ERROR")
-        return
+        try:
+            async for chunk in plan.provider.stream(
+                plan.prompt, model=plan.model, max_tokens=settings.llm_max_tokens,
+            ):
+                parts.append(chunk.text)
+                yield StreamEvent.delta(chunk.text)
+        except LLMError:
+            # Mid-stream failure: the 200 body is already open, so this cannot
+            # become an HTTP status (decision 7). No assistant turn is stored --
+            # only the user turn (step 5, already durable) persists (decision 10).
+            yield StreamEvent.error("LLM_ERROR")
+            return
+    finally:
+        await plan.provider.aclose()
 
     full_text = "".join(parts)
     final = _finalize_generation(full_text, plan)

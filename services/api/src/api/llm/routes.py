@@ -121,11 +121,14 @@ async def generate(
         )
 
     provider = provider_for(config)
-    completion = await provider.generate(
-        [ChatMessage("user", body.prompt)],
-        model=config.model,
-        max_tokens=settings.llm_max_tokens,
-    )
+    try:
+        completion = await provider.generate(
+            [ChatMessage("user", body.prompt)],
+            model=config.model,
+            max_tokens=settings.llm_max_tokens,
+        )
+    finally:
+        await provider.aclose()
 
     return {
         "text": completion.text,
@@ -157,7 +160,10 @@ async def embed(
         )
 
     provider = provider_for(config)
-    vectors = await provider.embed(body.texts, model=body.model)
+    try:
+        vectors = await provider.embed(body.texts, model=body.model)
+    finally:
+        await provider.aclose()
 
     return {
         "model": body.model,
@@ -188,7 +194,10 @@ async def classify(
         )
 
     provider = provider_for(config)
-    label = await provider.classify(body.text, body.labels, model=config.model)
+    try:
+        label = await provider.classify(body.text, body.labels, model=config.model)
+    finally:
+        await provider.aclose()
 
     return {"label": label, "model": config.model}
 
@@ -223,7 +232,10 @@ async def stream(
     )
 
     async def _yield_text() -> AsyncIterator[str]:
-        async for chunk in stream_iter:
-            yield chunk.text
+        try:
+            async for chunk in stream_iter:
+                yield chunk.text
+        finally:
+            await provider.aclose()
 
     return StreamingResponse(_yield_text(), media_type="text/plain")

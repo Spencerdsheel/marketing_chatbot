@@ -133,8 +133,11 @@ async def _embed_query(
         )
 
     provider = provider_for(config)
-    # LLMError from embed propagates untouched -- transient, never swallowed.
-    vectors = await provider.embed([query], model=config.embedding_model)
+    try:
+        # LLMError from embed propagates untouched -- transient, never swallowed.
+        vectors = await provider.embed([query], model=config.embedding_model)
+    finally:
+        await provider.aclose()
     qvec = vectors[0]
 
     if len(qvec) != embedding_dimension:

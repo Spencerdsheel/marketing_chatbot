@@ -45,6 +45,7 @@ class _StubProvider:
         self._label = label
         self._stream_chunks = stream_chunks or [Chunk("He"), Chunk("llo")]
         self._raise_on = raise_on
+        self.aclose_calls = 0
 
     async def generate(
         self,
@@ -89,6 +90,9 @@ class _StubProvider:
             raise LLMError("LLM request failed.")
         for chunk in self._stream_chunks:
             yield chunk
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
 
 
 def _get_sample(name: str, **labels: str) -> float | None:
@@ -378,3 +382,16 @@ async def test_metered_provider_uses_provider_label() -> None:
     ) or 0
 
     assert input_after - input_before == 8
+
+
+# -- aclose delegates, no metrics needed ----------------------------------------
+
+
+async def test_metered_aclose_delegates_to_delegate_aclose_exactly_once() -> None:
+    """MeteredProvider.aclose() delegates to the wrapped provider's aclose() once."""
+    stub = _StubProvider()
+    metered = MeteredProvider(stub, provider="openai")
+
+    await metered.aclose()
+
+    assert stub.aclose_calls == 1

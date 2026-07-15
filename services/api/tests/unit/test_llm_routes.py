@@ -112,6 +112,10 @@ class _StubProvider:
         self._vectors = vectors or [[0.1, 0.2, 0.3]]
         self._label = label
         self._stream_chunks = stream_chunks or [Chunk("He"), Chunk("llo")]
+        self.aclose_calls = 0
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
 
     async def generate(
         self,
@@ -336,7 +340,8 @@ async def test_llm_generate_with_config_returns_200() -> None:
     app = _build_app(db=db)
 
     # Patch provider_for to return a stub
-    with patch("api.llm.routes.provider_for", return_value=_StubProvider("Hello from Claude.")):
+    provider = _StubProvider("Hello from Claude.")
+    with patch("api.llm.routes.provider_for", return_value=provider):
         token = _mint_cookie(role=Role.CLIENT_ADMIN)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.post(
@@ -350,6 +355,8 @@ async def test_llm_generate_with_config_returns_200() -> None:
     assert body["model"] == "claude-opus-4-8"
     assert body["input_tokens"] == 10
     assert body["output_tokens"] == 5
+    # Resource-leak fix: the provider must be closed after generate.
+    assert provider.aclose_calls == 1
 
 
 async def test_llm_generate_no_config_returns_422() -> None:
@@ -426,9 +433,10 @@ async def test_llm_embed_with_config_returns_200() -> None:
     app = _build_app(db=db)
 
     stub_vectors = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+    provider = _StubProvider(vectors=stub_vectors)
     with patch(
         "api.llm.routes.provider_for",
-        return_value=_StubProvider(vectors=stub_vectors),
+        return_value=provider,
     ):
         token = _mint_cookie(role=Role.CLIENT_ADMIN)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
@@ -442,6 +450,8 @@ async def test_llm_embed_with_config_returns_200() -> None:
     assert body["model"] == "text-embedding-3-small"
     assert body["count"] == 2
     assert body["dimension"] == 3
+    # Resource-leak fix: the provider must be closed after embed.
+    assert provider.aclose_calls == 1
 
 
 async def test_llm_embed_no_config_returns_422() -> None:
@@ -501,9 +511,10 @@ async def test_llm_classify_with_config_returns_200() -> None:
     db = _StubDatabase(config_row=config_row)
     app = _build_app(db=db)
 
+    provider = _StubProvider(label="Support")
     with patch(
         "api.llm.routes.provider_for",
-        return_value=_StubProvider(label="Support"),
+        return_value=provider,
     ):
         token = _mint_cookie(role=Role.CLIENT_ADMIN)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
@@ -516,6 +527,8 @@ async def test_llm_classify_with_config_returns_200() -> None:
     body = resp.json()
     assert body["label"] == "Support"
     assert body["model"] == "gpt-4o"
+    # Resource-leak fix: the provider must be closed after classify.
+    assert provider.aclose_calls == 1
 
 
 async def test_llm_classify_no_config_returns_422() -> None:
@@ -576,9 +589,10 @@ async def test_llm_stream_with_config_returns_200() -> None:
     app = _build_app(db=db)
 
     stream_chunks = [Chunk("Hello"), Chunk(" from the bot.")]
+    provider = _StubProvider(stream_chunks=stream_chunks)
     with patch(
         "api.llm.routes.provider_for",
-        return_value=_StubProvider(stream_chunks=stream_chunks),
+        return_value=provider,
     ):
         token = _mint_cookie(role=Role.CLIENT_ADMIN)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
@@ -589,6 +603,9 @@ async def test_llm_stream_with_config_returns_200() -> None:
             )
     assert resp.status_code == 200
     assert resp.text == "Hello from the bot."
+    # Resource-leak fix: the provider must be closed only AFTER the stream
+    # body has been fully consumed by the client above.
+    assert provider.aclose_calls == 1
 
 
 async def test_llm_stream_client_agent_returns_403() -> None:

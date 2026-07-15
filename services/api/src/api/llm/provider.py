@@ -67,6 +67,17 @@ class LLMProvider(Protocol):
         max_tokens: int,
     ) -> AsyncIterator[Chunk]: ...
 
+    async def aclose(self) -> None:
+        """Release the underlying SDK client's connection pool.
+
+        Every call site that obtains a provider via ``provider_for`` owns its
+        lifetime and MUST call this exactly once when done -- providers wrap
+        an ``httpx.AsyncClient`` (or equivalent) that is never closed
+        implicitly. Idempotent implementations are encouraged but not
+        required by this Protocol; callers close at most once per instance.
+        """
+        ...
+
 
 class LLMError(AppException):
     """Provider-level failure (network, upstream error, unsupported provider)."""
