@@ -1,0 +1,232 @@
+import { describe, expect, it } from "vitest";
+import {
+  fieldValuesFromSettings,
+  parseBusinessHours,
+  settingsFormSchema,
+  shouldResetFieldsToServerValues,
+  stringifyBusinessHours,
+} from "@/lib/settings-schema";
+import type { BotSettings } from "@/lib/settings";
+import type { SaveState } from "@/app/(protected)/settings/actions";
+
+describe("settingsFormSchema", () => {
+  it("parses a fully valid input", () => {
+    const result = settingsFormSchema.safeParse({
+      greeting: "Hi there!",
+      escalationPolicy: "Escalate on refund requests.",
+      tone: "friendly",
+      businessHoursText: "",
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.greeting).toBe("Hi there!");
+      expect(result.data.escalationPolicy).toBe("Escalate on refund requests.");
+      expect(result.data.tone).toBe("friendly");
+    }
+  });
+
+  it("fails when greeting exceeds 2000 characters", () => {
+    const result = settingsFormSchema.safeParse({
+      greeting: "a".repeat(2001),
+      escalationPolicy: "",
+      tone: "",
+      businessHoursText: "",
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const msg = result.error.issues.find((i) => i.path[0] === "greeting")?.message;
+      expect(msg).toMatch(/2000/);
+    }
+  });
+
+  it("fails when escalationPolicy exceeds 2000 characters", () => {
+    const result = settingsFormSchema.safeParse({
+      greeting: "",
+      escalationPolicy: "a".repeat(2001),
+      tone: "",
+      businessHoursText: "",
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const msg = result.error.issues.find((i) => i.path[0] === "escalationPolicy")?.message;
+      expect(msg).toMatch(/2000/);
+    }
+  });
+
+  it("fails when tone exceeds 100 characters", () => {
+    const result = settingsFormSchema.safeParse({
+      greeting: "",
+      escalationPolicy: "",
+      tone: "a".repeat(101),
+      businessHoursText: "",
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const msg = result.error.issues.find((i) => i.path[0] === "tone")?.message;
+      expect(msg).toMatch(/100/);
+    }
+  });
+
+  it("coerces blank optional fields to undefined (backend receives null, not '')", () => {
+    const result = settingsFormSchema.safeParse({
+      greeting: "   ",
+      escalationPolicy: "",
+      tone: "",
+      businessHoursText: "",
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.greeting).toBeUndefined();
+      expect(result.data.escalationPolicy).toBeUndefined();
+      expect(result.data.tone).toBeUndefined();
+    }
+  });
+});
+
+describe("parseBusinessHours", () => {
+  it("blank/whitespace -> {ok:true, value:null}", () => {
+    expect(parseBusinessHours("")).toEqual({ ok: true, value: null });
+    expect(parseBusinessHours("   \n  ")).toEqual({ ok: true, value: null });
+  });
+
+  it("a valid JSON object -> {ok:true, value}", () => {
+    const result = parseBusinessHours('{"mon": ["09:00", "17:00"]}');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual({ mon: ["09:00", "17:00"] });
+    }
+  });
+
+  it("a JSON array -> {ok:false}", () => {
+    const result = parseBusinessHours("[1,2]");
+    expect(result.ok).toBe(false);
+  });
+
+  it("a JSON scalar (string) -> {ok:false}", () => {
+    expect(parseBusinessHours('"5"').ok).toBe(false);
+  });
+
+  it("a JSON scalar (number) -> {ok:false}", () => {
+    expect(parseBusinessHours("5").ok).toBe(false);
+  });
+
+  it("a JSON scalar (boolean) -> {ok:false}", () => {
+    expect(parseBusinessHours("true").ok).toBe(false);
+  });
+
+  it("malformed JSON -> {ok:false}", () => {
+    expect(parseBusinessHours("{").ok).toBe(false);
+  });
+
+  it("null literal -> {ok:false} (not a plain object)", () => {
+    expect(parseBusinessHours("null").ok).toBe(false);
+  });
+});
+
+describe("stringifyBusinessHours", () => {
+  it("null/undefined -> empty string", () => {
+    expect(stringifyBusinessHours(null)).toBe("");
+    expect(stringifyBusinessHours(undefined)).toBe("");
+  });
+
+  it("round-trips through parseBusinessHours", () => {
+    const value = { mon: ["09:00", "17:00"] };
+    const str = stringifyBusinessHours(value);
+    const parsed = parseBusinessHours(str);
+    expect(parsed).toEqual({ ok: true, value });
+  });
+});
+
+const baseSettings: BotSettings = {
+  greeting: "Hi!",
+  businessHours: { mon: ["09:00", "17:00"] },
+  escalationPolicy: "Escalate on refunds.",
+  tone: "friendly",
+  answerThreshold: 0.7,
+  escalateThreshold: 0.4,
+  turnCap: 7,
+  llmProvider: null,
+  llmModel: null,
+};
+
+describe("fieldValuesFromSettings", () => {
+  it("maps a fully-populated BotSettings to string field values", () => {
+    expect(fieldValuesFromSettings(baseSettings)).toEqual({
+      greeting: "Hi!",
+      businessHoursText: '{\n  "mon": [\n    "09:00",\n    "17:00"\n  ]\n}',
+      escalationPolicy: "Escalate on refunds.",
+      tone: "friendly",
+    });
+  });
+
+  it("maps nulls to empty strings", () => {
+    expect(
+      fieldValuesFromSettings({
+        ...baseSettings,
+        greeting: null,
+        businessHours: null,
+        escalationPolicy: null,
+        tone: null,
+      })
+    ).toEqual({
+      greeting: "",
+      businessHoursText: "",
+      escalationPolicy: "",
+      tone: "",
+    });
+  });
+});
+
+describe("shouldResetFieldsToServerValues", () => {
+  // Reproduces the reported bug: two consecutive error states (attempt 1
+  // failed, user edits, attempt 2 also failed) must NEVER trigger a reset --
+  // the in-progress edit the user made between the two failed submissions
+  // must survive.
+  it("is false when transitioning from idle to idle", () => {
+    const idle: SaveState = { status: "idle" };
+    expect(shouldResetFieldsToServerValues(idle, idle)).toBe(false);
+  });
+
+  it("is false when transitioning from idle to an error state", () => {
+    const idle: SaveState = { status: "idle" };
+    const error: SaveState = {
+      status: "error",
+      fieldErrors: { businessHoursText: "must be valid JSON" },
+      formError: null,
+      correlationId: null,
+    };
+    expect(shouldResetFieldsToServerValues(idle, error)).toBe(false);
+  });
+
+  it("is false when transitioning from one error state to ANOTHER error state (the reported bug)", () => {
+    const error1: SaveState = {
+      status: "error",
+      fieldErrors: { businessHoursText: "must be valid JSON" },
+      formError: null,
+      correlationId: null,
+    };
+    const error2: SaveState = {
+      status: "error",
+      fieldErrors: { businessHoursText: "must be valid JSON" },
+      formError: null,
+      correlationId: null,
+    };
+    expect(shouldResetFieldsToServerValues(error1, error2)).toBe(false);
+  });
+
+  it("is true when transitioning to a NEW saved state", () => {
+    const error: SaveState = {
+      status: "error",
+      fieldErrors: {},
+      formError: "Check the form and try again.",
+      correlationId: null,
+    };
+    const saved: SaveState = { status: "saved", settings: baseSettings };
+    expect(shouldResetFieldsToServerValues(error, saved)).toBe(true);
+  });
+
+  it("is false when the state object is referentially unchanged (no new transition, e.g. an unrelated parent re-render)", () => {
+    const saved: SaveState = { status: "saved", settings: baseSettings };
+    expect(shouldResetFieldsToServerValues(saved, saved)).toBe(false);
+  });
+});

@@ -1,0 +1,243 @@
+/**
+ * Server-only data layer for the conversation analytics dashboard (S13.5).
+ * Mirrors `lib/leads.ts`'s shape: a pure, unit-testable query resolver +
+ * a `getAnalyticsOverview()` that maps the backend's nested aggregate (or
+ * any error) into a discriminated `AnalyticsResult` the page renders --
+ * no silent fallbacks (CLAUDE.md §3): a backend error always becomes a
+ * visible, honest state, and a `null` rate is NEVER coerced to `0`.
+ *
+ * Constants below are sourced verbatim from the real backend, not invented:
+ *  - `ANALYTICS_BUCKETS` mirrors `_VALID_BUCKETS`
+ *    (services/api/src/api/analytics/repository.py:46) -- exactly
+ *    `{day, week}`, no `month`/`hour` (flagged backend gap, S13.5.md).
+ *  - The response shape mirrors `AnalyticsOverviewResponse`
+ *    (services/api/src/api/analytics/routes.py:78-89) exactly.
+ *  - `ANALYTICS_RANGES` is a UI choice (S13.5.md decision 5, Q1 default
+ *    30d, matching the backend's `analytics_default_window_days`), well
+ *    within the backend's `analytics_max_window_days` (366) cap.
+ */
+import "server-only";
+
+import { adminApiFetch, AdminApiError } from "@/lib/api";
+
+/** The two canonical bucket granularities (repository.py `_VALID_BUCKETS`). */
+export const ANALYTICS_BUCKETS = ["day", "week"] as const;
+
+export type AnalyticsBucket = (typeof ANALYTICS_BUCKETS)[number];
+
+/** Range presets (S13.5.md decision 5, Q1) -- day-spans mapped to absolute
+ * `from`/`to` by `resolveAnalyticsQuery`, all well within the backend's
+ * 366-day cap. */
+export const ANALYTICS_RANGES = [
+  { key: "7d", label: "Last 7 days", days: 7 },
+  { key: "30d", label: "Last 30 days", days: 30 },
+  { key: "90d", label: "Last 90 days", days: 90 },
+] as const;
+
+export type AnalyticsRangeKey = (typeof ANALYTICS_RANGES)[number]["key"];
+
+export const DEFAULT_RANGE_KEY: AnalyticsRangeKey = "30d";
+export const DEFAULT_BUCKET: AnalyticsBucket = "day";
+
+/** Camel-cased mirror of `AnalyticsOverviewResponse`
+ * (routes.py:78-89). `null` rates are preserved as `null` -- never
+ * coerced to `0` (Decision 6, the load-bearing no-silent-fallback
+ * property). No `tenant_id`/`visitor_id`/`conversation_id` -- the backend
+ * response is already leak-free by construction (S11.2 decision 9). */
+export interface AnalyticsOverview {
+  window: {
+    from: string;
+    to: string;
+    bucket: string;
+  };
+  totals: {
+    conversations: number;
+    userTurns: number;
+    botTurns: number;
+    decidedBotTurns: number;
+  };
+  intentDistribution: Record<string, number>;
+  decisionDistribution: Record<string, number>;
+  fallbackRate: number | null;
+  deflectionRate: number | null;
+  groundedRate: number | null;
+  schedule: {
+    ctaConversations: number;
+    conversions: number;
+    conversionRate: number | null;
+  };
+  series: {
+    bucketStart: string;
+    conversations: number;
+    answers: number;
+    escalations: number;
+    bookings: number;
+  }[];
+}
+
+interface AnalyticsOverviewResponseBody {
+  window: { from: string; to: string; bucket: string };
+  totals: {
+    conversations: number;
+    user_turns: number;
+    bot_turns: number;
+    decided_bot_turns: number;
+  };
+  intent_distribution: Record<string, number>;
+  decision_distribution: Record<string, number>;
+  fallback_rate: number | null;
+  deflection_rate: number | null;
+  grounded_rate: number | null;
+  schedule: {
+    cta_conversations: number;
+    conversions: number;
+    conversion_rate: number | null;
+  };
+  series: {
+    bucket_start: string;
+    conversations: number;
+    answers: number;
+    escalations: number;
+    bookings: number;
+  }[];
+}
+
+export type AnalyticsResult =
+  | { status: "ok"; data: AnalyticsOverview }
+  | { status: "error"; message: string; correlationId: string };
+
+export interface AnalyticsQueryParams {
+  range?: string;
+  bucket?: string;
+}
+
+/**
+ * Pure, unit-testable range/query resolver (decision 3/5). Drops an
+ * unknown/blank `range` -> default `30d`; drops an unknown/blank `bucket`
+ * -> default `day` (so a stray/hand-edited `?bucket=month` degrades to
+ * "day" rather than a guaranteed `422 INVALID_BUCKET` on first paint --
+ * Decision 5's belt-and-suspenders is the 422 mapping in
+ * `getAnalyticsOverview` below, for the rare case a bad value still
+ * reaches the backend). Computes `to = now(UTC)` / `from = to - days` and
+ * returns a URL-encoded query string via `URLSearchParams` (never
+ * string-concatenated raw).
+ */
+export function resolveAnalyticsQuery(params: AnalyticsQueryParams): string {
+  const rangeKey = params.range?.trim();
+  const range =
+    ANALYTICS_RANGES.find((r) => r.key === rangeKey) ??
+    ANALYTICS_RANGES.find((r) => r.key === DEFAULT_RANGE_KEY)!;
+
+  const bucketValue = params.bucket?.trim();
+  const bucket =
+    bucketValue && (ANALYTICS_BUCKETS as readonly string[]).includes(bucketValue)
+      ? (bucketValue as AnalyticsBucket)
+      : DEFAULT_BUCKET;
+
+  const to = new Date();
+  const from = new Date(to.getTime() - range.days * 24 * 60 * 60 * 1000);
+
+  const query = new URLSearchParams();
+  query.set("from", from.toISOString());
+  query.set("to", to.toISOString());
+  query.set("bucket", bucket);
+
+  return query.toString();
+}
+
+function toAnalyticsOverview(body: AnalyticsOverviewResponseBody): AnalyticsOverview {
+  return {
+    window: {
+      from: body.window.from,
+      to: body.window.to,
+      bucket: body.window.bucket,
+    },
+    totals: {
+      conversations: body.totals.conversations,
+      userTurns: body.totals.user_turns,
+      botTurns: body.totals.bot_turns,
+      decidedBotTurns: body.totals.decided_bot_turns,
+    },
+    intentDistribution: body.intent_distribution,
+    decisionDistribution: body.decision_distribution,
+    // `null` preserved as `null` -- never coerced to `0` (Decision 6a).
+    fallbackRate: body.fallback_rate,
+    deflectionRate: body.deflection_rate,
+    groundedRate: body.grounded_rate,
+    schedule: {
+      ctaConversations: body.schedule.cta_conversations,
+      conversions: body.schedule.conversions,
+      conversionRate: body.schedule.conversion_rate,
+    },
+    series: body.series.map((b) => ({
+      bucketStart: b.bucket_start,
+      conversations: b.conversations,
+      answers: b.answers,
+      escalations: b.escalations,
+      bookings: b.bookings,
+    })),
+  };
+}
+
+/**
+ * Fetch the caller's tenant conversation-analytics overview for the
+ * resolved range/bucket. Never sends a `tenant_id` -- scoping is entirely
+ * the backend's repository-layer job (CLAUDE.md §3). Never logs the
+ * response body (PII-minimal; the response is already PII-free by
+ * construction).
+ */
+export async function getAnalyticsOverview(
+  params: AnalyticsQueryParams
+): Promise<AnalyticsResult> {
+  const query = resolveAnalyticsQuery(params);
+
+  try {
+    const response = await adminApiFetch(`/admin/analytics/overview?${query}`);
+    const body = (await response.json()) as AnalyticsOverviewResponseBody;
+    return { status: "ok", data: toAnalyticsOverview(body) };
+  } catch (error) {
+    if (error instanceof AdminApiError) {
+      return { status: "error", message: mapErrorMessage(error), correlationId: error.correlationId };
+    }
+    // A network throw (not an AdminApiError) -- the request never reached
+    // (or never returned from) admin-api.
+    return {
+      status: "error",
+      message: "Unable to reach the server. Please try again.",
+      correlationId: "",
+    };
+  }
+}
+
+function mapErrorMessage(error: AdminApiError): string {
+  if (error.status === 403 || error.errorCode === "ROLE_NOT_PERMITTED") {
+    return "You do not have permission to view analytics.";
+  }
+  if (error.status === 401) {
+    return "Your session has expired. Please log in again.";
+  }
+  if (
+    error.errorCode === "INVALID_ANALYTICS_WINDOW" ||
+    error.errorCode === "ANALYTICS_WINDOW_TOO_LARGE" ||
+    error.errorCode === "INVALID_BUCKET"
+  ) {
+    return "That date range or bucket isn't valid -- showing the default window.";
+  }
+  return `Something went wrong (${error.errorCode || "UNKNOWN_ERROR"}). Correlation ID: ${
+    error.correlationId || "n/a"
+  }.`;
+}
+
+/**
+ * Format a `float | None` rate for display (Decision 6a, MANDATORY
+ * no-silent-fallback): `null` -> "No data" (a zero-denominator rate is
+ * genuinely unknown, NEVER a fabricated "0%"); a real number (including
+ * `0`) -> a percentage to 1 decimal place, trailing `.0` trimmed
+ * (`0 -> "0%"`, `0.4213 -> "42.1%"`, `1 -> "100%"`).
+ */
+export function formatRate(rate: number | null): string {
+  if (rate === null) return "No data";
+  const pct = rate * 100;
+  const rounded = Math.round(pct * 10) / 10;
+  return `${Number.isInteger(rounded) ? rounded : rounded.toFixed(1)}%`;
+}

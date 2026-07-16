@@ -1,0 +1,197 @@
+"use server";
+
+/**
+ * Tenant bot-settings save action (S13.6 decisions 4, 5, 7). Validates with
+ * the shared Zod schema + `parseBusinessHours` (courtesy pre-check; the
+ * backend is authoritative), then calls `PUT /admin/settings` via
+ * `adminApiFetch`.
+ *
+ * CONFIRMED, not optimistic (decision 4): on a `200`, the returned state
+ * carries the values from the PUT *response body* (the server's
+ * freshly-persisted unified settings, `settings_routes.py:99-100`), never
+ * the raw submitted `formData` -- so a backend-side normalization or
+ * concurrent change is reflected honestly. `revalidatePath("/settings")`
+ * re-syncs the RSC so a subsequent reload/navigation is consistent.
+ *
+ * Never logs the response body (mirrors `tenants/new/actions.ts`'s secrets
+ * hygiene, applied here to tenant config rather than credentials).
+ */
+import { revalidatePath } from "next/cache";
+import { AdminApiError, adminApiFetch } from "@/lib/api";
+import {
+  parseBusinessHours,
+  settingsFormSchema,
+} from "@/lib/settings-schema";
+import type { BotSettings } from "@/lib/settings";
+
+export interface SaveFieldErrors {
+  greeting?: string;
+  escalationPolicy?: string;
+  tone?: string;
+  businessHoursText?: string;
+}
+
+export interface SaveIdleState {
+  status: "idle";
+}
+
+export interface SaveErrorState {
+  status: "error";
+  fieldErrors: SaveFieldErrors;
+  /** General/banner-level message, when not tied to a single field. */
+  formError: string | null;
+  correlationId: string | null;
+}
+
+export interface SaveSuccessState {
+  status: "saved";
+  settings: BotSettings;
+}
+
+export type SaveState = SaveIdleState | SaveErrorState | SaveSuccessState;
+
+interface AdminBotSettingsResponseBody {
+  greeting: string | null;
+  business_hours: Record<string, unknown> | null;
+  escalation_policy: string | null;
+  tone: string | null;
+  answer_threshold: number;
+  escalate_threshold: number;
+  turn_cap: number;
+  llm_provider: string | null;
+  llm_model: string | null;
+}
+
+function toBotSettings(body: AdminBotSettingsResponseBody): BotSettings {
+  return {
+    greeting: body.greeting,
+    businessHours: body.business_hours,
+    escalationPolicy: body.escalation_policy,
+    tone: body.tone,
+    answerThreshold: body.answer_threshold,
+    escalateThreshold: body.escalate_threshold,
+    turnCap: body.turn_cap,
+    llmProvider: body.llm_provider,
+    llmModel: body.llm_model,
+  };
+}
+
+const GENERIC_NETWORK_ERROR = "Unable to reach the server. Please try again.";
+
+function errorState(partial: Omit<SaveErrorState, "status">): SaveErrorState {
+  return { status: "error", ...partial };
+}
+
+export async function saveSettings(
+  _prevState: SaveState,
+  formData: FormData
+): Promise<SaveState> {
+  const nullToUndefined = (value: FormDataEntryValue | null): string | undefined =>
+    value === null ? undefined : String(value);
+
+  const parsed = settingsFormSchema.safeParse({
+    greeting: nullToUndefined(formData.get("greeting")),
+    escalationPolicy: nullToUndefined(formData.get("escalationPolicy")),
+    tone: nullToUndefined(formData.get("tone")),
+    businessHoursText: String(formData.get("businessHoursText") ?? ""),
+  });
+
+  if (!parsed.success) {
+    const fieldErrors: SaveFieldErrors = {};
+    for (const issue of parsed.error.issues) {
+      const key = issue.path[0];
+      if (key === "greeting") fieldErrors.greeting ??= issue.message;
+      else if (key === "escalationPolicy") fieldErrors.escalationPolicy ??= issue.message;
+      else if (key === "tone") fieldErrors.tone ??= issue.message;
+    }
+    return errorState({
+      fieldErrors,
+      formError: Object.keys(fieldErrors).length === 0 ? "Check the form and try again." : null,
+      correlationId: null,
+    });
+  }
+
+  const { greeting, escalationPolicy, tone, businessHoursText } = parsed.data;
+
+  // Belt-and-suspenders JSON guard (decision 5) -- reject client-side and
+  // never call the backend on invalid business_hours.
+  const businessHoursResult = parseBusinessHours(businessHoursText);
+  if (!businessHoursResult.ok) {
+    return errorState({
+      fieldErrors: { businessHoursText: businessHoursResult.error },
+      formError: null,
+      correlationId: null,
+    });
+  }
+
+  const requestBody = {
+    greeting: greeting ?? null,
+    escalation_policy: escalationPolicy ?? null,
+    tone: tone ?? null,
+    business_hours: businessHoursResult.value,
+  };
+
+  let response: Response;
+  try {
+    response = await adminApiFetch("/admin/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
+    });
+  } catch (err) {
+    if (err instanceof AdminApiError) {
+      return mapAdminApiError(err);
+    }
+    // Network-level throw (not an AdminApiError).
+    return errorState({
+      fieldErrors: {},
+      formError: GENERIC_NETWORK_ERROR,
+      correlationId: null,
+    });
+  }
+
+  const body = (await response.json()) as AdminBotSettingsResponseBody;
+
+  revalidatePath("/settings");
+
+  return { status: "saved", settings: toBotSettings(body) };
+}
+
+function mapAdminApiError(err: AdminApiError): SaveErrorState {
+  if (err.status === 403 || err.errorCode === "ROLE_NOT_PERMITTED") {
+    return errorState({
+      fieldErrors: {},
+      formError: "You do not have permission to change these settings.",
+      correlationId: err.correlationId || null,
+    });
+  }
+
+  if (err.status === 401) {
+    return errorState({
+      fieldErrors: {},
+      formError: "Your session has expired. Please sign in again.",
+      correlationId: err.correlationId || null,
+    });
+  }
+
+  if (err.status === 422) {
+    // Pydantic body-validation 422s arrive in FastAPI's default `{detail}`
+    // shape (no `RequestValidationError` handler is registered -- see
+    // S13.6.md Investigation), so `err.errorCode`/`err.message` may be
+    // empty/undefined here. The client Zod pre-check mirrors the backend's
+    // max_lengths, so this path is belt-and-suspenders, not the normal one.
+    return errorState({
+      fieldErrors: {},
+      formError: "The server rejected one or more values — check the lengths and try again.",
+      correlationId: err.correlationId || null,
+    });
+  }
+
+  return errorState({
+    fieldErrors: {},
+    formError: `${err.message || "Something went wrong."} (correlation ID: ${
+      err.correlationId || "unknown"
+    })`,
+    correlationId: err.correlationId || null,
+  });
+}

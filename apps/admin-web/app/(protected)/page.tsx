@@ -44,6 +44,21 @@ export default async function ProtectedHomePage() {
           Upload knowledge
         </Link>
       ) : null}
+      {claims.role === "CLIENT_ADMIN" || claims.role === "CLIENT_AGENT" ? (
+        <Link href="/leads" className={buttonVariants({ variant: "secondary" })}>
+          Review leads
+        </Link>
+      ) : null}
+      {claims.role === "CLIENT_ADMIN" || claims.role === "CLIENT_AGENT" ? (
+        <Link href="/analytics" className={buttonVariants({ variant: "secondary" })}>
+          View analytics
+        </Link>
+      ) : null}
+      {claims.role === "CLIENT_ADMIN" || claims.role === "CLIENT_AGENT" ? (
+        <Link href="/settings" className={buttonVariants({ variant: "secondary" })}>
+          Bot settings
+        </Link>
+      ) : null}
       <form action={logout}>
         <Button type="submit" variant="outline">
           Log out
