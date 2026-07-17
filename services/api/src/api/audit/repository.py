@@ -10,17 +10,33 @@ Every method:
 Data model (migration 0017):
 - ``audit_events(tenant_id PK, event_id PK, actor, action, target_type,
   target_id, metadata jsonb, created_at)``.
+
+S12.7 (platform-admin super-user, D4): ``record_audit`` accepts an optional
+``actor_context`` -- the ``api.auth.dependencies.PlatformAdminActor`` a
+tenant-explicit-route caller stashes on ``request.state.platform_admin_actor``
+when a PLATFORM_ADMIN reached tenant X via ``resolve_tenant_scope``. When
+present, the row's ``metadata`` gains ``platform_admin: true`` and
+``platform_admin_role`` -- an honest, invisible-to-the-operator marker that a
+super-user (not tenant X's own admin) made this change. ``actor`` is left
+UNCHANGED (``claims.subject`` -- already the real platform admin's own id,
+because ``resolve_tenant_scope`` preserves the real ``subject`` on the
+derived claims; D1's "no JWT/identity mutation" carries through for free).
+For a normal ``CLIENT_ADMIN`` write, ``actor_context`` is ``None`` and no
+marker is added -- behavior is byte-for-byte unchanged.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from common.auth import AuthClaims
 from common.db import Database
 from common.errors import ValidationError
+
+if TYPE_CHECKING:
+    from api.auth.dependencies import PlatformAdminActor
 
 
 @dataclass(frozen=True)
@@ -57,15 +73,28 @@ async def record_audit(
     target_type: str | None = None,
     target_id: str | None = None,
     metadata: dict[str, Any] | None = None,
+    actor_context: PlatformAdminActor | None = None,
 ) -> str:
     """Insert a new ``audit_events`` row.
 
     Returns the ``event_id`` (uuid4().hex). The ``metadata`` dict is stored
     as jsonb (the default codec handles dict→jsonb conversion).
+
+    ``actor_context`` (S12.7 D4): when the caller is a platform admin acting
+    on a tenant-explicit route, pass the ``PlatformAdminActor`` stashed on
+    ``request.state.platform_admin_actor``. The row's ``metadata`` then gains
+    ``platform_admin: true`` and ``platform_admin_role`` -- merged in without
+    overwriting any keys the caller already supplied. ``actor`` stays
+    ``claims.subject`` either way (already the real actor id).
     """
     _reject_global(claims)
 
     new_event_id = uuid4().hex
+    row_metadata: dict[str, Any] | None = metadata
+    if actor_context is not None:
+        row_metadata = {**(metadata or {}), "platform_admin": True,
+                         "platform_admin_role": actor_context.role.value}
+
     params: list[Any] = [
         claims.tenant_id,
         new_event_id,
@@ -73,7 +102,7 @@ async def record_audit(
         action,
         target_type,
         target_id,
-        metadata,  # jsonb
+        row_metadata,  # jsonb
     ]
     await db.execute(
         "INSERT INTO audit_events "

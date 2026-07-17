@@ -35,8 +35,8 @@ export default async function ProtectedHomePage() {
         </p>
       </div>
       {claims.role === "PLATFORM_ADMIN" ? (
-        <Link href="/tenants/new" className={buttonVariants({ variant: "secondary" })}>
-          Onboard a client
+        <Link href="/clients" className={buttonVariants({ variant: "secondary" })}>
+          Clients
         </Link>
       ) : null}
       {claims.role === "CLIENT_ADMIN" ? (

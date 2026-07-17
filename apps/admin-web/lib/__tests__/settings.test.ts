@@ -135,4 +135,54 @@ describe("getBotSettings", () => {
     expect(logSpy).not.toHaveBeenCalled();
     expect(errorSpy).not.toHaveBeenCalled();
   });
+
+  it("targets the implicit /admin/settings path when tenantId is omitted", async () => {
+    getMock.mockReturnValue(undefined);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          greeting: null,
+          business_hours: null,
+          escalation_policy: null,
+          tone: null,
+          answer_threshold: 0.7,
+          escalate_threshold: 0.4,
+          turn_cap: 7,
+          llm_provider: null,
+          llm_model: null,
+        }),
+        { status: 200 }
+      )
+    );
+
+    await getBotSettings();
+
+    const [url] = fetchSpy.mock.calls[0] as [string];
+    expect(url).toBe("http://localhost:8000/admin/settings");
+  });
+
+  it("targets the S12.7 tenant-scoped path when tenantId is provided (PLATFORM_ADMIN)", async () => {
+    getMock.mockReturnValue(undefined);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          greeting: null,
+          business_hours: null,
+          escalation_policy: null,
+          tone: null,
+          answer_threshold: 0.7,
+          escalate_threshold: 0.4,
+          turn_cap: 7,
+          llm_provider: null,
+          llm_model: null,
+        }),
+        { status: 200 }
+      )
+    );
+
+    await getBotSettings("tenant-x");
+
+    const [url] = fetchSpy.mock.calls[0] as [string];
+    expect(url).toBe("http://localhost:8000/admin/tenants/tenant-x/settings");
+  });
 });

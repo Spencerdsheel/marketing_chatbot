@@ -238,4 +238,28 @@ describe("listLeads", () => {
     expect(consoleSpy).not.toHaveBeenCalled();
     expect(errorSpy).not.toHaveBeenCalled();
   });
+
+  it("targets the implicit /admin/leads path when tenantId is omitted", async () => {
+    getMock.mockReturnValue(undefined);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ items: [], total: 0, limit: 25, offset: 0 }), { status: 200 })
+    );
+
+    await listLeads({ page: 1 });
+
+    const [url] = fetchSpy.mock.calls[0] as [string];
+    expect(url).toBe("http://localhost:8000/admin/leads?limit=25&offset=0");
+  });
+
+  it("targets the S12.7 tenant-scoped path when tenantId is provided (PLATFORM_ADMIN)", async () => {
+    getMock.mockReturnValue(undefined);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ items: [], total: 0, limit: 25, offset: 0 }), { status: 200 })
+    );
+
+    await listLeads({ page: 1 }, "tenant-x");
+
+    const [url] = fetchSpy.mock.calls[0] as [string];
+    expect(url).toBe("http://localhost:8000/admin/tenants/tenant-x/leads?limit=25&offset=0");
+  });
 });

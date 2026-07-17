@@ -25,7 +25,8 @@ from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
-from api.auth.dependencies import require_roles
+from api.audit.repository import record_audit
+from api.auth.dependencies import get_platform_admin_actor, require_roles, resolve_tenant_scope
 from api.auth.repository import get_user_by_id
 from api.leads.pipeline import (
     _STATUS_BY_STAGE,
@@ -52,6 +53,7 @@ _log = get_logger(__name__)
 _NOTE_MAX_LENGTH = 4000
 
 router = APIRouter(prefix="/admin/leads", tags=["leads"])
+tenant_scoped_router = APIRouter(prefix="/admin/tenants/{tenant_id}/leads", tags=["leads"])
 
 
 class LeadStageUpdateRequest(BaseModel):
@@ -196,17 +198,17 @@ def _lead_to_csv_row(lead: Lead) -> list[str]:
     ]
 
 
-@router.get("")
-async def list_leads_route(
+async def _list_leads(
     request: Request,
-    limit: int = Query(default=50),
-    offset: int = Query(default=0),
-    stage: str | None = Query(default=None),
-    status_: str | None = Query(default=None, alias="status"),
-    assigned_agent_id: str | None = Query(default=None),
-    created_from: datetime | None = Query(default=None, alias="from"),  # noqa: B008
-    created_to: datetime | None = Query(default=None, alias="to"),  # noqa: B008
-    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+    claims: AuthClaims,
+    *,
+    limit: int,
+    offset: int,
+    stage: str | None,
+    status_: str | None,
+    assigned_agent_id: str | None,
+    created_from: datetime | None,
+    created_to: datetime | None,
 ) -> LeadListResponse:
     """List/filter the caller's tenant leads, newest first, paginated (S12.4).
 
@@ -276,10 +278,50 @@ async def list_leads_route(
     )
 
 
-@router.get("/export")
-async def export_leads(
+@router.get("")
+async def list_leads_route(
     request: Request,
+    limit: int = Query(default=50),
+    offset: int = Query(default=0),
+    stage: str | None = Query(default=None),
+    status_: str | None = Query(default=None, alias="status"),
+    assigned_agent_id: str | None = Query(default=None),
+    created_from: datetime | None = Query(default=None, alias="from"),  # noqa: B008
+    created_to: datetime | None = Query(default=None, alias="to"),  # noqa: B008
     claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> LeadListResponse:
+    return await _list_leads(
+        request, claims,
+        limit=limit, offset=offset, stage=stage, status_=status_,
+        assigned_agent_id=assigned_agent_id,
+        created_from=created_from, created_to=created_to,
+    )
+
+
+@tenant_scoped_router.get("")
+async def list_leads_route_for_tenant(
+    request: Request,
+    limit: int = Query(default=50),
+    offset: int = Query(default=0),
+    stage: str | None = Query(default=None),
+    status_: str | None = Query(default=None, alias="status"),
+    assigned_agent_id: str | None = Query(default=None),
+    created_from: datetime | None = Query(default=None, alias="from"),  # noqa: B008
+    created_to: datetime | None = Query(default=None, alias="to"),  # noqa: B008
+    claims: AuthClaims = Depends(resolve_tenant_scope(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> LeadListResponse:
+    """PLATFORM_ADMIN super-user variant of ``GET /admin/leads`` (S12.7)."""
+    return await _list_leads(
+        request, claims,
+        limit=limit, offset=offset, stage=stage, status_=status_,
+        assigned_agent_id=assigned_agent_id,
+        created_from=created_from, created_to=created_to,
+    )
+
+
+async def _export_leads(
+    request: Request,
+    claims: AuthClaims,
 ) -> StreamingResponse:
     """Stream a tenant-scoped CSV export of leads (S7.4 decision 5).
 
@@ -328,11 +370,29 @@ async def export_leads(
     )
 
 
-@router.get("/{lead_id}")
-async def get_lead_detail(
-    lead_id: str,
+@router.get("/export")
+async def export_leads(
     request: Request,
     claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> StreamingResponse:
+    return await _export_leads(request, claims)
+
+
+@tenant_scoped_router.get("/export")
+async def export_leads_for_tenant(
+    request: Request,
+    claims: AuthClaims = Depends(resolve_tenant_scope(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> StreamingResponse:
+    """PLATFORM_ADMIN super-user variant of ``GET /admin/leads/export`` (S12.7).
+
+    NOTE: registered ABOVE ``GET /{lead_id}`` on ``tenant_scoped_router`` too,
+    for the same declaration-order reason as the implicit route.
+    """
+    return await _export_leads(request, claims)
+
+
+async def _get_lead_detail(
+    lead_id: str, request: Request, claims: AuthClaims,
 ) -> LeadDetailResponse:
     """Fetch a lead's pipeline detail. Returns 404 if missing or cross-tenant."""
     db = request.app.state.db
@@ -344,12 +404,27 @@ async def get_lead_detail(
     return _to_response(lead)
 
 
-@router.patch("/{lead_id}")
-async def patch_lead_stage(
+@router.get("/{lead_id}")
+async def get_lead_detail(
     lead_id: str,
-    body: LeadStageUpdateRequest,
     request: Request,
     claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> LeadDetailResponse:
+    return await _get_lead_detail(lead_id, request, claims)
+
+
+@tenant_scoped_router.get("/{lead_id}")
+async def get_lead_detail_for_tenant(
+    lead_id: str,
+    request: Request,
+    claims: AuthClaims = Depends(resolve_tenant_scope(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> LeadDetailResponse:
+    """PLATFORM_ADMIN super-user variant of ``GET /admin/leads/{lead_id}`` (S12.7)."""
+    return await _get_lead_detail(lead_id, request, claims)
+
+
+async def _patch_lead_stage(
+    lead_id: str, body: LeadStageUpdateRequest, request: Request, claims: AuthClaims,
 ) -> LeadDetailResponse:
     """Move a lead to a new pipeline stage.
 
@@ -405,6 +480,16 @@ async def patch_lead_stage(
         actor=claims.subject,
     )
 
+    await record_audit(
+        db,
+        claims,
+        action="lead_stage_transitioned",
+        target_type="lead",
+        target_id=lead_id,
+        metadata={"from_stage": lead.stage, "to_stage": body.stage},
+        actor_context=get_platform_admin_actor(request),
+    )
+
     # PII-safe transition log: lead_id/tenant_id/from_stage/to_stage/event only.
     _log.info(
         "lead stage transitioned",
@@ -420,12 +505,29 @@ async def patch_lead_stage(
     return _to_response(updated)
 
 
-@router.post("/{lead_id}/notes", status_code=status.HTTP_201_CREATED)
-async def post_lead_note(
+@router.patch("/{lead_id}")
+async def patch_lead_stage(
     lead_id: str,
-    body: LeadNoteRequest,
+    body: LeadStageUpdateRequest,
     request: Request,
     claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> LeadDetailResponse:
+    return await _patch_lead_stage(lead_id, body, request, claims)
+
+
+@tenant_scoped_router.patch("/{lead_id}")
+async def patch_lead_stage_for_tenant(
+    lead_id: str,
+    body: LeadStageUpdateRequest,
+    request: Request,
+    claims: AuthClaims = Depends(resolve_tenant_scope(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> LeadDetailResponse:
+    """PLATFORM_ADMIN super-user variant of ``PATCH /admin/leads/{lead_id}`` (S12.7)."""
+    return await _patch_lead_stage(lead_id, body, request, claims)
+
+
+async def _post_lead_note(
+    lead_id: str, body: LeadNoteRequest, request: Request, claims: AuthClaims,
 ) -> LeadActivityResponse:
     """Append a free-text note to a lead's timeline.
 
@@ -446,6 +548,17 @@ async def post_lead_note(
         type="note",
         payload={"text": body.text},
         actor=claims.subject,
+    )
+
+    # Audit metadata is PII-free (note text is intentionally excluded).
+    await record_audit(
+        db,
+        claims,
+        action="lead_note_added",
+        target_type="lead",
+        target_id=lead_id,
+        metadata={"activity_id": activity_id},
+        actor_context=get_platform_admin_actor(request),
     )
 
     _log.info(
@@ -469,12 +582,29 @@ async def post_lead_note(
     )
 
 
-@router.post("/{lead_id}/assignment")
-async def post_lead_assignment(
+@router.post("/{lead_id}/notes", status_code=status.HTTP_201_CREATED)
+async def post_lead_note(
     lead_id: str,
-    body: LeadAssignmentRequest,
+    body: LeadNoteRequest,
     request: Request,
     claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> LeadActivityResponse:
+    return await _post_lead_note(lead_id, body, request, claims)
+
+
+@tenant_scoped_router.post("/{lead_id}/notes", status_code=status.HTTP_201_CREATED)
+async def post_lead_note_for_tenant(
+    lead_id: str,
+    body: LeadNoteRequest,
+    request: Request,
+    claims: AuthClaims = Depends(resolve_tenant_scope(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> LeadActivityResponse:
+    """PLATFORM_ADMIN super-user variant of ``POST /admin/leads/{lead_id}/notes`` (S12.7)."""
+    return await _post_lead_note(lead_id, body, request, claims)
+
+
+async def _post_lead_assignment(
+    lead_id: str, body: LeadAssignmentRequest, request: Request, claims: AuthClaims,
 ) -> LeadDetailResponse:
     """Assign a lead to a same-tenant, active ``CLIENT_AGENT``.
 
@@ -515,6 +645,16 @@ async def post_lead_assignment(
         actor=claims.subject,
     )
 
+    await record_audit(
+        db,
+        claims,
+        action="lead_assigned",
+        target_type="lead",
+        target_id=lead_id,
+        metadata={"agent_id": body.agent_id, "previous_agent_id": lead.assigned_agent_id},
+        actor_context=get_platform_admin_actor(request),
+    )
+
     _log.info(
         "lead assigned",
         extra={
@@ -529,11 +669,29 @@ async def post_lead_assignment(
     return _to_response(updated)
 
 
-@router.get("/{lead_id}/activities")
-async def get_lead_activities(
+@router.post("/{lead_id}/assignment")
+async def post_lead_assignment(
     lead_id: str,
+    body: LeadAssignmentRequest,
     request: Request,
     claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> LeadDetailResponse:
+    return await _post_lead_assignment(lead_id, body, request, claims)
+
+
+@tenant_scoped_router.post("/{lead_id}/assignment")
+async def post_lead_assignment_for_tenant(
+    lead_id: str,
+    body: LeadAssignmentRequest,
+    request: Request,
+    claims: AuthClaims = Depends(resolve_tenant_scope(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> LeadDetailResponse:
+    """PLATFORM_ADMIN super-user variant of ``POST /admin/leads/{lead_id}/assignment`` (S12.7)."""
+    return await _post_lead_assignment(lead_id, body, request, claims)
+
+
+async def _get_lead_activities(
+    lead_id: str, request: Request, claims: AuthClaims,
 ) -> list[LeadActivityResponse]:
     """Fetch a lead's timeline, newest first. 404 if missing or cross-tenant."""
     db = request.app.state.db
@@ -544,3 +702,22 @@ async def get_lead_activities(
 
     activities = await list_activities(db, claims, lead_id)
     return [_to_activity_response(a) for a in activities]
+
+
+@router.get("/{lead_id}/activities")
+async def get_lead_activities(
+    lead_id: str,
+    request: Request,
+    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> list[LeadActivityResponse]:
+    return await _get_lead_activities(lead_id, request, claims)
+
+
+@tenant_scoped_router.get("/{lead_id}/activities")
+async def get_lead_activities_for_tenant(
+    lead_id: str,
+    request: Request,
+    claims: AuthClaims = Depends(resolve_tenant_scope(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> list[LeadActivityResponse]:
+    """PLATFORM_ADMIN super-user variant of ``GET /admin/leads/{lead_id}/activities`` (S12.7)."""
+    return await _get_lead_activities(lead_id, request, claims)

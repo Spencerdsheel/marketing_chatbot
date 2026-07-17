@@ -25,12 +25,15 @@ from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.analytics.repository import AnalyticsOverview, get_analytics_overview
-from api.auth.dependencies import require_roles
+from api.auth.dependencies import require_roles, resolve_tenant_scope
 from api.config import get_api_settings
 
 _log = get_logger(__name__)
 
 router = APIRouter(prefix="/admin/analytics", tags=["analytics"])
+tenant_scoped_router = APIRouter(
+    prefix="/admin/tenants/{tenant_id}/analytics", tags=["analytics"]
+)
 
 
 class AnalyticsBucketResponse(BaseModel):
@@ -134,13 +137,13 @@ def _as_utc(value: datetime) -> datetime:
     return value
 
 
-@router.get("/overview")
-async def get_overview(
+async def _get_overview(
     request: Request,
-    date_from: datetime | None = Query(default=None, alias="from"),  # noqa: B008
-    date_to: datetime | None = Query(default=None, alias="to"),  # noqa: B008
-    bucket: str = Query(default="day"),  # noqa: B008
-    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+    claims: AuthClaims,
+    *,
+    date_from: datetime | None,
+    date_to: datetime | None,
+    bucket: str,
 ) -> AnalyticsOverviewResponse:
     """Return the tenant-scoped conversation-analytics overview.
 
@@ -194,3 +197,26 @@ async def get_overview(
     )
 
     return _to_response(overview)
+
+
+@router.get("/overview")
+async def get_overview(
+    request: Request,
+    date_from: datetime | None = Query(default=None, alias="from"),  # noqa: B008
+    date_to: datetime | None = Query(default=None, alias="to"),  # noqa: B008
+    bucket: str = Query(default="day"),  # noqa: B008
+    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> AnalyticsOverviewResponse:
+    return await _get_overview(request, claims, date_from=date_from, date_to=date_to, bucket=bucket)
+
+
+@tenant_scoped_router.get("/overview")
+async def get_overview_for_tenant(
+    request: Request,
+    date_from: datetime | None = Query(default=None, alias="from"),  # noqa: B008
+    date_to: datetime | None = Query(default=None, alias="to"),  # noqa: B008
+    bucket: str = Query(default="day"),  # noqa: B008
+    claims: AuthClaims = Depends(resolve_tenant_scope(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> AnalyticsOverviewResponse:
+    """PLATFORM_ADMIN super-user variant of ``GET /admin/analytics/overview`` (S12.7)."""
+    return await _get_overview(request, claims, date_from=date_from, date_to=date_to, bucket=bucket)

@@ -65,6 +65,7 @@ describe("saveSettings", () => {
     );
 
     const state = await saveSettings(
+      undefined,
       { status: "idle" },
       buildFormData({ greeting: "What the user typed" })
     );
@@ -78,6 +79,7 @@ describe("saveSettings", () => {
 
   it("rejects an invalid business_hours textarea without calling adminApiFetch", async () => {
     const state = await saveSettings(
+      undefined,
       { status: "idle" },
       buildFormData({ businessHoursText: "{" })
     );
@@ -91,6 +93,7 @@ describe("saveSettings", () => {
 
   it("rejects a business_hours array without calling adminApiFetch", async () => {
     const state = await saveSettings(
+      undefined,
       { status: "idle" },
       buildFormData({ businessHoursText: "[1,2]" })
     );
@@ -104,6 +107,7 @@ describe("saveSettings", () => {
 
   it("rejects an over-length greeting client-side without calling adminApiFetch", async () => {
     const state = await saveSettings(
+      undefined,
       { status: "idle" },
       buildFormData({ greeting: "a".repeat(2001) })
     );
@@ -117,6 +121,7 @@ describe("saveSettings", () => {
 
   it("rejects an over-length tone client-side without calling adminApiFetch", async () => {
     const state = await saveSettings(
+      undefined,
       { status: "idle" },
       buildFormData({ tone: "a".repeat(101) })
     );
@@ -137,7 +142,7 @@ describe("saveSettings", () => {
       })
     );
 
-    const state = await saveSettings({ status: "idle" }, buildFormData());
+    const state = await saveSettings(undefined, { status: "idle" }, buildFormData());
 
     expect(state.status).toBe("error");
     if (state.status === "error") {
@@ -154,7 +159,7 @@ describe("saveSettings", () => {
       })
     );
 
-    const state = await saveSettings({ status: "idle" }, buildFormData());
+    const state = await saveSettings(undefined, { status: "idle" }, buildFormData());
 
     expect(state.status).toBe("error");
     if (state.status === "error") {
@@ -173,7 +178,7 @@ describe("saveSettings", () => {
       })
     );
 
-    const state = await saveSettings({ status: "idle" }, buildFormData());
+    const state = await saveSettings(undefined, { status: "idle" }, buildFormData());
 
     expect(state.status).toBe("error");
     if (state.status === "error") {
@@ -190,7 +195,7 @@ describe("saveSettings", () => {
       })
     );
 
-    const state = await saveSettings({ status: "idle" }, buildFormData());
+    const state = await saveSettings(undefined, { status: "idle" }, buildFormData());
 
     expect(state.status).toBe("error");
     if (state.status === "error") {
@@ -201,7 +206,7 @@ describe("saveSettings", () => {
   it("returns a network-failure message when adminApiFetch throws a non-AdminApiError", async () => {
     adminApiFetchMock.mockRejectedValue(new TypeError("fetch failed"));
 
-    const state = await saveSettings({ status: "idle" }, buildFormData());
+    const state = await saveSettings(undefined, { status: "idle" }, buildFormData());
 
     expect(state.status).toBe("error");
     if (state.status === "error") {
@@ -227,13 +232,13 @@ describe("saveSettings", () => {
       )
     );
 
-    await saveSettings({ status: "idle" }, buildFormData());
+    await saveSettings(undefined, { status: "idle" }, buildFormData());
 
     expect(revalidatePathMock).toHaveBeenCalledWith("/settings");
   });
 
   it("does not call revalidatePath on a client-side validation failure", async () => {
-    await saveSettings({ status: "idle" }, buildFormData({ businessHoursText: "{" }));
+    await saveSettings(undefined, { status: "idle" }, buildFormData({ businessHoursText: "{" }));
 
     expect(revalidatePathMock).not.toHaveBeenCalled();
   });
@@ -260,12 +265,39 @@ describe("saveSettings", () => {
       )
     );
 
-    await saveSettings({ status: "idle" }, buildFormData());
+    await saveSettings(undefined, { status: "idle" }, buildFormData());
 
     for (const spy of [logSpy, errorSpy, warnSpy]) {
       for (const call of spy.mock.calls) {
         expect(call.join(" ")).not.toContain("A secret internal greeting fixture");
       }
     }
+  });
+
+  it("targets the S12.7 tenant-scoped PUT path and revalidates the client screen when tenantId is bound", async () => {
+    adminApiFetchMock.mockResolvedValue(
+      jsonResponse(
+        {
+          greeting: "Hi there!",
+          business_hours: null,
+          escalation_policy: "Escalate on refunds.",
+          tone: "friendly",
+          answer_threshold: 0.7,
+          escalate_threshold: 0.4,
+          turn_cap: 7,
+          llm_provider: null,
+          llm_model: null,
+        },
+        200
+      )
+    );
+
+    await saveSettings("tenant-x", { status: "idle" }, buildFormData());
+
+    expect(adminApiFetchMock).toHaveBeenCalledWith(
+      "/admin/tenants/tenant-x/settings",
+      expect.objectContaining({ method: "PUT" })
+    );
+    expect(revalidatePathMock).toHaveBeenCalledWith("/clients/tenant-x/settings");
   });
 });

@@ -81,11 +81,13 @@ function StatusPanel({
   initialRunId,
   initialDocStatus,
   idempotent,
+  tenantId,
 }: {
   docId: string;
   initialRunId: string | null;
   initialDocStatus: string;
   idempotent: boolean;
+  tenantId?: string;
 }) {
   const [result, setResult] = useState<DocStatusResult | null>(null);
   const [cappedOut, setCappedOut] = useState(false);
@@ -102,7 +104,7 @@ function StatusPanel({
   // behavior is unit-testable with fake timers.
   useEffect(() => {
     const stop = schedulePolling<DocStatusResult>({
-      pollOnce: () => getDocStatus(docId),
+      pollOnce: () => getDocStatus(docId, tenantId),
       isTerminal: (r) => r.status === "error" || (r.status === "ok" && isTerminalRunStatus(r.run?.status ?? "queued")),
       onResult: (r) => setResult(r),
       onCapped: () => setCappedOut(true),
@@ -110,12 +112,12 @@ function StatusPanel({
       maxPolls: MAX_POLLS,
     });
     return stop;
-  }, [docId]);
+  }, [docId, tenantId]);
 
   // Manual "Refresh status" -- fires a one-off poll outside the driver
   // (safe post-cap or pre-cap alike); does not re-arm automatic polling.
   function manualRefresh() {
-    void getDocStatus(docId).then(setResult);
+    void getDocStatus(docId, tenantId).then(setResult);
   }
 
   return (
@@ -162,7 +164,9 @@ function StatusPanel({
         <Button
           type="button"
           variant={terminal ? "default" : "ghost"}
-          onClick={() => window.location.assign("/knowledge")}
+          onClick={() =>
+            window.location.assign(tenantId ? `/clients/${tenantId}/knowledge` : "/knowledge")
+          }
         >
           Upload another
         </Button>
@@ -243,8 +247,14 @@ function RunStatusBody({
   return <p className="text-sm text-muted-foreground">Status: {status}</p>;
 }
 
-export function UploadForm() {
-  const [state, formAction] = useActionState(uploadKnowledge, initialState);
+/**
+ * `tenantId` (S13.7): when provided, the per-client knowledge screen renders
+ * this same form binding `uploadKnowledge` to the S12.7 tenant-scoped upload
+ * route (`uploadKnowledge.bind(null, tenantId)`) -- reused as-is, not
+ * rewritten. `undefined` preserves the existing CLIENT_ADMIN behavior.
+ */
+export function UploadForm({ tenantId }: { tenantId?: string } = {}) {
+  const [state, formAction] = useActionState(uploadKnowledge.bind(null, tenantId), initialState);
   const [clientError, setClientError] = useState<string | null>(null);
   const fileInputId = useId();
 
@@ -275,6 +285,7 @@ export function UploadForm() {
         initialRunId={state.runId}
         initialDocStatus={state.docStatus}
         idempotent={state.idempotent}
+        tenantId={tenantId}
       />
     );
   }

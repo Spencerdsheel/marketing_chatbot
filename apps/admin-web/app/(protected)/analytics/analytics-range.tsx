@@ -12,15 +12,23 @@ const BUCKET_LABELS: Record<AnalyticsBucket, string> = {
   week: "Week",
 };
 
+/**
+ * `basePath` (S13.7): the per-client analytics screen passes
+ * `/clients/{tenantId}/analytics` so the range/bucket form stays on that
+ * same tenant-scoped route instead of the implicit `/analytics`. Defaults to
+ * `/analytics`, preserving the existing CLIENT_ADMIN/AGENT behavior.
+ */
 export function AnalyticsRange({
   currentRange,
   currentBucket,
+  basePath = "/analytics",
 }: {
   currentRange: AnalyticsRangeKey;
   currentBucket: AnalyticsBucket;
+  basePath?: string;
 }) {
   return (
-    <form action="/analytics" method="get" className="flex flex-wrap items-end gap-3">
+    <form action={basePath} method="get" className="flex flex-wrap items-end gap-3">
       <div className="flex flex-col gap-1">
         <label htmlFor="range" className="text-xs font-medium text-muted-foreground">
           Date range

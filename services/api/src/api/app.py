@@ -173,16 +173,24 @@ def create_app() -> FastAPI:
     # -- Routers ---------------------------------------------------------------
     from api.admin.routes import router as admin_router
     from api.admin.settings_routes import router as admin_settings_router
+    from api.admin.settings_routes import tenant_scoped_router as admin_settings_tenant_router
     from api.admin.users_routes import router as admin_users_router
     from api.analytics.routes import router as analytics_router
+    from api.analytics.routes import tenant_scoped_router as analytics_tenant_router
     from api.audit.routes import router as audit_router
+    from api.audit.routes import tenant_scoped_router as audit_tenant_router
     from api.auth.routes import router as auth_router
     from api.conversation_store.admin_routes import router as conversation_admin_router
+    from api.conversation_store.admin_routes import (
+        tenant_scoped_router as conversation_admin_tenant_router,
+    )
     from api.conversation_store.routes import router as conversation_router
     from api.crm.routes import router as crm_router
     from api.gateway.routes import router as gateway_router
     from api.ingestion.routes import router as ingestion_router
+    from api.ingestion.routes import tenant_scoped_router as ingestion_tenant_router
     from api.leads.admin_routes import router as leads_admin_router
+    from api.leads.admin_routes import tenant_scoped_router as leads_admin_tenant_router
     from api.leads.routes import router as leads_router
     from api.llm.routes import router as llm_router
     from api.notifications.admin_routes import router as notifications_admin_router
@@ -216,6 +224,18 @@ def create_app() -> FastAPI:
     app.include_router(scheduling_router)
     app.include_router(tasks_router)
     app.include_router(tenants_router)
+
+    # -- Platform-admin tenant-explicit routers (S12.7) -------------------------
+    # /admin/tenants/{tenant_id}/... -- same business logic as the routers
+    # above, reached via resolve_tenant_scope instead of require_roles. The
+    # implicit routers above are byte-for-byte unchanged for CLIENT_ADMIN/
+    # CLIENT_AGENT.
+    app.include_router(admin_settings_tenant_router)
+    app.include_router(analytics_tenant_router)
+    app.include_router(audit_tenant_router)
+    app.include_router(conversation_admin_tenant_router)
+    app.include_router(ingestion_tenant_router)
+    app.include_router(leads_admin_tenant_router)
 
     # -- Routes ----------------------------------------------------------------
     @app.get("/healthz")

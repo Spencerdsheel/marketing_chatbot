@@ -264,4 +264,30 @@ describe("getAnalyticsOverview", () => {
     expect(consoleSpy).not.toHaveBeenCalled();
     expect(errorSpy).not.toHaveBeenCalled();
   });
+
+  it("targets the implicit /admin/analytics/overview path when tenantId is omitted", async () => {
+    getMock.mockReturnValue(undefined);
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify(makeBody()), { status: 200 }));
+
+    await getAnalyticsOverview({});
+
+    const [url] = fetchSpy.mock.calls[0] as [string];
+    expect(url.startsWith("http://localhost:8000/admin/analytics/overview?")).toBe(true);
+  });
+
+  it("targets the S12.7 tenant-scoped path when tenantId is provided (PLATFORM_ADMIN)", async () => {
+    getMock.mockReturnValue(undefined);
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify(makeBody()), { status: 200 }));
+
+    await getAnalyticsOverview({}, "tenant-x");
+
+    const [url] = fetchSpy.mock.calls[0] as [string];
+    expect(
+      url.startsWith("http://localhost:8000/admin/tenants/tenant-x/analytics/overview?")
+    ).toBe(true);
+  });
 });

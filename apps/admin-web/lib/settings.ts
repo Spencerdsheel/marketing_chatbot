@@ -56,13 +56,23 @@ function toBotSettings(body: AdminBotSettingsResponseBody): BotSettings {
 }
 
 /**
- * Fetch the caller's tenant bot settings. Never sends a `tenant_id` --
- * scoping is entirely the backend's repository-layer job from the caller's
- * own claims (CLAUDE.md §3). Never logs the response body.
+ * Fetch the caller's tenant bot settings. Never sends a `tenant_id` in the
+ * BODY -- scoping is entirely the backend's repository-layer job from the
+ * caller's own claims (CLAUDE.md §3). Never logs the response body.
+ *
+ * `tenantId` (S13.7): when provided, targets the S12.7 PLATFORM_ADMIN
+ * super-user surface `GET /admin/tenants/{tenantId}/settings` instead of the
+ * implicit `GET /admin/settings` -- the SAME response shape
+ * (settings_routes.py `_get_settings`), only the URL prefix differs. The
+ * `{tenantId}` always comes from the route segment the per-client screen is
+ * mounted under, never client state (D1).
  */
-export async function getBotSettings(): Promise<SettingsResult> {
+export async function getBotSettings(tenantId?: string): Promise<SettingsResult> {
   try {
-    const response = await adminApiFetch("/admin/settings");
+    const path = tenantId
+      ? `/admin/tenants/${encodeURIComponent(tenantId)}/settings`
+      : "/admin/settings";
+    const response = await adminApiFetch(path);
     const body = (await response.json()) as AdminBotSettingsResponseBody;
     return { status: "ok", settings: toBotSettings(body) };
   } catch (error) {

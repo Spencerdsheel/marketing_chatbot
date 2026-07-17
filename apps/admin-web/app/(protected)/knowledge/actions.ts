@@ -52,7 +52,17 @@ interface AdminUploadResponseBody {
   status: string;
 }
 
+/**
+ * `tenantId` (S13.7): bound via `uploadKnowledge.bind(null, tenantId)` from
+ * the per-client knowledge screen (the standard Next.js pattern for passing
+ * an extra argument to a `useActionState` action) -- when set, targets the
+ * S12.7 PLATFORM_ADMIN super-user surface
+ * `POST /admin/tenants/{tenantId}/ingestion/upload` instead of the implicit
+ * `POST /admin/ingestion/upload`. `undefined`/omitted preserves the existing
+ * CLIENT_ADMIN behavior exactly (implicit route, `{tenantId}` never sent).
+ */
 export async function uploadKnowledge(
+  tenantId: string | undefined,
   _prevState: UploadState,
   formData: FormData
 ): Promise<UploadState> {
@@ -92,11 +102,15 @@ export async function uploadKnowledge(
   const uploadForm = new FormData();
   uploadForm.append("file", file, file.name);
 
+  const uploadPath = tenantId
+    ? `/admin/tenants/${encodeURIComponent(tenantId)}/ingestion/upload`
+    : "/admin/ingestion/upload";
+
   let response: Response;
   try {
     // No manual Content-Type -- adminApiFetch/fetch sets the multipart
     // boundary automatically for a FormData body.
-    response = await adminApiFetch("/admin/ingestion/upload", {
+    response = await adminApiFetch(uploadPath, {
       method: "POST",
       body: uploadForm,
     });
@@ -206,10 +220,21 @@ interface AdminDocStatusResponseBody {
   parsed_preview: string | null;
 }
 
-export async function getDocStatus(docId: string): Promise<DocStatusResult> {
+/**
+ * `tenantId` (S13.7): when provided, targets the S12.7 PLATFORM_ADMIN
+ * super-user surface `GET /admin/tenants/{tenantId}/ingestion/docs/{docId}`
+ * instead of the implicit `GET /admin/ingestion/docs/{docId}`. Called
+ * directly from a client component's poll loop (not via `useActionState`),
+ * so this takes `tenantId` as a normal parameter rather than a bound arg.
+ */
+export async function getDocStatus(docId: string, tenantId?: string): Promise<DocStatusResult> {
+  const path = tenantId
+    ? `/admin/tenants/${encodeURIComponent(tenantId)}/ingestion/docs/${encodeURIComponent(docId)}`
+    : `/admin/ingestion/docs/${encodeURIComponent(docId)}`;
+
   let response: Response;
   try {
-    response = await adminApiFetch(`/admin/ingestion/docs/${encodeURIComponent(docId)}`, {
+    response = await adminApiFetch(path, {
       method: "GET",
     });
   } catch (err) {

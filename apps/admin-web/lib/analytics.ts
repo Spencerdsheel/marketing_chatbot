@@ -185,14 +185,24 @@ function toAnalyticsOverview(body: AnalyticsOverviewResponseBody): AnalyticsOver
  * the backend's repository-layer job (CLAUDE.md §3). Never logs the
  * response body (PII-minimal; the response is already PII-free by
  * construction).
+ *
+ * `tenantId` (S13.7): when provided, targets the S12.7 PLATFORM_ADMIN
+ * super-user surface `GET /admin/tenants/{tenantId}/analytics/overview`
+ * instead of the implicit `GET /admin/analytics/overview` -- same response
+ * shape (routes.py `_get_overview`), only the URL prefix differs. Always
+ * the route segment's `{tenantId}`, never client state (D1).
  */
 export async function getAnalyticsOverview(
-  params: AnalyticsQueryParams
+  params: AnalyticsQueryParams,
+  tenantId?: string
 ): Promise<AnalyticsResult> {
   const query = resolveAnalyticsQuery(params);
+  const basePath = tenantId
+    ? `/admin/tenants/${encodeURIComponent(tenantId)}/analytics/overview`
+    : "/admin/analytics/overview";
 
   try {
-    const response = await adminApiFetch(`/admin/analytics/overview?${query}`);
+    const response = await adminApiFetch(`${basePath}?${query}`);
     const body = (await response.json()) as AnalyticsOverviewResponseBody;
     return { status: "ok", data: toAnalyticsOverview(body) };
   } catch (error) {

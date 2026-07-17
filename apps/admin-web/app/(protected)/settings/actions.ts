@@ -82,7 +82,16 @@ function errorState(partial: Omit<SaveErrorState, "status">): SaveErrorState {
   return { status: "error", ...partial };
 }
 
+/**
+ * `tenantId` (S13.7): bound via `saveSettings.bind(null, tenantId)` from the
+ * per-client settings screen -- when set, targets the S12.7 PLATFORM_ADMIN
+ * super-user surface `PUT /admin/tenants/{tenantId}/settings` instead of the
+ * implicit `PUT /admin/settings`, and revalidates `/clients/{tenantId}/settings`
+ * instead of `/settings`. `undefined`/omitted preserves the existing
+ * CLIENT_ADMIN behavior exactly.
+ */
 export async function saveSettings(
+  tenantId: string | undefined,
   _prevState: SaveState,
   formData: FormData
 ): Promise<SaveState> {
@@ -131,9 +140,13 @@ export async function saveSettings(
     business_hours: businessHoursResult.value,
   };
 
+  const path = tenantId
+    ? `/admin/tenants/${encodeURIComponent(tenantId)}/settings`
+    : "/admin/settings";
+
   let response: Response;
   try {
-    response = await adminApiFetch("/admin/settings", {
+    response = await adminApiFetch(path, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(requestBody),
@@ -152,7 +165,7 @@ export async function saveSettings(
 
   const body = (await response.json()) as AdminBotSettingsResponseBody;
 
-  revalidatePath("/settings");
+  revalidatePath(tenantId ? `/clients/${tenantId}/settings` : "/settings");
 
   return { status: "saved", settings: toBotSettings(body) };
 }

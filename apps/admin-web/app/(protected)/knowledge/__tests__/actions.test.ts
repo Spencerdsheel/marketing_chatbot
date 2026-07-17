@@ -38,7 +38,7 @@ describe("uploadKnowledge", () => {
   });
 
   it("rejects a missing file client-side without calling adminApiFetch", async () => {
-    const state = await uploadKnowledge({ status: "idle" }, buildFormData(null));
+    const state = await uploadKnowledge(undefined, { status: "idle" }, buildFormData(null));
 
     expect(state.status).toBe("error");
     expect(adminApiFetchMock).not.toHaveBeenCalled();
@@ -46,7 +46,7 @@ describe("uploadKnowledge", () => {
 
   it("rejects an oversized file in the server-action re-check without calling adminApiFetch", async () => {
     const oversized = makeFile({ sizeBytes: 10_485_761 });
-    const state = await uploadKnowledge({ status: "idle" }, buildFormData(oversized));
+    const state = await uploadKnowledge(undefined, { status: "idle" }, buildFormData(oversized));
 
     expect(state.status).toBe("error");
     if (state.status === "error") {
@@ -57,7 +57,7 @@ describe("uploadKnowledge", () => {
 
   it("rejects a disallowed content type in the server-action re-check without calling adminApiFetch", async () => {
     const badType = makeFile({ name: "logo.png", type: "image/png" });
-    const state = await uploadKnowledge({ status: "idle" }, buildFormData(badType));
+    const state = await uploadKnowledge(undefined, { status: "idle" }, buildFormData(badType));
 
     expect(state.status).toBe("error");
     if (state.status === "error") {
@@ -71,7 +71,7 @@ describe("uploadKnowledge", () => {
       jsonResponse({ doc_id: "doc-1", run_id: "run-1", status: "pending" }, 200)
     );
 
-    const state = await uploadKnowledge({ status: "idle" }, buildFormData(makeFile()));
+    const state = await uploadKnowledge(undefined, { status: "idle" }, buildFormData(makeFile()));
 
     expect(state.status).toBe("uploaded");
     if (state.status === "uploaded") {
@@ -86,7 +86,7 @@ describe("uploadKnowledge", () => {
       jsonResponse({ doc_id: "doc-2", run_id: null, status: "parsed" }, 200)
     );
 
-    const state = await uploadKnowledge({ status: "idle" }, buildFormData(makeFile()));
+    const state = await uploadKnowledge(undefined, { status: "idle" }, buildFormData(makeFile()));
 
     expect(state.status).toBe("uploaded");
     if (state.status === "uploaded") {
@@ -106,7 +106,7 @@ describe("uploadKnowledge", () => {
       })
     );
 
-    const state = await uploadKnowledge({ status: "idle" }, buildFormData(makeFile()));
+    const state = await uploadKnowledge(undefined, { status: "idle" }, buildFormData(makeFile()));
 
     expect(state.status).toBe("error");
     if (state.status === "error") {
@@ -123,7 +123,7 @@ describe("uploadKnowledge", () => {
       })
     );
 
-    const state = await uploadKnowledge({ status: "idle" }, buildFormData(makeFile()));
+    const state = await uploadKnowledge(undefined, { status: "idle" }, buildFormData(makeFile()));
 
     expect(state.status).toBe("error");
     if (state.status === "error") {
@@ -140,7 +140,7 @@ describe("uploadKnowledge", () => {
       })
     );
 
-    const state = await uploadKnowledge({ status: "idle" }, buildFormData(makeFile()));
+    const state = await uploadKnowledge(undefined, { status: "idle" }, buildFormData(makeFile()));
 
     expect(state.status).toBe("error");
     if (state.status === "error") {
@@ -157,7 +157,7 @@ describe("uploadKnowledge", () => {
       })
     );
 
-    const state = await uploadKnowledge({ status: "idle" }, buildFormData(makeFile()));
+    const state = await uploadKnowledge(undefined, { status: "idle" }, buildFormData(makeFile()));
 
     expect(state.status).toBe("error");
     if (state.status === "error") {
@@ -174,7 +174,7 @@ describe("uploadKnowledge", () => {
       })
     );
 
-    const state = await uploadKnowledge({ status: "idle" }, buildFormData(makeFile()));
+    const state = await uploadKnowledge(undefined, { status: "idle" }, buildFormData(makeFile()));
 
     expect(state.status).toBe("error");
     if (state.status === "error") {
@@ -185,12 +185,38 @@ describe("uploadKnowledge", () => {
   it("returns a generic network message when adminApiFetch throws a non-AdminApiError", async () => {
     adminApiFetchMock.mockRejectedValue(new TypeError("fetch failed"));
 
-    const state = await uploadKnowledge({ status: "idle" }, buildFormData(makeFile()));
+    const state = await uploadKnowledge(undefined, { status: "idle" }, buildFormData(makeFile()));
 
     expect(state.status).toBe("error");
     if (state.status === "error") {
       expect(state.message).toMatch(/unable to reach the server/i);
     }
+  });
+
+  it("targets the implicit /admin/ingestion/upload path when tenantId is omitted", async () => {
+    adminApiFetchMock.mockResolvedValue(
+      jsonResponse({ doc_id: "doc-1", run_id: "run-1", status: "pending" }, 200)
+    );
+
+    await uploadKnowledge(undefined, { status: "idle" }, buildFormData(makeFile()));
+
+    expect(adminApiFetchMock).toHaveBeenCalledWith(
+      "/admin/ingestion/upload",
+      expect.objectContaining({ method: "POST" })
+    );
+  });
+
+  it("targets the S12.7 tenant-scoped path when tenantId is bound (PLATFORM_ADMIN)", async () => {
+    adminApiFetchMock.mockResolvedValue(
+      jsonResponse({ doc_id: "doc-1", run_id: "run-1", status: "pending" }, 200)
+    );
+
+    await uploadKnowledge("tenant-x", { status: "idle" }, buildFormData(makeFile()));
+
+    expect(adminApiFetchMock).toHaveBeenCalledWith(
+      "/admin/tenants/tenant-x/ingestion/upload",
+      expect.objectContaining({ method: "POST" })
+    );
   });
 });
 

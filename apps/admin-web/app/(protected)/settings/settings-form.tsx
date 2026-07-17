@@ -51,10 +51,12 @@ function SubmitButton() {
 
 export function SettingsForm({
   currentSettings,
+  tenantId,
 }: {
   currentSettings: BotSettings;
+  tenantId?: string;
 }) {
-  const [state, formAction] = useActionState(saveSettings, initialState);
+  const [state, formAction] = useActionState(saveSettings.bind(null, tenantId), initialState);
 
   // Controlled field state, seeded once from the server-loaded snapshot.
   // `useState`'s lazy initializer only runs on mount, so this does NOT

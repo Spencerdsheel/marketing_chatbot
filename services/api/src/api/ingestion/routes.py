@@ -26,7 +26,8 @@ from common.logging import get_logger
 from fastapi import APIRouter, Depends, Request, UploadFile
 from fastapi.responses import JSONResponse
 
-from api.auth.dependencies import require_roles
+from api.audit.repository import record_audit
+from api.auth.dependencies import get_platform_admin_actor, require_roles, resolve_tenant_scope
 from api.config import get_api_settings
 from api.ingestion import repository as repo
 from api.ingestion.storage import get_storage
@@ -35,6 +36,7 @@ from api.ingestion.tasks import ingest_document
 _log = get_logger(__name__)
 
 router = APIRouter(prefix="/admin/ingestion", tags=["ingestion"])
+tenant_scoped_router = APIRouter(prefix="/admin/tenants/{tenant_id}/ingestion", tags=["ingestion"])
 
 _ALLOWED_CONTENT_TYPES = {
     "text/plain",
@@ -42,12 +44,7 @@ _ALLOWED_CONTENT_TYPES = {
 }
 
 
-@router.post("/upload", response_model=None)
-async def upload_document(
-    file: UploadFile,
-    request: Request,
-    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN)),  # noqa: B008
-) -> Any:
+async def _upload_document(file: UploadFile, request: Request, claims: AuthClaims) -> Any:
     """Accept a document upload, store it, and enqueue the ingestion task.
 
     Returns ``{doc_id, run_id, status:"pending"}`` on a fresh upload.
@@ -133,6 +130,16 @@ async def upload_document(
         correlation_id=cid,
     )
 
+    await record_audit(
+        db,
+        claims,
+        action="document_uploaded",
+        target_type="knowledge_doc",
+        target_id=doc_id,
+        metadata={"filename": filename, "content_type": content_type},
+        actor_context=get_platform_admin_actor(request),
+    )
+
     _log.info(
         "document_uploaded",
         extra={
@@ -143,12 +150,26 @@ async def upload_document(
     return {"doc_id": doc_id, "run_id": run.run_id, "status": "pending"}
 
 
-@router.get("/docs/{doc_id}")
-async def get_document(
-    doc_id: str,
+@router.post("/upload", response_model=None)
+async def upload_document(
+    file: UploadFile,
     request: Request,
     claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN)),  # noqa: B008
-) -> dict[str, Any]:
+) -> Any:
+    return await _upload_document(file, request, claims)
+
+
+@tenant_scoped_router.post("/upload", response_model=None)
+async def upload_document_for_tenant(
+    file: UploadFile,
+    request: Request,
+    claims: AuthClaims = Depends(resolve_tenant_scope(Role.CLIENT_ADMIN)),  # noqa: B008
+) -> Any:
+    """PLATFORM_ADMIN super-user variant of ``POST /admin/ingestion/upload`` (S12.7)."""
+    return await _upload_document(file, request, claims)
+
+
+async def _get_document(doc_id: str, request: Request, claims: AuthClaims) -> dict[str, Any]:
     """Return doc metadata + latest run + parsed preview.
 
     Response NEVER includes ``tenant_id`` or ``storage_key``.
@@ -197,3 +218,22 @@ async def get_document(
         "latest_run": run_payload,
         "parsed_preview": parsed_preview,
     }
+
+
+@router.get("/docs/{doc_id}")
+async def get_document(
+    doc_id: str,
+    request: Request,
+    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN)),  # noqa: B008
+) -> dict[str, Any]:
+    return await _get_document(doc_id, request, claims)
+
+
+@tenant_scoped_router.get("/docs/{doc_id}")
+async def get_document_for_tenant(
+    doc_id: str,
+    request: Request,
+    claims: AuthClaims = Depends(resolve_tenant_scope(Role.CLIENT_ADMIN)),  # noqa: B008
+) -> dict[str, Any]:
+    """PLATFORM_ADMIN super-user variant of ``GET /admin/ingestion/docs/{doc_id}`` (S12.7)."""
+    return await _get_document(doc_id, request, claims)

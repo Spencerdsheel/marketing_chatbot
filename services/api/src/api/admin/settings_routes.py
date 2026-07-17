@@ -6,6 +6,11 @@ mirrors S11.2's RBAC choice). ``PUT`` is ``CLIENT_ADMIN``-only (CLAUDE.md:
 ``CLIENT_AGENT`` "cannot change config") and writes ONLY the four qualitative
 columns -- thresholds/provider/model are read-only here, unchanged by this
 endpoint (decision 6).
+
+S12.7: ``/admin/tenants/{tenant_id}/settings`` mounts the SAME business logic
+(``_get_settings``/``_put_settings``) for a PLATFORM_ADMIN super-user, via
+``resolve_tenant_scope``. The implicit ``/admin/settings`` routes below are
+byte-for-byte unchanged for CLIENT_ADMIN/CLIENT_AGENT.
 """
 from __future__ import annotations
 
@@ -17,11 +22,13 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 
 from api.admin.settings_repository import BotSettings, get_bot_settings, upsert_bot_settings
-from api.auth.dependencies import require_roles
+from api.audit.repository import record_audit
+from api.auth.dependencies import get_platform_admin_actor, require_roles, resolve_tenant_scope
 
 _log = get_logger(__name__)
 
 router = APIRouter(prefix="/admin/settings", tags=["admin"])
+tenant_scoped_router = APIRouter(prefix="/admin/tenants/{tenant_id}/settings", tags=["admin"])
 
 
 class AdminBotSettingsRequest(BaseModel):
@@ -61,11 +68,7 @@ def _to_response(settings: BotSettings) -> AdminBotSettingsResponse:
     )
 
 
-@router.get("")
-async def get_settings(
-    request: Request,
-    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
-) -> AdminBotSettingsResponse:
+async def _get_settings(request: Request, claims: AuthClaims) -> AdminBotSettingsResponse:
     """Unified read: qualitative bot config + existing thresholds + provider/model."""
     db = request.app.state.db
 
@@ -73,11 +76,8 @@ async def get_settings(
     return _to_response(settings)
 
 
-@router.put("")
-async def put_settings(
-    body: AdminBotSettingsRequest,
-    request: Request,
-    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN)),  # noqa: B008
+async def _put_settings(
+    body: AdminBotSettingsRequest, request: Request, claims: AuthClaims,
 ) -> AdminBotSettingsResponse:
     """Write ONLY the four qualitative fields; thresholds/provider/model are untouched."""
     db = request.app.state.db
@@ -91,6 +91,15 @@ async def put_settings(
         tone=body.tone,
     )
 
+    await record_audit(
+        db,
+        claims,
+        action="tenant_bot_settings_updated",
+        target_type="tenant_bot_settings",
+        target_id=claims.tenant_id,
+        actor_context=get_platform_admin_actor(request),
+    )
+
     _log.info(
         "tenant bot settings updated",
         extra={"event": "tenant_bot_settings_updated", "tenant_id": claims.tenant_id},
@@ -98,3 +107,39 @@ async def put_settings(
 
     settings = await get_bot_settings(db, claims)
     return _to_response(settings)
+
+
+@router.get("")
+async def get_settings(
+    request: Request,
+    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> AdminBotSettingsResponse:
+    return await _get_settings(request, claims)
+
+
+@router.put("")
+async def put_settings(
+    body: AdminBotSettingsRequest,
+    request: Request,
+    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN)),  # noqa: B008
+) -> AdminBotSettingsResponse:
+    return await _put_settings(body, request, claims)
+
+
+@tenant_scoped_router.get("")
+async def get_settings_for_tenant(
+    request: Request,
+    claims: AuthClaims = Depends(resolve_tenant_scope(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> AdminBotSettingsResponse:
+    """PLATFORM_ADMIN super-user variant of ``GET /admin/settings`` (S12.7)."""
+    return await _get_settings(request, claims)
+
+
+@tenant_scoped_router.put("")
+async def put_settings_for_tenant(
+    body: AdminBotSettingsRequest,
+    request: Request,
+    claims: AuthClaims = Depends(resolve_tenant_scope(Role.CLIENT_ADMIN)),  # noqa: B008
+) -> AdminBotSettingsResponse:
+    """PLATFORM_ADMIN super-user variant of ``PUT /admin/settings`` (S12.7)."""
+    return await _put_settings(body, request, claims)

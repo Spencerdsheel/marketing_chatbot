@@ -21,6 +21,7 @@ from api.audit.repository import (
     list_audit,
     record_audit,
 )
+from api.auth.dependencies import PlatformAdminActor
 
 
 class _RecordingDatabase:
@@ -205,3 +206,61 @@ async def test_platform_admin_rejected_on_list() -> None:
 
     with pytest.raises(ValidationError):
         await list_audit(db, claims, limit=10, offset=0)
+
+
+# -- actor_context (S12.7 D4) ---------------------------------------------------
+
+
+async def test_record_audit_actor_context_adds_platform_admin_marker() -> None:
+    """actor_context set -> metadata gains platform_admin=True + role, actor
+    stays claims.subject (the real platform admin's own id, unchanged)."""
+    db = _RecordingDatabase()
+    # The derived, tenant-scoped claims resolve_tenant_scope would build for
+    # a platform admin reaching tenant X -- role=CLIENT_ADMIN, subject=the
+    # real platform admin's own id.
+    claims = _claims("tenant-x", Role.CLIENT_ADMIN, subject="pa-real-id")
+    actor_context = PlatformAdminActor(subject="pa-real-id", role=Role.PLATFORM_ADMIN)
+
+    await record_audit(
+        db, claims,
+        action="tenant_bot_settings_updated",
+        actor_context=actor_context,
+    )
+
+    # metadata is the 7th positional param (index 6).
+    metadata = db.last_params[6]
+    assert metadata["platform_admin"] is True
+    assert metadata["platform_admin_role"] == "PLATFORM_ADMIN"
+    # actor (index 2) is unaffected -- still the real platform admin subject.
+    assert db.last_params[2] == "pa-real-id"
+
+
+async def test_record_audit_actor_context_merges_with_existing_metadata() -> None:
+    """actor_context does not clobber caller-supplied metadata keys."""
+    db = _RecordingDatabase()
+    claims = _claims("tenant-x", Role.CLIENT_ADMIN, subject="pa-real-id")
+    actor_context = PlatformAdminActor(subject="pa-real-id", role=Role.PLATFORM_ADMIN)
+
+    await record_audit(
+        db, claims,
+        action="lead_stage_transitioned",
+        metadata={"from_stage": "captured", "to_stage": "qualified"},
+        actor_context=actor_context,
+    )
+
+    metadata = db.last_params[6]
+    assert metadata["from_stage"] == "captured"
+    assert metadata["to_stage"] == "qualified"
+    assert metadata["platform_admin"] is True
+
+
+async def test_record_audit_no_actor_context_no_marker() -> None:
+    """A normal CLIENT_ADMIN write (no actor_context) -- metadata unchanged,
+    no platform_admin key added."""
+    db = _RecordingDatabase()
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN, subject="real-admin-1")
+
+    await record_audit(db, claims, action="tenant_bot_settings_updated")
+
+    metadata = db.last_params[6]
+    assert metadata is None

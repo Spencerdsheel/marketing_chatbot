@@ -1,5 +1,5 @@
 /**
- * Route gate (S13.1 decisions 2 & 3).
+ * Route gate (S13.1 decisions 2 & 3; extended by S13.7 D4/D6).
  *
  * NAMING NOTE: the S13.1 spec calls this file `middleware.ts`. The
  * installed Next.js version (16.2.10) deprecated that file convention in
@@ -17,7 +17,19 @@
  * pre-render gate for unauthenticated access only; it is NOT the
  * fine-grained per-screen authorization boundary (the backend remains
  * that boundary, per CLAUDE.md/admin-web skill: "the API is the real
- * boundary"). Per-role UI gating starts in S13.2+.
+ * boundary").
+ *
+ * S13.7 D4/D6 (defense-in-depth UI routing only -- the backend still
+ * enforces regardless of what this gate does):
+ * - A PLATFORM_ADMIN landing on the single-tenant home (`/`) is redirected
+ *   to the client list (`/clients`) -- they have no single-tenant dashboard
+ *   of their own (D4).
+ * - A CLIENT_ADMIN/CLIENT_AGENT forcing `/clients` (or any `/clients/**`)
+ *   is redirected to their own dashboard (`/`) -- they never see the client
+ *   list (D6). The per-screen `requireRole("PLATFORM_ADMIN")` calls in
+ *   `clients/page.tsx` and `clients/[tenantId]/layout.tsx` are the same
+ *   belt-and-suspenders pattern `lib/auth.ts`'s `requireRole` docstring
+ *   already establishes for `/tenants/new` and `/knowledge`.
  */
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
@@ -30,6 +42,16 @@ export function proxy(request: NextRequest) {
   if (!claims) {
     const loginUrl = new URL("/login", request.url);
     return NextResponse.redirect(loginUrl);
+  }
+
+  const { pathname } = request.nextUrl;
+
+  if (claims.role === "PLATFORM_ADMIN" && pathname === "/") {
+    return NextResponse.redirect(new URL("/clients", request.url));
+  }
+
+  if (claims.role !== "PLATFORM_ADMIN" && pathname.startsWith("/clients")) {
+    return NextResponse.redirect(new URL("/", request.url));
   }
 
   return NextResponse.next();

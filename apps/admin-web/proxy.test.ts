@@ -25,6 +25,18 @@ const validToken = jwt.sign(
   { algorithm: "HS256", expiresIn: "1h" }
 );
 
+const platformAdminToken = jwt.sign(
+  { sub: "p1", role: "PLATFORM_ADMIN", tenant_id: null, project_ids: [] },
+  SECRET,
+  { algorithm: "HS256", expiresIn: "1h" }
+);
+
+const clientAgentToken = jwt.sign(
+  { sub: "a1", role: "CLIENT_AGENT", tenant_id: "t1", project_ids: [] },
+  SECRET,
+  { algorithm: "HS256", expiresIn: "1h" }
+);
+
 describe("proxy (route gate)", () => {
   it("redirects to /login when no cookie is present on a protected route", () => {
     const res = proxy(requestTo("/"));
@@ -57,5 +69,50 @@ describe("proxy (route gate)", () => {
     expect(
       unstable_doesProxyMatch({ config, nextConfig: {}, url: "/leads" })
     ).toBe(true);
+  });
+
+  // S13.7 D4/D6 -- role-aware routing to/from the client list. Defense-in-
+  // depth UI only; the backend still enforces regardless.
+  it("redirects a PLATFORM_ADMIN request to / to /clients (D4: no single-tenant dashboard of their own)", () => {
+    const res = proxy(requestTo("/", platformAdminToken));
+    expect(res.status).toBe(307);
+    expect(res.headers.get("location")).toContain("/clients");
+  });
+
+  it("passes through a PLATFORM_ADMIN request to /clients/{tenantId}/settings", () => {
+    const res = proxy(requestTo("/clients/tenant-x/settings", platformAdminToken));
+    expect(res.headers.get("location")).toBeNull();
+  });
+
+  it("passes through a PLATFORM_ADMIN request to /clients", () => {
+    const res = proxy(requestTo("/clients", platformAdminToken));
+    expect(res.headers.get("location")).toBeNull();
+  });
+
+  it("redirects a CLIENT_ADMIN request to /clients to their own dashboard (D6: never sees the client list)", () => {
+    const res = proxy(requestTo("/clients", validToken));
+    expect(res.status).toBe(307);
+    const location = res.headers.get("location");
+    expect(location).not.toBeNull();
+    expect(new URL(location as string).pathname).toBe("/");
+  });
+
+  it("redirects a CLIENT_AGENT request to /clients/{tenantId}/settings to their own dashboard", () => {
+    const res = proxy(requestTo("/clients/tenant-x/settings", clientAgentToken));
+    expect(res.status).toBe(307);
+    const location = res.headers.get("location");
+    expect(location).not.toBeNull();
+    expect(new URL(location as string).pathname).toBe("/");
+  });
+
+  it("a CLIENT_ADMIN's own feature route still renders unchanged (S13.2-S13.6 untouched)", () => {
+    const res = proxy(requestTo("/leads", validToken));
+    expect(res.headers.get("location")).toBeNull();
+  });
+
+  it("an unauthenticated request to /clients still redirects to /login (S13.1 behavior preserved)", () => {
+    const res = proxy(requestTo("/clients"));
+    expect(res.status).toBe(307);
+    expect(res.headers.get("location")).toContain("/login");
   });
 });

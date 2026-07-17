@@ -20,7 +20,7 @@ from common.logging import get_logger
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
 
-from api.auth.dependencies import require_roles
+from api.auth.dependencies import require_roles, resolve_tenant_scope
 from api.conversation_store.repository import (
     ConversationSummaryRow,
     get_conversation,
@@ -31,6 +31,9 @@ from api.conversation_store.repository import (
 _log = get_logger(__name__)
 
 router = APIRouter(prefix="/admin/conversations", tags=["conversations"])
+tenant_scoped_router = APIRouter(
+    prefix="/admin/tenants/{tenant_id}/conversations", tags=["conversations"]
+)
 
 _VALID_STATUSES: set[str] = {"active", "ended"}
 
@@ -98,17 +101,17 @@ def _to_list_item(row: ConversationSummaryRow) -> ConversationListItem:
     )
 
 
-@router.get("")
-async def list_conversations_route(
+async def _list_conversations(
     request: Request,
-    limit: int = Query(default=50),
-    offset: int = Query(default=0),
-    status_: str | None = Query(default=None, alias="status"),
-    channel: str | None = Query(default=None),
-    escalated: bool | None = Query(default=None),
-    started_from: datetime | None = Query(default=None, alias="from"),  # noqa: B008
-    started_to: datetime | None = Query(default=None, alias="to"),  # noqa: B008
-    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+    claims: AuthClaims,
+    *,
+    limit: int,
+    offset: int,
+    status_: str | None,
+    channel: str | None,
+    escalated: bool | None,
+    started_from: datetime | None,
+    started_to: datetime | None,
 ) -> ConversationListResponse:
     """List/filter the caller's tenant conversations, newest first, paginated.
 
@@ -171,11 +174,49 @@ async def list_conversations_route(
     )
 
 
-@router.get("/{conversation_id}")
-async def get_conversation_detail(
+@router.get("")
+async def list_conversations_route(
+    request: Request,
+    limit: int = Query(default=50),
+    offset: int = Query(default=0),
+    status_: str | None = Query(default=None, alias="status"),
+    channel: str | None = Query(default=None),
+    escalated: bool | None = Query(default=None),
+    started_from: datetime | None = Query(default=None, alias="from"),  # noqa: B008
+    started_to: datetime | None = Query(default=None, alias="to"),  # noqa: B008
+    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> ConversationListResponse:
+    return await _list_conversations(
+        request, claims,
+        limit=limit, offset=offset, status_=status_, channel=channel,
+        escalated=escalated, started_from=started_from, started_to=started_to,
+    )
+
+
+@tenant_scoped_router.get("")
+async def list_conversations_route_for_tenant(
+    request: Request,
+    limit: int = Query(default=50),
+    offset: int = Query(default=0),
+    status_: str | None = Query(default=None, alias="status"),
+    channel: str | None = Query(default=None),
+    escalated: bool | None = Query(default=None),
+    started_from: datetime | None = Query(default=None, alias="from"),  # noqa: B008
+    started_to: datetime | None = Query(default=None, alias="to"),  # noqa: B008
+    claims: AuthClaims = Depends(resolve_tenant_scope(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> ConversationListResponse:
+    """PLATFORM_ADMIN super-user variant of ``GET /admin/conversations`` (S12.7)."""
+    return await _list_conversations(
+        request, claims,
+        limit=limit, offset=offset, status_=status_, channel=channel,
+        escalated=escalated, started_from=started_from, started_to=started_to,
+    )
+
+
+async def _get_conversation_detail(
     conversation_id: str,
     request: Request,
-    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+    claims: AuthClaims,
 ) -> ConversationDetailResponse:
     """Fetch a conversation's full transcript. Reuses ``get_conversation`` +
     ``get_messages`` (already tenant-scoped) -- no new single-conversation
@@ -222,3 +263,23 @@ async def get_conversation_detail(
             for m in messages
         ],
     )
+
+
+@router.get("/{conversation_id}")
+async def get_conversation_detail(
+    conversation_id: str,
+    request: Request,
+    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> ConversationDetailResponse:
+    return await _get_conversation_detail(conversation_id, request, claims)
+
+
+@tenant_scoped_router.get("/{conversation_id}")
+async def get_conversation_detail_for_tenant(
+    conversation_id: str,
+    request: Request,
+    claims: AuthClaims = Depends(resolve_tenant_scope(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> ConversationDetailResponse:
+    """PLATFORM_ADMIN super-user variant of
+    ``GET /admin/conversations/{conversation_id}`` (S12.7)."""
+    return await _get_conversation_detail(conversation_id, request, claims)

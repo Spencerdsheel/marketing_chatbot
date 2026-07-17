@@ -17,10 +17,22 @@ const STAGE_LABELS: Record<(typeof LEAD_STAGES)[number], string> = {
   disqualified: "Disqualified",
 };
 
-export function LeadsFilter({ currentStage }: { currentStage: string | undefined }) {
+/**
+ * `basePath` (S13.7): the per-client leads screen passes
+ * `/clients/{tenantId}/leads` so the filter form and "Clear filter" link
+ * stay on that same tenant-scoped route instead of the implicit `/leads`.
+ * Defaults to `/leads`, preserving the existing CLIENT_ADMIN/AGENT behavior.
+ */
+export function LeadsFilter({
+  currentStage,
+  basePath = "/leads",
+}: {
+  currentStage: string | undefined;
+  basePath?: string;
+}) {
   return (
     <form
-      action="/leads"
+      action={basePath}
       method="get"
       className="flex flex-wrap items-end gap-3"
     >
@@ -49,7 +61,7 @@ export function LeadsFilter({ currentStage }: { currentStage: string | undefined
         Filter
       </button>
       {currentStage ? (
-        <Link href="/leads" className="text-sm text-muted-foreground hover:underline">
+        <Link href={basePath} className="text-sm text-muted-foreground hover:underline">
           Clear filter
         </Link>
       ) : null}

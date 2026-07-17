@@ -124,12 +124,24 @@ function toLeadListItem(body: LeadListItemResponseBody): LeadListItem {
  * Fetch a page of the caller's tenant leads. Never sends a `tenant_id` --
  * scoping is entirely the backend's repository-layer job from the caller's
  * own claims (CLAUDE.md §3). Never logs the response body (PII-minimal).
+ *
+ * `tenantId` (S13.7): when provided, targets the S12.7 PLATFORM_ADMIN
+ * super-user surface `GET /admin/tenants/{tenantId}/leads` instead of the
+ * implicit `GET /admin/leads` -- same response shape
+ * (admin_routes.py `_list_leads`), only the URL prefix differs. Always the
+ * route segment's `{tenantId}`, never client state (D1).
  */
-export async function listLeads(params: LeadsQueryParams): Promise<LeadsResult> {
+export async function listLeads(
+  params: LeadsQueryParams,
+  tenantId?: string
+): Promise<LeadsResult> {
   const query = buildLeadsQuery(params);
+  const basePath = tenantId
+    ? `/admin/tenants/${encodeURIComponent(tenantId)}/leads`
+    : "/admin/leads";
 
   try {
-    const response = await adminApiFetch(`/admin/leads?${query}`);
+    const response = await adminApiFetch(`${basePath}?${query}`);
     const body = (await response.json()) as LeadListResponseBody;
     return {
       status: "ok",
