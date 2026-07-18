@@ -1,0 +1,22 @@
+# dependencies
+/node_modules
+
+# build output
+/dist
+
+# testing
+/coverage
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+
+# env files (local overrides only; .env.example is checked in)
+.env
+.env.local
+
+# typescript
+*.tsbuildinfo

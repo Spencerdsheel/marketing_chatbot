@@ -7,6 +7,9 @@
  */
 import { redirect } from "next/navigation";
 import { getClaims } from "@/lib/auth";
+import { getProfile } from "@/lib/profile";
+import { AdminShell } from "@/components/admin/admin-shell";
+import { logout } from "@/app/(protected)/actions";
 
 export default async function ProtectedLayout({
   children,
@@ -18,5 +21,12 @@ export default async function ProtectedLayout({
     redirect("/login");
   }
 
-  return <div className="flex flex-1 flex-col">{children}</div>;
+  const profile = await getProfile();
+  const identityLabel = profile?.name || profile?.email || claims.subject;
+
+  return (
+    <AdminShell role={claims.role} identityLabel={identityLabel} logoutAction={logout}>
+      {children}
+    </AdminShell>
+  );
 }

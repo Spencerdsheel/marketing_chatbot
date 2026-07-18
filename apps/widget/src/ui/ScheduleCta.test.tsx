@@ -1,0 +1,479 @@
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { WidgetConfig } from "../config";
+import type { BookSlotResult, FetchSlotsResult } from "../schedule";
+
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+const fetchSlotsMock = vi.fn<(config: WidgetConfig, input: unknown) => Promise<FetchSlotsResult>>();
+const bookSlotMock = vi.fn<(config: WidgetConfig, input: unknown) => Promise<BookSlotResult>>();
+
+vi.mock("../schedule", async () => {
+  const actual = await vi.importActual<typeof import("../schedule")>("../schedule");
+  return {
+    ...actual,
+    fetchSlots: (config: WidgetConfig, input: unknown) => fetchSlotsMock(config, input),
+    bookSlot: (config: WidgetConfig, input: unknown) => bookSlotMock(config, input),
+  };
+});
+
+import { ScheduleCta } from "./ScheduleCta";
+import { SCHEDULE_CONSENT_TEXT } from "../schedule";
+
+const baseConfig: WidgetConfig = {
+  clientKey: "pk_test_123",
+  apiBase: "http://localhost:8000",
+  mountSelector: null,
+  debug: false,
+};
+
+const SLOT_A = { startsAt: "2026-07-20T09:00:00+00:00", endsAt: "2026-07-20T09:30:00+00:00" };
+const SLOT_B = { startsAt: "2026-07-20T10:00:00+00:00", endsAt: "2026-07-20T10:30:00+00:00" };
+
+let container: HTMLDivElement;
+let root: Root;
+
+function flush(): Promise<void> {
+  return act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+beforeEach(() => {
+  container = document.createElement("div");
+  document.body.appendChild(container);
+  root = createRoot(container);
+  fetchSlotsMock.mockReset();
+  bookSlotMock.mockReset();
+});
+
+afterEach(() => {
+  act(() => {
+    root.unmount();
+  });
+  container.remove();
+  vi.restoreAllMocks();
+});
+
+function getSlotButtons(): HTMLButtonElement[] {
+  return Array.from(container.querySelectorAll<HTMLButtonElement>(".cw-sched-slot"));
+}
+
+function getSlotButton(index: number): HTMLButtonElement {
+  const button = getSlotButtons()[index];
+  if (!button) throw new Error(`slot button at index ${index} not found`);
+  return button;
+}
+
+function getConsentCheckbox(): HTMLInputElement {
+  const input = container.querySelector<HTMLInputElement>("#cw-sched-consent");
+  if (!input) throw new Error("consent checkbox not found");
+  return input;
+}
+
+function getConfirmButton(): HTMLButtonElement {
+  const button = container.querySelector<HTMLButtonElement>(".cw-sched-confirm-button");
+  if (!button) throw new Error("confirm button not found");
+  return button;
+}
+
+describe("ScheduleCta", () => {
+  it("calls fetchSlots once on mount and renders the returned slots with local-timezone labels", async () => {
+    fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [SLOT_A, SLOT_B] });
+
+    act(() => {
+      root.render(<ScheduleCta config={baseConfig} />);
+    });
+    await flush();
+
+    expect(fetchSlotsMock).toHaveBeenCalledTimes(1);
+    const buttons = getSlotButtons();
+    expect(buttons).toHaveLength(2);
+    // The displayed label must not be the raw UTC string verbatim (it's localized).
+    const firstButton = getSlotButton(0);
+    expect(firstButton.textContent).not.toBe(SLOT_A.startsAt);
+    expect(firstButton.textContent?.length).toBeGreaterThan(0);
+  });
+
+  it("renders an honest 'no times available' message on an empty slot list, never a fabricated slot", async () => {
+    fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [] });
+
+    act(() => {
+      root.render(<ScheduleCta config={baseConfig} />);
+    });
+    await flush();
+
+    expect(getSlotButtons()).toHaveLength(0);
+    const empty = container.querySelector(".cw-sched-empty");
+    expect(empty).not.toBeNull();
+    expect(empty?.textContent).toMatch(/no times/i);
+  });
+
+  it("renders an honest error on a fetchSlots failure, no faked slots", async () => {
+    fetchSlotsMock.mockResolvedValueOnce({
+      ok: false,
+      error: {
+        type: "SCHEDULE_ERROR",
+        errorCode: "NETWORK_ERROR",
+        message: "Network request failed.",
+        correlationId: null,
+        status: null,
+        retryAfterSeconds: null,
+      },
+    });
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    act(() => {
+      root.render(<ScheduleCta config={baseConfig} />);
+    });
+    await flush();
+
+    expect(getSlotButtons()).toHaveLength(0);
+    const errorLine = container.querySelector(".cw-sched-error");
+    expect(errorLine).not.toBeNull();
+    expect(consoleErrorSpy).toHaveBeenCalled();
+  });
+
+  it("selecting a slot shows the confirm step with an unchecked consent checkbox and a disabled Confirm; enables on check", async () => {
+    fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [SLOT_A] });
+
+    act(() => {
+      root.render(<ScheduleCta config={baseConfig} />);
+    });
+    await flush();
+
+    act(() => {
+      getSlotButton(0).click();
+    });
+
+    const checkbox = getConsentCheckbox();
+    expect(checkbox.checked).toBe(false);
+    expect(getConfirmButton().disabled).toBe(true);
+    expect(bookSlotMock).not.toHaveBeenCalled();
+
+    act(() => {
+      checkbox.click();
+    });
+    expect(getConfirmButton().disabled).toBe(false);
+    expect(bookSlotMock).not.toHaveBeenCalled();
+  });
+
+  it("consent label text matches the exported SCHEDULE_CONSENT_TEXT (shown == sent)", async () => {
+    fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [SLOT_A] });
+
+    act(() => {
+      root.render(<ScheduleCta config={baseConfig} />);
+    });
+    await flush();
+    act(() => {
+      getSlotButton(0).click();
+    });
+
+    const label = container.querySelector(".cw-sched-consent-label");
+    expect(label?.textContent).toBe(SCHEDULE_CONSENT_TEXT);
+  });
+
+  it("confirming calls bookSlot once with the exact selected UTC starts_at and granted:true consent; shows confirmation on 201", async () => {
+    fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [SLOT_A] });
+    bookSlotMock.mockResolvedValueOnce({
+      ok: true,
+      booking: { eventId: "evt-1", startsAt: SLOT_A.startsAt, endsAt: SLOT_A.endsAt, status: "booked" },
+    });
+
+    act(() => {
+      root.render(<ScheduleCta config={baseConfig} />);
+    });
+    await flush();
+    act(() => {
+      getSlotButton(0).click();
+    });
+    act(() => {
+      getConsentCheckbox().click();
+    });
+    act(() => {
+      getConfirmButton().click();
+    });
+    await flush();
+
+    expect(bookSlotMock).toHaveBeenCalledTimes(1);
+    const [, input] = bookSlotMock.mock.calls[0] as [WidgetConfig, { startsAt: string; consent: { granted: boolean } }];
+    expect(input.startsAt).toBe(SLOT_A.startsAt);
+    expect(input.consent.granted).toBe(true);
+
+    // Confirmation renders, picker is gone (no rebook affordance).
+    const confirmation = container.querySelector(".cw-sched-confirmation");
+    expect(confirmation).not.toBeNull();
+    expect(getSlotButtons()).toHaveLength(0);
+    expect(container.querySelector(".cw-sched-confirm-button")).toBeNull();
+  });
+
+  it("on SLOT_UNAVAILABLE, shows an honest error and re-fetches slots (second fetchSlots call), no confirmation", async () => {
+    fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [SLOT_A] });
+    fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [SLOT_B] });
+    bookSlotMock.mockResolvedValueOnce({
+      ok: false,
+      error: {
+        type: "SCHEDULE_ERROR",
+        errorCode: "SLOT_UNAVAILABLE",
+        message: "The requested time is no longer available.",
+        correlationId: "corr-1",
+        status: 422,
+        retryAfterSeconds: null,
+      },
+    });
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    act(() => {
+      root.render(<ScheduleCta config={baseConfig} />);
+    });
+    await flush();
+    act(() => {
+      getSlotButton(0).click();
+    });
+    act(() => {
+      getConsentCheckbox().click();
+    });
+    act(() => {
+      getConfirmButton().click();
+    });
+    await flush();
+
+    expect(bookSlotMock).toHaveBeenCalledTimes(1);
+    expect(fetchSlotsMock).toHaveBeenCalledTimes(2);
+    expect(container.querySelector(".cw-sched-confirmation")).toBeNull();
+    // Re-fetched slot list is shown (the taken slot is gone, replaced by SLOT_B).
+    expect(getSlotButtons()).toHaveLength(1);
+    expect(consoleErrorSpy).toHaveBeenCalled();
+  });
+
+  it("on CALENDAR_SYNC_FAILED, shows an honest error with no confirmation and no auto-retry", async () => {
+    fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [SLOT_A] });
+    bookSlotMock.mockResolvedValueOnce({
+      ok: false,
+      error: {
+        type: "SCHEDULE_ERROR",
+        errorCode: "CALENDAR_SYNC_FAILED",
+        message: "Failed to sync the booking to the calendar. Please try again.",
+        correlationId: "corr-2",
+        status: 422,
+        retryAfterSeconds: null,
+      },
+    });
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    act(() => {
+      root.render(<ScheduleCta config={baseConfig} />);
+    });
+    await flush();
+    act(() => {
+      getSlotButton(0).click();
+    });
+    act(() => {
+      getConsentCheckbox().click();
+    });
+    act(() => {
+      getConfirmButton().click();
+    });
+    await flush();
+
+    expect(bookSlotMock).toHaveBeenCalledTimes(1);
+    // No re-fetch for a non-SLOT_UNAVAILABLE failure (no auto-retry/loop).
+    expect(fetchSlotsMock).toHaveBeenCalledTimes(1);
+    expect(container.querySelector(".cw-sched-confirmation")).toBeNull();
+    const errorLine = container.querySelector(".cw-sched-error");
+    expect(errorLine).not.toBeNull();
+    expect(consoleErrorSpy).toHaveBeenCalled();
+  });
+
+  it("never logs booked-time/PII beyond error_code/correlation_id on failure", async () => {
+    fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [SLOT_A] });
+    bookSlotMock.mockResolvedValueOnce({
+      ok: false,
+      error: {
+        type: "SCHEDULE_ERROR",
+        errorCode: "CALENDAR_SYNC_FAILED",
+        message: "Failed to sync the booking to the calendar. Please try again.",
+        correlationId: "corr-2",
+        status: 422,
+        retryAfterSeconds: null,
+      },
+    });
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    act(() => {
+      root.render(<ScheduleCta config={baseConfig} />);
+    });
+    await flush();
+    act(() => {
+      getSlotButton(0).click();
+    });
+    act(() => {
+      getConsentCheckbox().click();
+    });
+    act(() => {
+      getConfirmButton().click();
+    });
+    await flush();
+
+    const loggedText = consoleErrorSpy.mock.calls.map((c) => c.join(" ")).join(" ");
+    expect(loggedText).toContain("CALENDAR_SYNC_FAILED");
+    expect(loggedText).toContain("corr-2");
+    expect(loggedText).not.toContain(SLOT_A.startsAt);
+  });
+
+  describe("S14.5 a11y hardening", () => {
+    it("slot buttons are real focusable <button>s whose accessible name conveys the time", async () => {
+      fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [SLOT_A, SLOT_B] });
+
+      act(() => {
+        root.render(<ScheduleCta config={baseConfig} />);
+      });
+      await flush();
+
+      const buttons = getSlotButtons();
+      expect(buttons).toHaveLength(2);
+      for (const button of buttons) {
+        expect(button.tagName).toBe("BUTTON");
+        expect(button.type).toBe("button");
+        expect(button.disabled).toBe(false);
+        // Accessible name == visible text content, which formatLocalSlotLabel
+        // renders as a localized time string (not the raw UTC string).
+        expect(button.textContent?.length).toBeGreaterThan(0);
+      }
+    });
+
+    it("the slot list is labelled via aria-labelledby", async () => {
+      fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [SLOT_A] });
+
+      act(() => {
+        root.render(<ScheduleCta config={baseConfig} />);
+      });
+      await flush();
+
+      const list = container.querySelector("ul.cw-sched-list");
+      const labelledBy = list?.getAttribute("aria-labelledby");
+      expect(labelledBy).toBeTruthy();
+      expect(container.querySelector(`#${labelledBy}`)?.textContent).toMatch(/choose a time/i);
+    });
+
+    it("the empty-state and loading state are announced via role=status", async () => {
+      fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [] });
+
+      act(() => {
+        root.render(<ScheduleCta config={baseConfig} />);
+      });
+
+      // Immediately after mount (before the mocked fetch resolves), the
+      // loading state should be announced.
+      expect(container.querySelector('[role="status"]')).not.toBeNull();
+
+      await flush();
+
+      const empty = container.querySelector(".cw-sched-empty");
+      expect(empty?.getAttribute("role")).toBe("status");
+    });
+
+    it("the consent checkbox is keyboard-toggleable and labelled", async () => {
+      fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [SLOT_A] });
+
+      act(() => {
+        root.render(<ScheduleCta config={baseConfig} />);
+      });
+      await flush();
+      act(() => {
+        getSlotButton(0).click();
+      });
+
+      const checkbox = getConsentCheckbox();
+      expect(checkbox.tagName).toBe("INPUT");
+      expect(checkbox.type).toBe("checkbox");
+      const label = container.querySelector(`label[for="${checkbox.id}"]`);
+      expect(label).not.toBeNull();
+
+      checkbox.focus();
+      expect(document.activeElement).toBe(checkbox);
+    });
+
+    it("focus moves to the confirm heading on the list->confirm transition", async () => {
+      fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [SLOT_A] });
+
+      act(() => {
+        root.render(<ScheduleCta config={baseConfig} />);
+      });
+      await flush();
+      act(() => {
+        getSlotButton(0).click();
+      });
+
+      const heading = container.querySelector<HTMLElement>(".cw-sched-confirm-heading");
+      expect(heading).not.toBeNull();
+      expect(document.activeElement).toBe(heading);
+    });
+
+    it("focus moves to the booking confirmation on the confirm->booked transition", async () => {
+      fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [SLOT_A] });
+      bookSlotMock.mockResolvedValueOnce({
+        ok: true,
+        booking: { eventId: "evt-1", startsAt: SLOT_A.startsAt, endsAt: SLOT_A.endsAt, status: "booked" },
+      });
+
+      act(() => {
+        root.render(<ScheduleCta config={baseConfig} />);
+      });
+      await flush();
+      act(() => {
+        getSlotButton(0).click();
+      });
+      act(() => {
+        getConsentCheckbox().click();
+      });
+      act(() => {
+        getConfirmButton().click();
+      });
+      await flush();
+
+      const confirmation = container.querySelector<HTMLElement>(".cw-sched-confirmation");
+      expect(confirmation).not.toBeNull();
+      expect(confirmation?.getAttribute("role")).toBe("status");
+      expect(document.activeElement).toBe(confirmation);
+    });
+
+    it("the booking error line is role=alert (assertive)", async () => {
+      fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [SLOT_A] });
+      bookSlotMock.mockResolvedValueOnce({
+        ok: false,
+        error: {
+          type: "SCHEDULE_ERROR",
+          errorCode: "CALENDAR_SYNC_FAILED",
+          message: "Failed to sync the booking to the calendar. Please try again.",
+          correlationId: "corr-2",
+          status: 422,
+          retryAfterSeconds: null,
+        },
+      });
+      vi.spyOn(console, "error").mockImplementation(() => {});
+
+      act(() => {
+        root.render(<ScheduleCta config={baseConfig} />);
+      });
+      await flush();
+      act(() => {
+        getSlotButton(0).click();
+      });
+      act(() => {
+        getConsentCheckbox().click();
+      });
+      act(() => {
+        getConfirmButton().click();
+      });
+      await flush();
+
+      const errorLine = container.querySelector(".cw-sched-error");
+      expect(errorLine?.getAttribute("role")).toBe("alert");
+    });
+  });
+});

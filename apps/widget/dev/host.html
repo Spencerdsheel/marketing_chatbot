@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Acme Roofing &mdash; Local Test Host Page</title>
+    <style>
+      /* A little lorem-ipsum "client site" chrome — exists only to give the
+         Shadow-DOM isolation proof (S14.1 Tests step 2) something real to
+         be isolated from/against. Intentionally clashes with the widget's
+         own styling (serif font, different button look) so isolation is
+         visually obvious. */
+      body {
+        font-family: Georgia, "Times New Roman", serif;
+        max-width: 720px;
+        margin: 40px auto;
+        padding: 0 20px;
+        color: #222;
+        background: #fdfaf3;
+      }
+      h1 {
+        color: #7a3b12;
+      }
+      button {
+        font-family: inherit;
+        font-size: 18px;
+        padding: 10px 24px;
+        border: 2px solid #7a3b12;
+        background: #fdfaf3;
+        color: #7a3b12;
+        border-radius: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Acme Roofing &amp; Gutters</h1>
+    <p>
+      Lorem ipsum dolor sit amet, consectetur adipiscing elit. This is a placeholder marketing page used only to
+      host a local build of the chat widget during development. Nothing on this page belongs to the widget except
+      the <code>&lt;script&gt;</code> tag below.
+    </p>
+    <p>
+      Suspendisse potenti. Curabitur non nulla sit amet nisl tempus convallis quis ac lectus. Vivamus suscipit
+      tortor eget felis porttitor volutpat.
+    </p>
+    <button type="button">A host-page button (unrelated to the widget)</button>
+
+    <!--
+      Production embed snippet (S14.1 decision 7). config.ts reads exactly
+      these data-* attributes:
+        - data-client-key  (required)  -- a REAL pk_... key from a seeded
+                                          tenant whose allowed_origins
+                                          contains this dev origin verbatim
+                                          (see dev/README.md).
+        - data-api-base    (optional)  -- points at the local backend.
+        - data-debug       (optional)  -- "true" renders the diagnostic
+                                          strip inside the shadow root on
+                                          admission failure.
+
+      S14.2 adds no new data-* attributes / no new embed snippet — the same
+      <script> tag now yields an interactive chat once admission succeeds
+      (see dev/README.md's S14.2 walkthrough section). For the chat turns
+      themselves to actually answer (rather than surface an honest
+      LLM_NOT_CONFIGURED / RAG_EMBEDDING_NOT_CONFIGURED error line), the
+      tenant behind this client key additionally needs a configured LLM
+      provider + ingested knowledge (see dev/README.md).
+
+      S14.3 likewise adds no new data-* attributes / no new embed snippet —
+      the same <script> tag now yields the real consent-gated lead form
+      (instead of the old stub line) whenever a turn returns
+      action="lead_form" (see dev/README.md's S14.3 walkthrough section).
+
+      S14.4 likewise adds no new data-* attributes / no new embed snippet —
+      the same <script> tag now yields the real consent-gated schedule CTA
+      (instead of the old stub line) whenever a turn returns
+      action="schedule_cta" (see dev/README.md's S14.4 walkthrough section).
+      For the happy path (open slots actually appearing), the tenant behind
+      this client key additionally needs availability configured — an
+      unconfigured tenant correctly shows the honest "no times available"
+      empty-state instead.
+
+      S14.5 likewise adds no new data-* attributes / no new embed snippet —
+      the same <script> tag now yields a panel with a working focus trap,
+      Escape-to-close, an announced (aria-live) message log, AA-contrast
+      styling, a reduced-motion-guarded typing indicator, and a header
+      Mute/Unmute toggle for the opt-in browser TTS greeting (see
+      dev/README.md's S14.5 walkthrough section — this is the sprint that
+      needs a real screen reader + a contrast checker, not just the
+      backend).
+
+      S14.6 likewise adds no new data-* attributes / no new embed snippet —
+      the same <script> tag now yields a bounded auto-retry/backoff layer
+      wrapping admission + turn sends, a connection-status indicator in the
+      panel header (online/retrying/rate-limited/reconnecting-session/
+      offline), a manual Retry control once auto-retry has stopped, and a
+      bounded (never unbounded) re-mint attempt on an expired session (see
+      dev/README.md's S14.6 walkthrough section — this is the sprint that
+      needs the backend process stopped/started and the admission rate
+      limit hammered on purpose, not just a normal chat flow).
+
+      Replace the client key below with a real pk_... key before testing
+      (see dev/README.md step 3).
+    -->
+    <script
+      src="/src/entry.tsx"
+      type="module"
+      data-client-key="pk_rDEpRNAAX2b9EWNRY2FFH25IHl01vd8i"
+      data-api-base="http://localhost:8000"
+      data-debug="true"
+    ></script>
+  </body>
+</html>
