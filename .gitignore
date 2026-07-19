@@ -236,6 +236,9 @@ jar_pa.txt
 kickbacks.vsix
 live_pass_S12.1_S12.2_S10.5.cmd
 Chatbot - Roofing Questions.md
+graphify-out/
+knowledge_base/
+manual_test.txt
 
 # Local dev data (storage root for document ingestion; never commit uploads)
 .devdata/
