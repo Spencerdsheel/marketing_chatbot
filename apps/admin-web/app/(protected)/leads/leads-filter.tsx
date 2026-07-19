@@ -34,34 +34,32 @@ export function LeadsFilter({
     <form
       action={basePath}
       method="get"
-      className="flex flex-wrap items-end gap-3"
+      className="flex flex-wrap items-center gap-2.5"
     >
-      <div className="flex flex-col gap-1">
-        <label htmlFor="stage" className="text-xs font-medium text-muted-foreground">
-          Stage
-        </label>
-        <select
-          id="stage"
-          name="stage"
-          defaultValue={currentStage ?? ""}
-          className="h-8 rounded-lg border border-input bg-transparent px-2.5 py-1 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
-        >
-          <option value="">All stages</option>
-          {LEAD_STAGES.map((stage) => (
-            <option key={stage} value={stage}>
-              {STAGE_LABELS[stage]}
-            </option>
-          ))}
-        </select>
-      </div>
+      <label htmlFor="stage" className="sr-only">
+        Stage
+      </label>
+      <select
+        id="stage"
+        name="stage"
+        defaultValue={currentStage ?? ""}
+        className="min-h-9 rounded-[9px] border border-[#e7e7e2] bg-white px-3 text-[12.5px] text-[#45463f] outline-none focus-visible:border-[#191a17]"
+      >
+        <option value="">All stages</option>
+        {LEAD_STAGES.map((stage) => (
+          <option key={stage} value={stage}>
+            {STAGE_LABELS[stage]}
+          </option>
+        ))}
+      </select>
       <button
         type="submit"
-        className="h-8 rounded-lg border border-transparent bg-primary px-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/80"
+        className="min-h-9 rounded-[9px] border border-[#e7e7e2] bg-white px-3.5 text-[12.5px] font-semibold text-[#45463f] hover:bg-[#f7f7f3]"
       >
         Filter
       </button>
       {currentStage ? (
-        <Link href={basePath} className="text-sm text-muted-foreground hover:underline">
+        <Link href={basePath} className="text-[12.5px] text-[#70716a] underline underline-offset-2">
           Clear filter
         </Link>
       ) : null}

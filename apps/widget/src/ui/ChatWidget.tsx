@@ -393,6 +393,9 @@ export function ChatWidget({ config, expiresAt }: ChatWidgetProps) {
                 aria-label={muted ? "Turn greeting sound on" : "Turn greeting sound off"}
               >
                 <ChatGlyph name={muted ? "muted" : "sound"} />
+                <span className="cw-mute-toggle-label" aria-hidden="true">
+                  {muted ? "Off" : "On"}
+                </span>
               </button>
               <button type="button" className="cw-close-button" onClick={toggleOpen} aria-label="Close chat">
                 <ChatGlyph name="close" />

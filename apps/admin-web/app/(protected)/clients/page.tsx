@@ -1,94 +1,164 @@
 /**
- * PLATFORM_ADMIN "Clients" tile list (S13.7). This is the top-level area a
- * platform admin lands on (D4) -- a tile per onboarded client, each linking
- * into that client's management area (`/clients/{tenantId}/settings`), plus
- * the "Add client" platform-level action (D7). Gated by `requireRole`
- * (D6) -- a CLIENT_ADMIN/CLIENT_AGENT who forces this URL is redirected to
- * their own dashboard (mirrors `tenants/new/page.tsx`'s existing pattern).
+ * PLATFORM_ADMIN "Clients" tile list (S13.7), restyled to the locked design
+ * spec screen 6b (`knowledge_base/ui design/updated ui/project/
+ * Chatbot System Designs.dc.html#6b` + `HANDOFF-SPEC.md` §2/§3). This is the
+ * top-level area a platform admin lands on (D4) -- a tenant card per
+ * onboarded client, each linking into that client's management area
+ * (`/clients/{tenantId}/settings`), plus the "Add client" platform-level
+ * action (D7). Gated by `requireRole` (D6) -- a CLIENT_ADMIN/CLIENT_AGENT who
+ * forces this URL is redirected to their own dashboard (mirrors
+ * `tenants/new/page.tsx`'s existing pattern).
  *
- * Honest empty/error states (no fabricated client rows) -- `listClients()`
- * (lib/clients.ts) already returns a discriminated result for exactly this.
+ * Design-vs-real-data note (read before "fixing" the status/usage fields):
+ * screen 6b's mockup shows ACTIVE/ONBOARDING/PAST DUE badges, a usage row
+ * (convos/mo, leads, plan), and an ONBOARDING checklist card -- none of that
+ * has a backend source. `ClientSummary` (lib/clients.ts) only carries
+ * `tenantId`/`name`/`slug`/`enabled` (from `TenantRepository.list`, no
+ * billing/usage/plan/checklist columns exist -- confirmed against
+ * `services/api/src/api/tenants/**` and `services/api/src/api/admin/**`).
+ * So this page renders the real two-state signal the backend actually has --
+ * ACTIVE vs DISABLED, from `enabled` -- and deliberately OMITS the usage row
+ * and the ONBOARDING checklist card rather than fabricate numbers or fake
+ * checklist progress (CLAUDE.md §3 "no silent fallbacks" / honest empty
+ * states, same standard `listClients()` already applies to the empty-list
+ * case). Promoting a real `/admin/tenants` list with usage/billing/plan
+ * fields is a reasonable follow-up but out of scope here (no `services/**`
+ * changes this sprint).
  */
 import Link from "next/link";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import { requireRole } from "@/lib/auth";
-import { listClients } from "@/lib/clients";
+import { listClients, type ClientSummary } from "@/lib/clients";
 import { OnboardClientForm } from "@/app/(protected)/clients/onboard-client-form";
+
+function initials(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "??";
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[1][0]).toUpperCase();
+}
+
+function StatusBadge({ enabled }: { enabled: boolean }) {
+  return (
+    <span
+      className={
+        "shrink-0 rounded-full px-2 py-[3px] text-[10px] font-bold tracking-wide " +
+        (enabled ? "bg-[#dcefdc] text-[#1f6a2f]" : "bg-[#f6e3df] text-[#c2452d]")
+      }
+    >
+      {enabled ? "ACTIVE" : "DISABLED"}
+    </span>
+  );
+}
+
+function ClientCard({ client }: { client: ClientSummary }) {
+  return (
+    <li className="flex flex-col gap-3 rounded-[14px] border border-[#e7e7e2] bg-white p-[18px]">
+      <div className="flex items-center gap-2.5">
+        <div className="grid size-9 shrink-0 place-items-center rounded-[10px] bg-[#ecece5] text-[13px] font-bold text-[#191a17]">
+          {initials(client.name)}
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm font-bold text-[#191a17]">{client.name}</p>
+          <p className="truncate text-[11px] text-[#96978e]">{client.slug}</p>
+        </div>
+        <StatusBadge enabled={client.enabled} />
+      </div>
+
+      {/* Usage row intentionally omitted -- no backend usage/plan/billing
+          signal exists for tenants yet (see file header note). */}
+
+      <div className="flex gap-2 border-t border-[#f0f0ea] pt-3">
+        <Link
+          href={`/clients/${client.tenantId}/settings`}
+          className="flex min-h-11 flex-1 items-center justify-center rounded-lg border border-[#e7e7e2] px-3 text-[11.5px] font-semibold text-[#45463f] transition-colors hover:bg-[#f7f7f3] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#191a17]"
+        >
+          Open console →
+        </Link>
+      </div>
+    </li>
+  );
+}
+
+function AddClientTile() {
+  return (
+    <li>
+      <Link
+        href="#add-client"
+        className="flex min-h-[150px] w-full flex-col items-center justify-center gap-2 rounded-[14px] border-[1.5px] border-dashed border-[#d5d5cb] text-[#96978e] transition-colors hover:border-[#a8a99f] hover:text-[#70716a] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#191a17]"
+      >
+        <span className="grid size-[34px] place-items-center rounded-full bg-[#f7f7f3] text-base">
+          +
+        </span>
+        <span className="text-xs font-semibold">Add a client</span>
+      </Link>
+    </li>
+  );
+}
 
 export default async function ClientsPage() {
   await requireRole("PLATFORM_ADMIN");
 
   const result = await listClients();
+  const activeCount =
+    result.status === "ok" ? result.items.filter((c) => c.enabled).length : null;
 
   return (
-    <div className="flex flex-1 flex-col items-center gap-6 p-8">
-      <div className="grid w-full max-w-5xl gap-6 lg:grid-cols-[2fr_1fr]">
-        <Card>
-          <CardHeader>
-            <CardTitle>Clients</CardTitle>
-            <CardDescription>
-              Every onboarded client. Select one to manage its bot, leads, analytics, and
-              knowledge base.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            {result.status === "error" ? (
-              <p
-                role="alert"
-                className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive"
-              >
-                {result.message}
-                {result.correlationId ? (
-                  <span className="block text-xs text-destructive/80">
-                    Correlation ID: {result.correlationId}
-                  </span>
-                ) : null}
-              </p>
-            ) : result.items.length === 0 ? (
-              <p role="status" className="rounded-md border border-input bg-muted/50 p-4 text-sm">
-                No clients yet — use &quot;Add client&quot; to onboard the first one.
-              </p>
-            ) : (
-              <ul className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                {result.items.map((client) => (
-                  <li key={client.tenantId}>
-                    <Link
-                      href={`/clients/${client.tenantId}/settings`}
-                      className="flex flex-col gap-1 rounded-md border border-input p-4 transition-colors hover:bg-muted/50"
-                    >
-                      <span className="font-medium">{client.name}</span>
-                      <span className="font-mono text-xs text-muted-foreground">
-                        {client.slug}
-                      </span>
-                      {!client.enabled ? (
-                        <span className="text-xs text-destructive">Disabled</span>
-                      ) : null}
-                    </Link>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </CardContent>
-        </Card>
+    <div className="flex flex-1 flex-col gap-6 p-6 lg:p-8">
+      <div className="flex items-center gap-3.5">
+        <div>
+          <div className="flex items-center gap-2.5">
+            <h1 className="text-xl font-bold text-[#191a17]">Clients</h1>
+            <span className="rounded-full bg-[#191a17] px-2.5 py-[3px] text-[10.5px] font-bold text-[#e4f222]">
+              PLATFORM ADMIN
+            </span>
+          </div>
+          {result.status === "ok" ? (
+            <p className="mt-0.5 text-[12.5px] text-[#70716a]">
+              {result.items.length} tenant{result.items.length === 1 ? "" : "s"}
+              {activeCount !== null ? ` · ${activeCount} active` : ""}
+            </p>
+          ) : null}
+        </div>
+        <a
+          href="#add-client"
+          className="ml-auto flex min-h-11 items-center whitespace-nowrap rounded-lg bg-[#191a17] px-4 text-[12.5px] font-bold text-[#e4f222] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#191a17]"
+        >
+          + New client
+        </a>
+      </div>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>Add client</CardTitle>
-            <CardDescription>
-              Creates a new tenant and its first CLIENT_ADMIN user. The client key (and generated
-              admin password, if any) are shown exactly once — they cannot be recovered later.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <OnboardClientForm />
-          </CardContent>
-        </Card>
+      {result.status === "error" ? (
+        <p
+          role="alert"
+          className="rounded-[14px] border border-[#c2452d]/40 bg-[#f6e3df] p-4 text-sm text-[#c2452d]"
+        >
+          {result.message}
+          {result.correlationId ? (
+            <span className="block text-xs opacity-80">Correlation ID: {result.correlationId}</span>
+          ) : null}
+        </p>
+      ) : result.items.length === 0 ? (
+        <p role="status" className="rounded-[14px] border border-[#e7e7e2] bg-[#f7f7f3] p-4 text-sm text-[#45463f]">
+          No clients yet — use &quot;Add a client&quot; below to onboard the first one.
+        </p>
+      ) : (
+        <ul className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          {result.items.map((client) => (
+            <ClientCard key={client.tenantId} client={client} />
+          ))}
+          <AddClientTile />
+        </ul>
+      )}
+
+      <div id="add-client" className="scroll-mt-6 rounded-[14px] border border-[#e7e7e2] bg-white p-5">
+        <h2 className="text-sm font-bold text-[#191a17]">Add client</h2>
+        <p className="mt-1 text-[12.5px] text-[#70716a]">
+          Creates a new tenant and its first CLIENT_ADMIN user. The client key (and generated admin
+          password, if any) are shown exactly once — they cannot be recovered later.
+        </p>
+        <div className="mt-4 max-w-md">
+          <OnboardClientForm />
+        </div>
       </div>
     </div>
   );

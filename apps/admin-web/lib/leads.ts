@@ -15,6 +15,29 @@
 import "server-only";
 
 import { adminApiFetch, AdminApiError } from "@/lib/api";
+import type {
+  LeadDetail,
+  LeadDetailResult,
+  LeadActivityItem,
+  LeadActivitiesResult,
+  BadgeStyle,
+} from "@/lib/leads-presentation";
+import {
+  stageBadgeStyle,
+  scoreChipStyle,
+  initialsFromName,
+} from "@/lib/leads-presentation";
+
+// Re-exported so existing server-side consumers (`leads-table.tsx`,
+// `lib/dashboard.ts`, and this module's own test suite) can keep importing
+// these pure, client-safe types/functions from `@/lib/leads` unchanged.
+// `lead-drawer.tsx` (a Client Component) must import them from
+// `@/lib/leads-presentation` directly instead -- see that file's header for
+// why (this module is `server-only` and can't be reached from client code,
+// even transitively for a type-only import, without triggering Next's
+// "'server-only' cannot be imported from a Client Component" build error).
+export type { LeadDetail, LeadDetailResult, LeadActivityItem, LeadActivitiesResult, BadgeStyle };
+export { stageBadgeStyle, scoreChipStyle, initialsFromName };
 
 /** The five canonical lead stages (pipeline.py STAGE_ORDER + TERMINAL_STAGES). */
 export const LEAD_STAGES = [
@@ -178,3 +201,133 @@ function mapErrorMessage(error: AdminApiError): string {
     error.correlationId || "n/a"
   }.`;
 }
+
+function mapDetailErrorMessage(error: AdminApiError): string {
+  if (error.status === 404 || error.errorCode === "NOT_FOUND") {
+    return "This lead could not be found.";
+  }
+  if (error.status === 403 || error.errorCode === "ROLE_NOT_PERMITTED") {
+    return "You do not have permission to view this lead.";
+  }
+  if (error.status === 401) {
+    return "Your session has expired. Please log in again.";
+  }
+  return `Something went wrong (${error.errorCode || "UNKNOWN_ERROR"}). Correlation ID: ${
+    error.correlationId || "n/a"
+  }.`;
+}
+
+// ---------------------------------------------------------------------------
+// Lead detail drawer (4b) -- GET /admin/leads/{lead_id} and
+// GET /admin/leads/{lead_id}/activities. Both mirror `admin_routes.py`'s
+// leak-free response shapes exactly (no `tenant_id`). There is intentionally
+// no transcript endpoint in this router (leads are not linked to a
+// conversation_id anywhere server-side yet) -- the drawer's Transcript tab
+// therefore has no real data source and must show an honest "not available"
+// state rather than fabricate one (CLAUDE.md §3, no silent fallbacks).
+// ---------------------------------------------------------------------------
+
+interface LeadDetailResponseBody {
+  lead_id: string;
+  name: string;
+  email: string;
+  phone: string | null;
+  status: string;
+  stage: string;
+  qualification_score: number | null;
+  assigned_agent_id: string | null;
+  source: string;
+}
+
+function toLeadDetail(body: LeadDetailResponseBody): LeadDetail {
+  return {
+    leadId: body.lead_id,
+    name: body.name,
+    email: body.email,
+    phone: body.phone,
+    status: body.status,
+    stage: body.stage,
+    qualificationScore: body.qualification_score,
+    assignedAgentId: body.assigned_agent_id,
+    source: body.source,
+  };
+}
+
+/** Fetch a single lead's detail for the drawer's Details tab. Mirrors
+ * `listLeads`'s tenant-scoped-path convention exactly. */
+export async function getLeadDetail(
+  leadId: string,
+  tenantId?: string
+): Promise<LeadDetailResult> {
+  const basePath = tenantId
+    ? `/admin/tenants/${encodeURIComponent(tenantId)}/leads`
+    : "/admin/leads";
+
+  try {
+    const response = await adminApiFetch(`${basePath}/${encodeURIComponent(leadId)}`);
+    const body = (await response.json()) as LeadDetailResponseBody;
+    return { status: "ok", lead: toLeadDetail(body) };
+  } catch (error) {
+    if (error instanceof AdminApiError) {
+      return { status: "error", message: mapDetailErrorMessage(error), correlationId: error.correlationId };
+    }
+    return {
+      status: "error",
+      message: "Unable to reach the server. Please try again.",
+      correlationId: "",
+    };
+  }
+}
+
+interface LeadActivityResponseBody {
+  activity_id: string;
+  lead_id: string;
+  type: string;
+  payload: Record<string, unknown> | null;
+  actor: string | null;
+  created_at: string;
+}
+
+function toLeadActivityItem(body: LeadActivityResponseBody): LeadActivityItem {
+  return {
+    activityId: body.activity_id,
+    leadId: body.lead_id,
+    type: body.type,
+    payload: body.payload,
+    actor: body.actor,
+    createdAt: body.created_at,
+  };
+}
+
+/** Fetch a lead's full timeline for the drawer's Activity tab. The Notes tab
+ * reuses this same call, filtered client-side to `type === "note"` -- the
+ * backend has no separate notes-only GET route. */
+export async function getLeadActivities(
+  leadId: string,
+  tenantId?: string
+): Promise<LeadActivitiesResult> {
+  const basePath = tenantId
+    ? `/admin/tenants/${encodeURIComponent(tenantId)}/leads`
+    : "/admin/leads";
+
+  try {
+    const response = await adminApiFetch(
+      `${basePath}/${encodeURIComponent(leadId)}/activities`
+    );
+    const body = (await response.json()) as LeadActivityResponseBody[];
+    return { status: "ok", items: body.map(toLeadActivityItem) };
+  } catch (error) {
+    if (error instanceof AdminApiError) {
+      return { status: "error", message: mapDetailErrorMessage(error), correlationId: error.correlationId };
+    }
+    return {
+      status: "error",
+      message: "Unable to reach the server. Please try again.",
+      correlationId: "",
+    };
+  }
+}
+
+// 4b design tokens (badge/score/initials helpers) now live in
+// `@/lib/leads-presentation` (client-safe) and are re-exported at the top of
+// this file for backwards compatibility with existing server-side imports.

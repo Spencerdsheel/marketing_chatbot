@@ -1,11 +1,28 @@
 /**
- * Range + bucket control (S13.5.md decision 5). A plain GET `<form>` with
- * two native `<select>`s -- no client JS, no `select` primitive dependency
- * (decision 7), mirroring `leads/leads-filter.tsx` exactly. Submitting
- * navigates to `/analytics?range=...&bucket=...`, which re-runs the server
- * component. Server component -- no `"use client"` needed.
+ * Range + bucket control (S13.5.md decision 5), restyled to Ink & Citron's
+ * 5b segmented pill toggle (7d / 30d / 90d / Custom). Still a plain GET
+ * `<form>` -- no client JS, no `select` primitive dependency (decision 7),
+ * mirroring `leads/leads-filter.tsx`. Submitting navigates to
+ * `/analytics?range=...&bucket=...[&from=...&to=...]`, which re-runs the
+ * server component. Server component -- no `"use client"` needed.
+ *
+ * The visual segmented control is built from radio inputs styled as pills
+ * (native `<input type="radio">` + `<label>`, no JS) so keyboard/screen
+ * reader users get real radio-group semantics instead of a div soup. The
+ * "Custom" option reveals two native `<input type="date">` fields; because
+ * this is a zero-JS server component, both date inputs are always present
+ * in the DOM (not conditionally toggled) and are ignored server-side by
+ * `resolveAnalyticsQuery` unless `range=custom` is actually submitted --
+ * so picking a custom date range while a preset pill is still checked has
+ * no unexpected effect.
  */
-import { ANALYTICS_BUCKETS, ANALYTICS_RANGES, type AnalyticsBucket, type AnalyticsRangeKey } from "@/lib/analytics";
+import {
+  ANALYTICS_BUCKETS,
+  ANALYTICS_RANGES,
+  CUSTOM_RANGE_KEY,
+  type AnalyticsBucket,
+  type AnalyticsRangeKey,
+} from "@/lib/analytics";
 
 const BUCKET_LABELS: Record<AnalyticsBucket, string> = {
   day: "Day",
@@ -21,40 +38,90 @@ const BUCKET_LABELS: Record<AnalyticsBucket, string> = {
 export function AnalyticsRange({
   currentRange,
   currentBucket,
+  currentFrom,
+  currentTo,
   basePath = "/analytics",
 }: {
   currentRange: AnalyticsRangeKey;
   currentBucket: AnalyticsBucket;
+  currentFrom?: string;
+  currentTo?: string;
   basePath?: string;
 }) {
+  const isCustom = currentRange === CUSTOM_RANGE_KEY;
+
   return (
-    <form action={basePath} method="get" className="flex flex-wrap items-end gap-3">
-      <div className="flex flex-col gap-1">
-        <label htmlFor="range" className="text-xs font-medium text-muted-foreground">
-          Date range
-        </label>
-        <select
-          id="range"
-          name="range"
-          defaultValue={currentRange}
-          className="h-8 rounded-lg border border-input bg-transparent px-2.5 py-1 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
-        >
+    <form
+      action={basePath}
+      method="get"
+      className="flex flex-wrap items-end gap-3"
+      aria-label="Analytics date range and bucket"
+    >
+      <fieldset className="flex flex-col gap-1">
+        <legend className="text-xs font-medium text-[#70716a]">Date range</legend>
+        <div className="flex overflow-hidden rounded-[9px] border border-[#e7e7e2] text-xs font-semibold">
           {ANALYTICS_RANGES.map((range) => (
-            <option key={range.key} value={range.key}>
-              {range.label}
-            </option>
+            <label
+              key={range.key}
+              className="cursor-pointer px-3.5 py-[7px] text-[#5a5b54] transition-colors has-checked:bg-[#191a17] has-checked:text-white hover:has-[:not(:checked)]:bg-[#f7f7f3] focus-within:outline-2 focus-within:outline-offset-[-2px] focus-within:outline-[#191a17]"
+            >
+              <input
+                type="radio"
+                name="range"
+                value={range.key}
+                defaultChecked={currentRange === range.key}
+                className="sr-only"
+              />
+              {range.label.replace("Last ", "")}
+            </label>
           ))}
-        </select>
+          <label className="cursor-pointer border-l border-[#e7e7e2] px-3.5 py-[7px] text-[#5a5b54] transition-colors has-checked:bg-[#191a17] has-checked:text-white hover:has-[:not(:checked)]:bg-[#f7f7f3] focus-within:outline-2 focus-within:outline-offset-[-2px] focus-within:outline-[#191a17]">
+            <input
+              type="radio"
+              name="range"
+              value={CUSTOM_RANGE_KEY}
+              defaultChecked={isCustom}
+              className="sr-only"
+            />
+            Custom
+          </label>
+        </div>
+      </fieldset>
+
+      <div className="flex flex-col gap-1">
+        <label htmlFor="from" className="text-xs font-medium text-[#70716a]">
+          Custom from
+        </label>
+        <input
+          type="date"
+          id="from"
+          name="from"
+          defaultValue={currentFrom}
+          className="h-8 rounded-[9px] border border-[#e7e7e2] bg-white px-2.5 py-1 text-sm text-[#191a17] outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#191a17]"
+        />
       </div>
       <div className="flex flex-col gap-1">
-        <label htmlFor="bucket" className="text-xs font-medium text-muted-foreground">
+        <label htmlFor="to" className="text-xs font-medium text-[#70716a]">
+          Custom to
+        </label>
+        <input
+          type="date"
+          id="to"
+          name="to"
+          defaultValue={currentTo}
+          className="h-8 rounded-[9px] border border-[#e7e7e2] bg-white px-2.5 py-1 text-sm text-[#191a17] outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#191a17]"
+        />
+      </div>
+
+      <div className="flex flex-col gap-1">
+        <label htmlFor="bucket" className="text-xs font-medium text-[#70716a]">
           Bucket
         </label>
         <select
           id="bucket"
           name="bucket"
           defaultValue={currentBucket}
-          className="h-8 rounded-lg border border-input bg-transparent px-2.5 py-1 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
+          className="h-8 rounded-[9px] border border-[#e7e7e2] bg-white px-2.5 py-1 text-sm text-[#191a17] outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#191a17]"
         >
           {ANALYTICS_BUCKETS.map((bucket) => (
             <option key={bucket} value={bucket}>
@@ -65,7 +132,7 @@ export function AnalyticsRange({
       </div>
       <button
         type="submit"
-        className="h-8 rounded-lg border border-transparent bg-primary px-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/80"
+        className="h-8 rounded-[9px] bg-[#191a17] px-3.5 text-sm font-semibold text-[#e4f222] transition-colors hover:bg-[#30312d] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#191a17]"
       >
         Apply
       </button>

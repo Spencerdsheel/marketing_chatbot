@@ -71,6 +71,46 @@ describe("resolveAnalyticsQuery", () => {
     // ISO datetimes contain `:` which URLSearchParams encodes as %3A.
     expect(qs).toContain("%3A");
   });
+
+  it("range=custom with valid from/to honors the caller-supplied window verbatim", () => {
+    const qs = resolveAnalyticsQuery({
+      range: "custom",
+      from: "2026-01-01",
+      to: "2026-01-15",
+    });
+    const params = new URLSearchParams(qs);
+    expect(new Date(params.get("from")!).toISOString()).toBe(
+      new Date("2026-01-01").toISOString()
+    );
+    expect(new Date(params.get("to")!).toISOString()).toBe(new Date("2026-01-15").toISOString());
+  });
+
+  it("range=custom with from >= to falls back to the 30-day default (no silent misapplication)", () => {
+    const qs = resolveAnalyticsQuery({ range: "custom", from: "2026-01-15", to: "2026-01-01" });
+    const params = new URLSearchParams(qs);
+    const from = new Date(params.get("from")!);
+    const to = new Date(params.get("to")!);
+    const days = (to.getTime() - from.getTime()) / (24 * 60 * 60 * 1000);
+    expect(days).toBeCloseTo(30, 0);
+  });
+
+  it("range=custom with a missing to falls back to the 30-day default", () => {
+    const qs = resolveAnalyticsQuery({ range: "custom", from: "2026-01-01" });
+    const params = new URLSearchParams(qs);
+    const from = new Date(params.get("from")!);
+    const to = new Date(params.get("to")!);
+    const days = (to.getTime() - from.getTime()) / (24 * 60 * 60 * 1000);
+    expect(days).toBeCloseTo(30, 0);
+  });
+
+  it("range=custom with an unparseable date falls back to the 30-day default", () => {
+    const qs = resolveAnalyticsQuery({ range: "custom", from: "not-a-date", to: "2026-01-15" });
+    const params = new URLSearchParams(qs);
+    const from = new Date(params.get("from")!);
+    const to = new Date(params.get("to")!);
+    const days = (to.getTime() - from.getTime()) / (24 * 60 * 60 * 1000);
+    expect(days).toBeCloseTo(30, 0);
+  });
 });
 
 describe("formatRate (Decision 6a, MANDATORY no-silent-fallback)", () => {

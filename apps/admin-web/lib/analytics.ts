@@ -34,7 +34,15 @@ export const ANALYTICS_RANGES = [
   { key: "90d", label: "Last 90 days", days: 90 },
 ] as const;
 
-export type AnalyticsRangeKey = (typeof ANALYTICS_RANGES)[number]["key"];
+/** The 5b "Custom" range-toggle option (HANDOFF-SPEC.md §3): an explicit
+ * `from`/`to` date pair the caller supplies via `?range=custom&from=...&to=...`,
+ * validated against the same backend rules as the preset ranges (`from <
+ * to`, span <= `analytics_max_window_days`) rather than a client-side day
+ * count. Kept as a distinct key (not part of `ANALYTICS_RANGES`) since it
+ * has no fixed `days` -- `resolveAnalyticsQuery` branches on it explicitly. */
+export const CUSTOM_RANGE_KEY = "custom" as const;
+
+export type AnalyticsRangeKey = (typeof ANALYTICS_RANGES)[number]["key"] | typeof CUSTOM_RANGE_KEY;
 
 export const DEFAULT_RANGE_KEY: AnalyticsRangeKey = "30d";
 export const DEFAULT_BUCKET: AnalyticsBucket = "day";
@@ -109,6 +117,18 @@ export type AnalyticsResult =
 export interface AnalyticsQueryParams {
   range?: string;
   bucket?: string;
+  /** Custom-range inputs (5b "Custom" toggle option), `YYYY-MM-DD` from a
+   * native `<input type="date">`. Only consulted when `range === "custom"`. */
+  from?: string;
+  to?: string;
+}
+
+function isValidCustomRange(fromRaw: string | undefined, toRaw: string | undefined): boolean {
+  if (!fromRaw || !toRaw) return false;
+  const from = new Date(fromRaw);
+  const to = new Date(toRaw);
+  if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) return false;
+  return from.getTime() < to.getTime();
 }
 
 /**
@@ -118,24 +138,40 @@ export interface AnalyticsQueryParams {
  * "day" rather than a guaranteed `422 INVALID_BUCKET` on first paint --
  * Decision 5's belt-and-suspenders is the 422 mapping in
  * `getAnalyticsOverview` below, for the rare case a bad value still
- * reaches the backend). Computes `to = now(UTC)` / `from = to - days` and
- * returns a URL-encoded query string via `URLSearchParams` (never
- * string-concatenated raw).
+ * reaches the backend). Computes `to = now(UTC)` / `from = to - days` for a
+ * preset range and returns a URL-encoded query string via `URLSearchParams`
+ * (never string-concatenated raw).
+ *
+ * `range=custom` (5b's 4th toggle option): honors caller-supplied `from`/
+ * `to` (`YYYY-MM-DD`) verbatim as the window bounds when both are present
+ * and `from < to` -- no-silent-fallback (CLAUDE.md §3): an incomplete or
+ * invalid custom range does NOT get silently coerced into some other
+ * window; it falls back to the same explicit `30d` default as an unknown
+ * preset key, so the caller sees a real, disclosed window rather than a
+ * custom range that silently wasn't applied.
  */
 export function resolveAnalyticsQuery(params: AnalyticsQueryParams): string {
   const rangeKey = params.range?.trim();
-  const range =
-    ANALYTICS_RANGES.find((r) => r.key === rangeKey) ??
-    ANALYTICS_RANGES.find((r) => r.key === DEFAULT_RANGE_KEY)!;
+
+  let from: Date;
+  let to: Date;
+
+  if (rangeKey === CUSTOM_RANGE_KEY && isValidCustomRange(params.from, params.to)) {
+    from = new Date(params.from!);
+    to = new Date(params.to!);
+  } else {
+    const range =
+      ANALYTICS_RANGES.find((r) => r.key === rangeKey) ??
+      ANALYTICS_RANGES.find((r) => r.key === DEFAULT_RANGE_KEY)!;
+    to = new Date();
+    from = new Date(to.getTime() - range.days * 24 * 60 * 60 * 1000);
+  }
 
   const bucketValue = params.bucket?.trim();
   const bucket =
     bucketValue && (ANALYTICS_BUCKETS as readonly string[]).includes(bucketValue)
       ? (bucketValue as AnalyticsBucket)
       : DEFAULT_BUCKET;
-
-  const to = new Date();
-  const from = new Date(to.getTime() - range.days * 24 * 60 * 60 * 1000);
 
   const query = new URLSearchParams();
   query.set("from", from.toISOString());

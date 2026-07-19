@@ -27,6 +27,12 @@ discriminated plan (``_ReplayOutcome`` | ``_FixedOutcome`` | ``_GeneratePlan``);
 scan + degrade logic, shared by both the non-streaming ``answer_turn`` and
 the streaming ``answer_turn_stream``. This keeps the two delivery modes from
 ever drifting -- a turn-cap or guardrail fix is made once, not twice.
+
+Post-generation no-answer override: a grounded generation carrying the
+``_NO_ANSWER_SENTINEL`` is escalated at this same seam. The pre-generation
+``_decide()`` confidence band remains pure and untouched; this is a second
+deterministic post-generation check alongside guardrails, not a revival of
+the S10.1 free-text confidence floor.
 """
 from __future__ import annotations
 
@@ -173,17 +179,29 @@ class _FinalizedGeneration:
     grounded: bool
     action: str | None
     guardrail_flag: str | None
+    resolve_escalate_action: bool = False
 
 
 # -- Intent taxonomy (decision 1) -- a fixed, code-owned label set. Only the
 # numeric thresholds are tenant-tunable; the taxonomy itself is not.
 _INTENT_LABELS: list[str] = ["question", "chitchat", "scheduling_request", "off_topic", "other"]
 
+_NO_ANSWER_SENTINEL = "NO_ANSWER_FOUND"
+
+_FORMATTING_RULES = (
+    " Formatting rules: write short plain paragraphs. You may use **bold**, "
+    "*italic*, and `inline code`. Never use markdown tables, bullet points "
+    "(- or *), headings (#), blockquotes (>), or numbered-list markdown; when "
+    "listing or comparing options, write them as short sentences or as plain "
+    'lines like "1) ..." on separate lines.'
+)
+
 _GROUNDING_SYSTEM_PROMPT = (
     "You are a helpful assistant for this business. Answer the user's "
     "question using ONLY the context provided below. If the context does "
-    "not contain the answer, say you don't have that information -- do not "
-    "invent facts, prices, or commitments."
+    "not contain the answer, reply with exactly `NO_ANSWER_FOUND` and nothing "
+    "else -- do not apologize, do not invent facts, prices, or commitments."
+    + _FORMATTING_RULES
 )
 
 _NO_CONTEXT_LINE = "(no relevant knowledge was found)"
@@ -195,6 +213,7 @@ _CHITCHAT_SYSTEM_PROMPT = (
     "Reply briefly and warmly. Do NOT answer business-specific questions or "
     "invent facts, prices, or commitments; if asked something specific, "
     "invite them to ask about the business."
+    + _FORMATTING_RULES
 )
 
 # Fixed clarify template (decision 6) -- deterministic, cheap, no generate
@@ -548,8 +567,11 @@ def _finalize_generation(text: str, plan: _GeneratePlan) -> _FinalizedGeneration
     Runs ``scan_output(text)`` on the COMPLETE generated text. On a
     violation, returns the safe reply + ``decision="blocked"`` +
     ``action="lead_form"`` + ``grounded=False`` + ``sources=[]`` +
-    ``guardrail_flag=<rule>``. Otherwise returns the clean text + the plan's
-    own decision/sources/grounded, ``action=None``, ``guardrail_flag=None``.
+    ``guardrail_flag=<rule>``. A clean grounded response containing the
+    no-answer protocol sentinel becomes ``decision="escalate"`` with the
+    regular escalation reply; the caller lazily resolves its CTA action.
+    Otherwise returns the clean text + the plan's own decision/sources/
+    grounded, ``action=None``, ``guardrail_flag=None``.
     Shared verbatim by ``answer_turn`` (non-streaming) and
     ``answer_turn_stream`` (streaming) -- the caller does the ``append_message``
     write and builds its own return/``done`` payload (so ``tokens`` can differ
@@ -564,6 +586,16 @@ def _finalize_generation(text: str, plan: _GeneratePlan) -> _FinalizedGeneration
             grounded=False,
             action="lead_form",
             guardrail_flag=guardrail.rule,
+        )
+    if plan.grounded and _NO_ANSWER_SENTINEL in text:
+        return _FinalizedGeneration(
+            reply=_ESCALATE_REPLY,
+            decision="escalate",
+            sources=[],
+            grounded=False,
+            action=None,
+            guardrail_flag=None,
+            resolve_escalate_action=True,
         )
     return _FinalizedGeneration(
         reply=text,
@@ -665,6 +697,10 @@ async def answer_turn(
     finally:
         await plan.provider.aclose()
     final = _finalize_generation(completion.text, plan)
+    action = final.action
+    if final.resolve_escalate_action:
+        action = await _schedule_action(db, claims)
+        _log.info("post-generation no-answer escalate", extra={"event": "chat_no_answer_escalate"})
 
     stored_message_id = await append_message(
         db,
@@ -680,7 +716,7 @@ async def answer_turn(
         message_id=plan.assistant_id,
         sources=_sources_to_payload(final.sources),
         guardrail_flag=final.guardrail_flag,
-        action=final.action,
+        action=action,
     )
 
     return TurnResult(
@@ -691,7 +727,7 @@ async def answer_turn(
         confidence=plan.confidence,
         sources=final.sources,
         intent=plan.intent,
-        action=final.action,
+        action=action,
         guardrail_flag=final.guardrail_flag,
     )
 
@@ -863,6 +899,10 @@ async def answer_turn_stream(
 
     full_text = "".join(parts)
     final = _finalize_generation(full_text, plan)
+    action = final.action
+    if final.resolve_escalate_action:
+        action = await _schedule_action(db, claims)
+        _log.info("post-generation no-answer escalate", extra={"event": "chat_no_answer_escalate"})
 
     stored_message_id = await append_message(
         db,
@@ -878,7 +918,7 @@ async def answer_turn_stream(
         message_id=plan.assistant_id,
         sources=_sources_to_payload(final.sources),
         guardrail_flag=final.guardrail_flag,
-        action=final.action,
+        action=action,
     )
 
     if final.guardrail_flag is not None:
@@ -903,7 +943,7 @@ async def answer_turn_stream(
         decision=final.decision,
         confidence=plan.confidence,
         sources=_sources_to_payload(final.sources),
-        action=final.action,
+        action=action,
         intent=plan.intent,
         guardrail_flag=final.guardrail_flag,
     )

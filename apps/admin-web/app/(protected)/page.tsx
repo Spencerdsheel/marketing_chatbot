@@ -4,11 +4,6 @@ import { ArrowRight, CalendarDays, CircleAlert, UserRound } from "lucide-react";
 import { getClaims } from "@/lib/auth";
 import { getDashboardPipeline, type PipelineColumn } from "@/lib/dashboard";
 
-function formatRate(rate: number | null): string {
-  if (rate === null) return "No data";
-  return `${Math.round(rate * 100)}%`;
-}
-
 function formatDate(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "Date unavailable";
@@ -63,6 +58,87 @@ function LeadCard({ lead, featured }: { lead: PipelineColumn["items"][number]; f
         ) : null}
       </dl>
     </article>
+  );
+}
+
+/**
+ * Per-stage lead counts as paired bars, matching the 3a prototype's "New
+ * leads" chart shape (dark #3d3e38 + citron #e4f222 per group). We have no
+ * time-series metric to back a day-by-day chart, so each group is a pipeline
+ * stage instead of a weekday: the dark bar is that stage's share of the
+ * total pipeline, the citron bar is its share of the active (non-terminal)
+ * leads. Both are derived from `getDashboardPipeline`'s real column totals
+ * -- nothing here is fabricated.
+ */
+function StageDistributionChart({ columns }: { columns: PipelineColumn[] }) {
+  const total = columns.reduce((sum, column) => sum + column.total, 0);
+  const activeTotal = columns
+    .filter((column) => column.key !== "converted")
+    .reduce((sum, column) => sum + column.total, 0);
+  const maxTotal = Math.max(...columns.map((column) => column.total), 1);
+
+  return (
+    <div>
+      <p className="text-[13.5px] font-semibold text-[#c6c7bd]">Pipeline by stage</p>
+      <div className="mt-4 flex items-end gap-3.5" style={{ height: 110 }}>
+        {columns.map((column) => {
+          const shareOfTotal = total > 0 ? (column.total / maxTotal) * 100 : 0;
+          const shareOfActive =
+            column.key !== "converted" && activeTotal > 0 ? (column.total / maxTotal) * 100 : 0;
+          return (
+            <div key={column.key} className="flex flex-col items-center gap-1.5">
+              <div className="flex items-end gap-[3px]" style={{ height: 90 }}>
+                <div
+                  role="img"
+                  aria-label={`${column.label}: ${column.total} leads`}
+                  className="w-3 rounded-[3px] bg-[#3d3e38]"
+                  style={{ height: `${Math.max(shareOfTotal, column.total > 0 ? 6 : 0)}%` }}
+                />
+                <div
+                  className="w-3 rounded-[3px] bg-[#e4f222]"
+                  style={{ height: `${Math.max(shareOfActive, shareOfActive > 0 ? 6 : 0)}%` }}
+                />
+              </div>
+              <div className="text-[11px] text-[#9b9c93]">{column.label}</div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Half-donut built from a clipped conic-gradient ring, per HANDOFF-SPEC's 3a
+ * recipe. Driven entirely by the real `qualificationRate` metric (already
+ * computed in lib/dashboard.ts as progressed / total); renders a flat empty
+ * ring rather than a fabricated percentage when the denominator is zero.
+ */
+function QualificationDonut({ rate }: { rate: number | null }) {
+  const pct = rate === null ? 0 : Math.round(rate * 100);
+  const sweepDeg = (pct / 100) * 180;
+
+  return (
+    <div className="flex flex-col items-center gap-1">
+      <div className="relative overflow-hidden" style={{ width: 170, height: 92 }}>
+        <div
+          className="absolute top-0 rounded-full"
+          style={{
+            width: 170,
+            height: 170,
+            background: `conic-gradient(from -90deg, #e4f222 0deg ${sweepDeg}deg, #3d3e38 ${sweepDeg}deg 180deg, transparent 180deg)`,
+          }}
+        />
+        <div
+          className="absolute rounded-full bg-[#191a17]"
+          style={{ width: 126, height: 126, top: 22, left: 22 }}
+        />
+        <div className="absolute inset-x-0 bottom-0 text-center text-2xl leading-none font-bold text-white">
+          {rate === null ? "–" : `${pct}%`}
+        </div>
+      </div>
+      <div className="text-[13px] text-[#9b9c93]">Qualification rate</div>
+    </div>
   );
 }
 
@@ -133,28 +209,33 @@ export default async function ProtectedHomePage() {
         </div>
       ) : (
         <>
-          <section aria-label="Lead pipeline overview" className="mt-6 rounded-2xl bg-[#191a17] p-5 text-white sm:p-7">
-            <div className="grid gap-6 sm:grid-cols-2 xl:grid-cols-4">
-              <div className="border-b border-white/15 pb-5 sm:border-b-0 sm:border-r sm:pb-0 sm:pr-6">
-                <p className="text-sm font-semibold">Pipeline leads</p>
-                <p className="mt-5 text-4xl font-bold tracking-[-0.05em] tabular-nums">{result.metrics.total}</p>
-                <p className="mt-2 text-xs text-[#bfc0b7]">Across the four active stages</p>
-              </div>
-              <div className="border-b border-white/15 pb-5 sm:border-b-0 sm:border-r sm:pb-0 sm:pr-6">
-                <p className="text-sm font-semibold">Qualification rate</p>
-                <p className="mt-5 text-4xl font-bold tracking-[-0.05em] tabular-nums text-[#e4f222]">{formatRate(result.metrics.qualificationRate)}</p>
-                <p className="mt-2 text-xs text-[#bfc0b7]">Reached qualified or later</p>
-              </div>
-              <div className="border-b border-white/15 pb-5 sm:border-b-0 sm:border-r sm:pb-0 sm:pr-6">
-                <p className="text-sm font-semibold">Active leads</p>
-                <p className="mt-5 text-4xl font-bold tracking-[-0.05em] tabular-nums">{result.metrics.active}</p>
-                <p className="mt-2 text-xs text-[#bfc0b7]">Captured, qualified, or contacted</p>
-              </div>
-              <div>
-                <p className="text-sm font-semibold">Converted</p>
-                <p className="mt-5 text-4xl font-bold tracking-[-0.05em] tabular-nums text-[#e4f222]">{result.metrics.converted}</p>
-                <p className="mt-2 text-xs text-[#bfc0b7]">Current converted stage</p>
-              </div>
+          <section
+            aria-label="Lead pipeline overview"
+            className="mt-6 grid gap-8 rounded-2xl bg-[#191a17] p-5 text-white sm:p-7 lg:grid-cols-[1.2fr_1fr_0.9fr_0.9fr] lg:items-center"
+          >
+            <StageDistributionChart columns={result.columns} />
+            <QualificationDonut rate={result.metrics.qualificationRate} />
+            <div>
+              <p className="text-[13.5px] font-semibold text-[#c6c7bd]">Pipeline leads</p>
+              <p className="mt-2.5 text-4xl leading-none font-bold tracking-[-0.05em] tabular-nums text-white">
+                {result.metrics.total}
+              </p>
+              <p className="mt-2.5 text-[13.5px] leading-[1.4] text-[#9b9c93]">
+                Across the four
+                <br />
+                active stages
+              </p>
+            </div>
+            <div>
+              <p className="text-[13.5px] font-semibold text-[#c6c7bd]">Converted</p>
+              <p className="mt-2.5 text-4xl leading-none font-bold tracking-[-0.05em] tabular-nums text-[#e4f222]">
+                {result.metrics.converted}
+              </p>
+              <p className="mt-2.5 text-[13.5px] leading-[1.4] text-[#9b9c93]">
+                Current converted
+                <br />
+                stage
+              </p>
             </div>
           </section>
 

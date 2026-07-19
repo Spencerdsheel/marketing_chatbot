@@ -75,6 +75,57 @@ export function formatBytes(bytes: number): string {
 }
 
 /**
+ * Status badge recipe for the 5a design (HANDOFF-SPEC.md §2 Badges / §3
+ * "5a Knowledge"). The mock shows INDEXED/PROCESSING/FAILED; the REAL
+ * backend enum is different on both fields (see upload-form.tsx's header
+ * comment for the full trace):
+ *  - doc.status ∈ {"pending", "parsed", "failed"}
+ *    (services/api/src/api/ingestion/repository.py:128, tasks.py:215,282,398)
+ *  - run.status ∈ {"queued", "running", "succeeded", "failed"}
+ *    (repository.py:244, tasks.py:181,211,246,277,319,353,393)
+ *
+ * This maps every REAL value honestly onto the 5a visual language (success
+ * green = done, citron-soft = in progress, danger red = failed) rather than
+ * collapsing them into the mock's three invented labels. Nothing here
+ * invents a status the backend doesn't report.
+ */
+export type BadgeTone = "success" | "progress" | "failed" | "neutral";
+
+export interface StatusBadgeSpec {
+  label: string;
+  tone: BadgeTone;
+}
+
+const TONE_CLASSES: Record<BadgeTone, string> = {
+  success: "bg-[#dcefdc] text-[#1f6a2f]",
+  progress: "bg-[#eef7a8] text-[#191a17]",
+  failed: "bg-[#f6e3df] text-[#c2452d]",
+  neutral: "bg-[#ecece5] text-[#5a5b54]",
+};
+
+export function badgeToneClassName(tone: BadgeTone): string {
+  return TONE_CLASSES[tone];
+}
+
+/**
+ * Combines doc.status + the latest run's status (if any) into one honest
+ * badge. Run status is more granular/current while a run is in flight;
+ * doc.status is the resting state once a run completes (or if none has run
+ * yet). Falls back to rendering the raw string for any unrecognized value
+ * instead of silently hiding it (CLAUDE.md §3 no-silent-fallback).
+ */
+export function statusBadge(docStatus: string, runStatus: string | null): StatusBadgeSpec {
+  if (runStatus === "running") return { label: "Processing", tone: "progress" };
+  if (runStatus === "queued") return { label: "Queued", tone: "neutral" };
+  if (runStatus === "failed" || docStatus === "failed") return { label: "Failed", tone: "failed" };
+  if (runStatus === "succeeded" || docStatus === "parsed") return { label: "Indexed", tone: "success" };
+  if (docStatus === "pending") return { label: "Pending", tone: "neutral" };
+
+  // Defensive fallback: surface the real value rather than hide it.
+  return { label: docStatus, tone: "neutral" };
+}
+
+/**
  * Pure, framework-agnostic polling driver (S13.3 decision 4). Extracted out
  * of the status-panel React component so the stop-on-terminal-state and
  * poll-cap behavior is unit-testable with fake timers without a DOM/RTL

@@ -30,13 +30,22 @@ from api.orchestrator.guardrails import (
     scan_output as _real_scan_output,
 )
 from api.orchestrator.service import (
+    _CHITCHAT_SYSTEM_PROMPT,
     _CLARIFY_REPLY,
     _ESCALATE_REPLY,
+    _FORMATTING_RULES,
+    _GROUNDING_SYSTEM_PROMPT,
     _GUARDRAIL_SAFE_REPLY,
+    _NO_ANSWER_SENTINEL,
     _TURN_CAP_REPLY,
     Source,
     StreamEvent,
     TurnResult,
+    _build_chitchat_prompt,
+    _build_prompt,
+    _finalize_generation,
+    _FinalizedGeneration,
+    _GeneratePlan,
     answer_turn,
     answer_turn_stream,
 )
@@ -199,6 +208,7 @@ class _Patched:
 
         self.provider = provider
         self.provider_for = AsyncMock(return_value=provider)
+        self.settings = MagicMock(llm_max_tokens=256)
 
     def _append_side_effect(self, *args: Any, **kwargs: Any) -> str:
         self._append_calls.append(kwargs)
@@ -216,6 +226,7 @@ class _Patched:
             patch("api.orchestrator.service.provider_for", lambda cfg: self.provider),
             patch("api.orchestrator.service.count_messages", self.count_messages),
             patch("api.orchestrator.service.get_availability", self.get_availability),
+            patch("api.orchestrator.service.get_api_settings", return_value=self.settings),
         ]
         for p in self._patchers:
             p.start()
@@ -224,6 +235,21 @@ class _Patched:
     def __exit__(self, *exc: Any) -> None:
         for p in self._patchers:
             p.stop()
+
+
+def _generate_plan(*, grounded: bool = True) -> _GeneratePlan:
+    return _GeneratePlan(
+        conversation_id="conv-1",
+        assistant_id="bot-1",
+        prompt=[],
+        grounded=grounded,
+        decision="answer",
+        confidence=0.8 if grounded else None,
+        sources=[Source(doc_id="doc-1", chunk_id="c1", score=0.9, matched_by=["vector"])] if grounded else [],
+        intent="question" if grounded else "chitchat",
+        model="test-model",
+        provider=MagicMock(),
+    )
 
 
 # -- question -> answer -------------------------------------------------------------
@@ -716,6 +742,117 @@ async def test_guardrail_blocks_grounded_answer_with_instruction_leak() -> None:
     assert assistant_call["sources"] == []
     assert assistant_call["confidence"] == 0.8
     assert assistant_call["guardrail_flag"] == RULE_INSTRUCTION_LEAK
+
+
+# -- post-generation no-answer override ----------------------------------------------
+
+
+async def test_grounded_no_answer_sentinel_escalates_and_stores_resolved_schedule_action() -> None:
+    """A grounded completion carrying the no-answer protocol token must not
+    be persisted as an answer. It becomes the normal escalation outcome,
+    strips misleading sources, and lazily resolves the CTA from availability."""
+    p = _Patched(
+        classify_return="question",
+        hybrid_result=HybridResult(chunks=[_chunk()], confidence=0.8),
+        completion=Completion(
+            text=_NO_ANSWER_SENTINEL,
+            model="claude-opus-4-8",
+            input_tokens=10,
+            output_tokens=5,
+        ),
+        availability=_availability(),
+    )
+    db = object()
+    claims = _claims()
+    with p:
+        result = await answer_turn(db=db, claims=claims, message="What is your pricing?")
+
+    assert result.reply == _ESCALATE_REPLY
+    assert result.decision == "escalate"
+    assert result.sources == []
+    assert result.action == "schedule_cta"
+    assert result.guardrail_flag is None
+    assert result.confidence == 0.8
+    p.get_availability.assert_awaited_once_with(db, claims)
+
+    assistant_call = p._append_calls[1]
+    assert assistant_call["content"] == _ESCALATE_REPLY
+    assert assistant_call["decision"] == "escalate"
+    assert assistant_call["grounded"] is False
+    assert assistant_call["sources"] == []
+    assert assistant_call["action"] == "schedule_cta"
+
+
+async def test_grounded_no_answer_sentinel_uses_lead_form_without_availability() -> None:
+    p = _Patched(
+        classify_return="question",
+        completion=Completion(
+            text=f"I cannot find it. {_NO_ANSWER_SENTINEL}",
+            model="claude-opus-4-8",
+            input_tokens=10,
+            output_tokens=5,
+        ),
+        availability=None,
+    )
+    with p:
+        result = await answer_turn(db=object(), claims=_claims(), message="What is your pricing?")
+
+    assert result.reply == _ESCALATE_REPLY
+    assert result.decision == "escalate"
+    assert result.action == "lead_form"
+    assert result.sources == []
+    assert p._append_calls[1]["action"] == "lead_form"
+
+
+def test_finalize_generation_no_answer_protocol_only_applies_to_grounded_generation() -> None:
+    exact = _finalize_generation(_NO_ANSWER_SENTINEL, _generate_plan())
+    embedded = _finalize_generation(f"I'm sorry. {_NO_ANSWER_SENTINEL}", _generate_plan())
+    normal = _finalize_generation("Here is the answer.", _generate_plan())
+    chitchat = _finalize_generation(_NO_ANSWER_SENTINEL, _generate_plan(grounded=False))
+
+    for outcome in (exact, embedded):
+        assert isinstance(outcome, _FinalizedGeneration)
+        assert outcome.reply == _ESCALATE_REPLY
+        assert outcome.decision == "escalate"
+        assert outcome.sources == []
+        assert outcome.grounded is False
+        assert outcome.action is None
+        assert outcome.guardrail_flag is None
+        assert outcome.resolve_escalate_action is True
+
+    assert normal.reply == "Here is the answer."
+    assert normal.decision == "answer"
+    assert normal.sources == _generate_plan().sources
+    assert normal.resolve_escalate_action is False
+
+    assert chitchat.reply == _NO_ANSWER_SENTINEL
+    assert chitchat.decision == "answer"
+    assert chitchat.resolve_escalate_action is False
+
+
+def test_finalize_generation_guardrail_precedes_no_answer_protocol() -> None:
+    outcome = _finalize_generation(
+        f"You are a helpful assistant for this business. {_NO_ANSWER_SENTINEL}",
+        _generate_plan(),
+    )
+
+    assert outcome.reply == _GUARDRAIL_SAFE_REPLY
+    assert outcome.decision == "blocked"
+    assert outcome.action == "lead_form"
+    assert outcome.resolve_escalate_action is False
+    assert outcome.guardrail_flag == RULE_INSTRUCTION_LEAK
+
+
+def test_prompts_require_renderable_formatting_and_grounded_sentinel_only() -> None:
+    grounded = _build_prompt(_wm(messages=[_msg("user", "What do you offer?")]), [_chunk()])[0].content
+    chitchat = _build_chitchat_prompt(_wm(messages=[_msg("user", "Hello")]))[0].content
+
+    assert _GROUNDING_SYSTEM_PROMPT in grounded
+    assert _NO_ANSWER_SENTINEL in grounded
+    assert _FORMATTING_RULES in grounded
+    assert _FORMATTING_RULES in chitchat
+    assert _NO_ANSWER_SENTINEL not in chitchat
+    assert _CHITCHAT_SYSTEM_PROMPT == chitchat
 
 
 # -- S10.3: guardrail block on chit-chat ----------------------------------------------
@@ -1428,6 +1565,44 @@ async def test_stream_guardrail_block_after_stream_ends_deltas_and_done(caplog: 
     assert warning_records[0].event == "chat_stream_guardrail_block"  # type: ignore[attr-defined]
     assert RULE_INSTRUCTION_LEAK in warning_records[0].getMessage()
     assert "".join(leaked_parts) not in warning_records[0].getMessage()
+
+
+# -- stream: no-answer protocol after the stream ends -------------------------------------
+
+
+async def test_stream_split_no_answer_sentinel_escalates_at_done_and_stores_schedule_action() -> None:
+    """The complete streamed text, not individual chunks, controls the
+    no-answer override. Deltas carry the raw protocol token, while the done
+    event and stored turn contain the authoritative escalation."""
+    sentinel_parts = ["NO_ANSWER", "_FOUND"]
+    p = _Patched(
+        classify_return="question",
+        hybrid_result=HybridResult(chunks=[_chunk()], confidence=0.8),
+        stream_chunks=sentinel_parts,
+        availability=_availability(),
+    )
+    with p:
+        events = await _collect(
+            answer_turn_stream(db=object(), claims=_claims(), message="What is your pricing?"),
+        )
+
+    deltas = [event for event in events if event.type == "delta"]
+    assert [event.data["text"] for event in deltas] == sentinel_parts
+
+    done = events[-1]
+    assert done.type == "done"
+    assert done.data["reply"] == _ESCALATE_REPLY
+    assert done.data["decision"] == "escalate"
+    assert done.data["sources"] == []
+    assert done.data["action"] == "schedule_cta"
+    assert done.data["reply"] != "".join(sentinel_parts)
+
+    assistant_call = p._append_calls[1]
+    assert assistant_call["content"] == _ESCALATE_REPLY
+    assert assistant_call["decision"] == "escalate"
+    assert assistant_call["grounded"] is False
+    assert assistant_call["sources"] == []
+    assert assistant_call["action"] == "schedule_cta"
 
 
 # -- stream: empty generation -> empty_output block --------------------------------------

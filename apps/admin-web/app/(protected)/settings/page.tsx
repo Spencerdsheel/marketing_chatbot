@@ -93,42 +93,45 @@ export default async function SettingsPage() {
   const result = await getBotSettings();
 
   return (
-    <div className="flex flex-1 flex-col items-center gap-4 p-8">
-      <div className="w-full max-w-2xl">
-        <Link href="/" className="text-sm text-muted-foreground hover:underline">
+    <div className="flex flex-1 flex-col gap-5 p-6 lg:p-8">
+      <div className="flex items-center">
+        <div>
+          <h1 className="text-xl font-bold text-[#191a17]">Bot settings</h1>
+          <p className="mt-0.5 text-[12.5px] text-[#70716a]">
+            Your tenant&apos;s chatbot configuration.
+          </p>
+        </div>
+        <Link href="/" className="ml-auto text-sm text-muted-foreground hover:underline">
           ← Back to console
         </Link>
       </div>
-      <Card className="w-full max-w-2xl">
-        <CardHeader>
-          <CardTitle>Bot settings</CardTitle>
-          <CardDescription>Your tenant&apos;s chatbot configuration.</CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-6">
-          {result.status === "error" ? (
-            <p
-              role="alert"
-              className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive"
-            >
-              {result.message}
-              {result.correlationId ? (
-                <span className="block text-xs text-destructive/80">
-                  Correlation ID: {result.correlationId}
-                </span>
-              ) : null}
-            </p>
-          ) : (
-            <>
-              <ReadOnlyInfoPanel settings={result.settings} />
-              {claims.role === "CLIENT_ADMIN" ? (
-                <SettingsForm currentSettings={result.settings} />
-              ) : (
-                <ReadOnlyQualitativeFields settings={result.settings} />
-              )}
-            </>
-          )}
-        </CardContent>
-      </Card>
+
+      {result.status === "error" ? (
+        <p
+          role="alert"
+          className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive"
+        >
+          {result.message}
+          {result.correlationId ? (
+            <span className="block text-xs text-destructive/80">
+              Correlation ID: {result.correlationId}
+            </span>
+          ) : null}
+        </p>
+      ) : claims.role === "CLIENT_ADMIN" ? (
+        <SettingsForm currentSettings={result.settings} />
+      ) : (
+        <Card className="w-full max-w-2xl">
+          <CardHeader>
+            <CardTitle>Bot settings</CardTitle>
+            <CardDescription>Your tenant&apos;s chatbot configuration.</CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-6">
+            <ReadOnlyInfoPanel settings={result.settings} />
+            <ReadOnlyQualitativeFields settings={result.settings} />
+          </CardContent>
+        </Card>
+      )}
     </div>
   );
 }

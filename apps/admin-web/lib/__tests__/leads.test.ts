@@ -8,7 +8,17 @@ vi.mock("next/headers", () => ({
 
 // Imported after the mock is registered so the module under test picks up
 // the mocked `next/headers` (adminApiFetch reads the access_token cookie).
-const { buildLeadsQuery, listLeads, LEAD_STAGES, LEAD_STATUSES } = await import("@/lib/leads");
+const {
+  buildLeadsQuery,
+  listLeads,
+  getLeadDetail,
+  getLeadActivities,
+  LEAD_STAGES,
+  LEAD_STATUSES,
+  stageBadgeStyle,
+  scoreChipStyle,
+  initialsFromName,
+} = await import("@/lib/leads");
 
 describe("LEAD_STAGES / LEAD_STATUSES", () => {
   it("matches the five canonical stages from pipeline.py exactly", () => {
@@ -261,5 +271,182 @@ describe("listLeads", () => {
 
     const [url] = fetchSpy.mock.calls[0] as [string];
     expect(url).toBe("http://localhost:8000/admin/tenants/tenant-x/leads?limit=25&offset=0");
+  });
+});
+
+describe("getLeadDetail", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    getMock.mockReset();
+  });
+
+  it("maps a 200 envelope to an ok result with no tenant_id", async () => {
+    getMock.mockReturnValue(undefined);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          lead_id: "lead-1",
+          name: "Ada Lovelace",
+          email: "ada@example.com",
+          phone: null,
+          status: "open",
+          stage: "qualified",
+          qualification_score: 82,
+          assigned_agent_id: null,
+          source: "widget",
+        }),
+        { status: 200 }
+      )
+    );
+
+    const result = await getLeadDetail("lead-1");
+    expect(result.status).toBe("ok");
+    if (result.status === "ok") {
+      expect(result.lead.leadId).toBe("lead-1");
+      expect(result.lead).not.toHaveProperty("tenant_id");
+    }
+  });
+
+  it("maps a 404 to a not-found message", async () => {
+    getMock.mockReturnValue(undefined);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({ error_code: "NOT_FOUND", message: "x", correlation_id: "c" }),
+        { status: 404 }
+      )
+    );
+
+    const result = await getLeadDetail("lead-1");
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.message).toMatch(/not be found/i);
+    }
+  });
+
+  it("targets the tenant-scoped path when tenantId is provided", async () => {
+    getMock.mockReturnValue(undefined);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          lead_id: "lead-1",
+          name: "Ada",
+          email: "ada@example.com",
+          phone: null,
+          status: "new",
+          stage: "captured",
+          qualification_score: null,
+          assigned_agent_id: null,
+          source: "widget",
+        }),
+        { status: 200 }
+      )
+    );
+
+    await getLeadDetail("lead-1", "tenant-x");
+
+    const [url] = fetchSpy.mock.calls[0] as [string];
+    expect(url).toBe("http://localhost:8000/admin/tenants/tenant-x/leads/lead-1");
+  });
+});
+
+describe("getLeadActivities", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    getMock.mockReset();
+  });
+
+  it("maps a 200 array to an ok result with items mapped", async () => {
+    getMock.mockReturnValue(undefined);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify([
+          {
+            activity_id: "act-1",
+            lead_id: "lead-1",
+            type: "note",
+            payload: { text: "Called, left voicemail" },
+            actor: "agent-1",
+            created_at: "2026-07-15T00:00:00Z",
+          },
+        ]),
+        { status: 200 }
+      )
+    );
+
+    const result = await getLeadActivities("lead-1");
+    expect(result.status).toBe("ok");
+    if (result.status === "ok") {
+      expect(result.items).toHaveLength(1);
+      expect(result.items[0].activityId).toBe("act-1");
+      expect(result.items[0].type).toBe("note");
+    }
+  });
+
+  it("maps a network throw to a generic message", async () => {
+    getMock.mockReturnValue(undefined);
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("down"));
+
+    const result = await getLeadActivities("lead-1");
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.message).toMatch(/unable to reach/i);
+    }
+  });
+});
+
+describe("stageBadgeStyle", () => {
+  it("returns the exact HANDOFF-SPEC.md §2 colors for each canonical stage", () => {
+    expect(stageBadgeStyle("captured")).toEqual({ label: "CAPTURED", bg: "#ecece5", fg: "#5a5b54" });
+    expect(stageBadgeStyle("qualified")).toEqual({ label: "QUALIFIED", bg: "#eef7a8", fg: "#191a17" });
+    expect(stageBadgeStyle("contacted")).toEqual({ label: "CONTACTED", bg: "#dcefdc", fg: "#1f6a2f" });
+    expect(stageBadgeStyle("converted")).toEqual({ label: "CONVERTED", bg: "#191a17", fg: "#e4f222" });
+    expect(stageBadgeStyle("disqualified")).toEqual({
+      label: "DISQUALIFIED",
+      bg: "#f6e3df",
+      fg: "#c2452d",
+    });
+  });
+
+  it("falls back to a neutral style for an unrecognized stage rather than throwing", () => {
+    const style = stageBadgeStyle("bogus");
+    expect(style.label).toBe("BOGUS");
+    expect(style.bg).toBe("#ecece5");
+  });
+});
+
+describe("scoreChipStyle", () => {
+  it("uses the citron-soft chip for a score >= 60 on a non-converted stage", () => {
+    expect(scoreChipStyle(76, "contacted")).toEqual({ label: "76", bg: "#eef7a8", fg: "#191a17" });
+  });
+
+  it("uses the converted-green chip regardless of score once stage is converted", () => {
+    expect(scoreChipStyle(90, "converted")).toEqual({ label: "90", bg: "#dcefdc", fg: "#1f6a2f" });
+  });
+
+  it("uses a plain muted style below the 60 threshold", () => {
+    expect(scoreChipStyle(25, "disqualified")).toEqual({ label: "25", bg: "transparent", fg: "#96978e" });
+  });
+
+  it("the 60 boundary itself is highlighted (>= not >)", () => {
+    expect(scoreChipStyle(60, "qualified").bg).toBe("#eef7a8");
+    expect(scoreChipStyle(59, "qualified").bg).toBe("transparent");
+  });
+});
+
+describe("initialsFromName", () => {
+  it("takes the first letter of the first two words", () => {
+    expect(initialsFromName("Sara Romero")).toBe("SR");
+  });
+
+  it("uppercases a lowercase name", () => {
+    expect(initialsFromName("jordan millar")).toBe("JM");
+  });
+
+  it("falls back to the first two letters for a single-word name", () => {
+    expect(initialsFromName("Cher")).toBe("CH");
+  });
+
+  it("falls back to '?' for a blank name rather than throwing", () => {
+    expect(initialsFromName("   ")).toBe("?");
   });
 });

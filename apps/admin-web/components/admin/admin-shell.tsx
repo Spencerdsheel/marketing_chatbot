@@ -4,11 +4,15 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   BarChart3,
+  Bell,
   BookOpen,
   Building2,
   LayoutDashboard,
   LogOut,
+  MessageSquare,
+  MoreHorizontal,
   Settings2,
+  Users2,
   UsersRound,
 } from "lucide-react";
 import type { Role } from "@/lib/auth";
@@ -18,6 +22,7 @@ interface AdminShellProps {
   children: React.ReactNode;
   role: Role;
   identityLabel: string;
+  identityRoleLabel?: string;
   logoutAction: () => Promise<void>;
 }
 
@@ -29,7 +34,17 @@ interface NavItem {
   roles: Role[];
 }
 
-const navigation: NavItem[] = [
+/**
+ * Nav groups mirror HANDOFF-SPEC.md's Sidebar recipe (Overview / Tools / Team).
+ * PLATFORM_ADMIN sees a distinct "Platform" group instead, since Clients is a
+ * different persona's workspace, not a peer of the client-facing tools.
+ */
+interface NavGroup {
+  label: string;
+  items: NavItem[];
+}
+
+const overviewItems: NavItem[] = [
   {
     href: "/",
     label: "Dashboard",
@@ -37,6 +52,21 @@ const navigation: NavItem[] = [
     roles: ["CLIENT_ADMIN", "CLIENT_AGENT"],
   },
   { href: "/leads", label: "Leads", icon: UsersRound, roles: ["CLIENT_ADMIN", "CLIENT_AGENT"] },
+  {
+    href: "/conversations",
+    label: "Conversations",
+    icon: MessageSquare,
+    roles: ["CLIENT_ADMIN", "CLIENT_AGENT"],
+  },
+];
+
+const toolsItems: NavItem[] = [
+  {
+    href: "/notifications",
+    label: "Notifications",
+    icon: Bell,
+    roles: ["CLIENT_ADMIN", "CLIENT_AGENT", "PLATFORM_ADMIN"],
+  },
   {
     href: "/knowledge",
     label: "Knowledge base",
@@ -53,9 +83,23 @@ const navigation: NavItem[] = [
   {
     href: "/settings",
     label: "Bot settings",
+    mobileLabel: "Settings",
     icon: Settings2,
     roles: ["CLIENT_ADMIN", "CLIENT_AGENT"],
   },
+];
+
+const teamItems: NavItem[] = [
+  {
+    href: "/members",
+    label: "Team members",
+    mobileLabel: "Members",
+    icon: Users2,
+    roles: ["CLIENT_ADMIN"],
+  },
+];
+
+const platformItems: NavItem[] = [
   {
     href: "/clients",
     label: "Clients",
@@ -64,14 +108,47 @@ const navigation: NavItem[] = [
   },
 ];
 
+const navGroups: NavGroup[] = [
+  { label: "Overview", items: overviewItems },
+  { label: "Tools", items: toolsItems },
+  { label: "Team", items: teamItems },
+  { label: "Platform", items: platformItems },
+];
+
 function isCurrentPath(pathname: string, href: string): boolean {
   return href === "/" ? pathname === "/" : pathname === href || pathname.startsWith(`${href}/`);
 }
 
-export function AdminShell({ children, role, identityLabel, logoutAction }: AdminShellProps) {
+/** Mobile bottom nav shows at most this many items before overflowing into "More". */
+const MOBILE_NAV_MAX = 5;
+
+export function AdminShell({
+  children,
+  role,
+  identityLabel,
+  identityRoleLabel,
+  logoutAction,
+}: AdminShellProps) {
   const pathname = usePathname();
-  const visibleItems = navigation.filter((item) => item.roles.includes(role));
+  const visibleGroups = navGroups
+    .map((group) => ({
+      label: group.label,
+      items: group.items.filter((item) => item.roles.includes(role)),
+    }))
+    .filter((group) => group.items.length > 0);
+  const visibleItems = visibleGroups.flatMap((group) => group.items);
   const isPlatformAdmin = role === "PLATFORM_ADMIN";
+  const roleLabel = identityRoleLabel ?? (isPlatformAdmin ? "Platform admin" : "Client workspace");
+
+  // Cap the mobile bottom nav at MOBILE_NAV_MAX slots: if there's room for
+  // every item, show them all; otherwise reserve the last slot for a "More"
+  // overflow link to the first tool page rather than letting a 6th+ item
+  // disappear or the row overflow off-screen.
+  const mobilePrimaryItems =
+    visibleItems.length <= MOBILE_NAV_MAX ? visibleItems : visibleItems.slice(0, MOBILE_NAV_MAX - 1);
+  const mobileOverflowItems =
+    visibleItems.length <= MOBILE_NAV_MAX ? [] : visibleItems.slice(MOBILE_NAV_MAX - 1);
+  const mobileSlotCount = mobilePrimaryItems.length + (mobileOverflowItems.length > 0 ? 1 : 0);
 
   return (
     <div className="flex min-h-screen bg-[#fbfbf8] text-[#191a17]">
@@ -88,38 +165,45 @@ export function AdminShell({ children, role, identityLabel, logoutAction }: Admi
           </div>
         </div>
 
-        <p className="px-2 py-1 text-[10px] font-semibold tracking-[0.08em] text-[#a8a99f] uppercase">
-          {isPlatformAdmin ? "Platform" : "Overview"}
-        </p>
-        <nav aria-label="Main navigation" className="mt-1 flex flex-col gap-1">
-          {visibleItems.map((item) => {
-            const Icon = item.icon;
-            const current = isCurrentPath(pathname, item.href);
-            return (
-              <Link
-                key={item.href}
-                href={item.href}
-                aria-current={current ? "page" : undefined}
-                className={cn(
-                  "flex min-h-11 items-center gap-2.5 rounded-lg px-2.5 text-[13px] transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#191a17]",
-                  current
-                    ? "bg-[#ecece5] font-semibold text-[#191a17]"
-                    : "text-[#45463f] hover:bg-[#ecece5]/70"
-                )}
-              >
-                <Icon aria-hidden className="size-4" />
-                {item.label}
-              </Link>
-            );
-          })}
+        <nav aria-label="Main navigation" className="flex flex-col gap-4 overflow-y-auto">
+          {visibleGroups.map((group) => (
+            <div key={group.label} className="flex flex-col gap-1">
+              <p className="px-2 py-1 text-[10.5px] font-semibold tracking-[0.06em] text-[#a8a99f] uppercase">
+                {group.label}
+              </p>
+              {group.items.map((item) => {
+                const Icon = item.icon;
+                const current = isCurrentPath(pathname, item.href);
+                return (
+                  <Link
+                    key={item.href}
+                    href={item.href}
+                    aria-current={current ? "page" : undefined}
+                    className={cn(
+                      "flex min-h-11 items-center gap-2.5 rounded-lg px-2.5 text-[13px] transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#191a17]",
+                      current
+                        ? "bg-[#ecece5] font-semibold text-[#191a17]"
+                        : "text-[#45463f] hover:bg-[#ecece5]/70"
+                    )}
+                  >
+                    <Icon aria-hidden className="size-4" />
+                    {item.label}
+                  </Link>
+                );
+              })}
+            </div>
+          ))}
         </nav>
 
         <div className="mt-auto border-t border-[#e7e7e2] pt-3">
-          <div className="flex items-center gap-2.5 px-2 py-2">
+          <div className="flex items-center gap-2.5 rounded-lg px-2 py-2">
             <div className="grid size-8 shrink-0 place-items-center rounded-full bg-[#dcdcd2] text-[10px] font-bold text-[#5a5b54]">
               {identityLabel.slice(0, 2).toUpperCase()}
             </div>
-            <p className="min-w-0 truncate text-xs font-semibold">{identityLabel}</p>
+            <div className="min-w-0 flex-1">
+              <p className="min-w-0 truncate text-xs font-semibold">{identityLabel}</p>
+              <p className="min-w-0 truncate text-[11px] text-[#96978e]">{roleLabel}</p>
+            </div>
           </div>
           <form action={logoutAction}>
             <button
@@ -154,16 +238,10 @@ export function AdminShell({ children, role, identityLabel, logoutAction }: Admi
         <div className="flex min-w-0 flex-1 flex-col pb-20 lg:pb-0">{children}</div>
         <nav
           aria-label="Mobile navigation"
-          className={cn(
-            "fixed inset-x-0 bottom-0 z-40 grid min-h-16 border-t border-[#e7e7e2] bg-[#fbfbf8]/95 px-2 pb-[env(safe-area-inset-bottom)] backdrop-blur lg:hidden",
-            visibleItems.length === 1
-              ? "grid-cols-1"
-              : visibleItems.length === 4
-                ? "grid-cols-4"
-                : "grid-cols-5"
-          )}
+          className="fixed inset-x-0 bottom-0 z-40 grid min-h-16 border-t border-[#e7e7e2] bg-[#fbfbf8]/95 px-2 pb-[env(safe-area-inset-bottom)] backdrop-blur lg:hidden"
+          style={{ gridTemplateColumns: `repeat(${Math.max(mobileSlotCount, 1)}, minmax(0, 1fr))` }}
         >
-          {visibleItems.map((item) => {
+          {mobilePrimaryItems.map((item) => {
             const Icon = item.icon;
             const current = isCurrentPath(pathname, item.href);
             return (
@@ -182,6 +260,32 @@ export function AdminShell({ children, role, identityLabel, logoutAction }: Admi
               </Link>
             );
           })}
+          {mobileOverflowItems.length > 0 ? (
+            (() => {
+              const overflowCurrent = mobileOverflowItems.some((item) =>
+                isCurrentPath(pathname, item.href)
+              );
+              // Overflow lands on the first hidden item's route; the full set
+              // of remaining destinations is still one tap away from there
+              // via the full sidebar / desktop nav, and each item keeps its
+              // own <Link> so it's reachable directly by URL.
+              const target = mobileOverflowItems[0];
+              return (
+                <Link
+                  href={target.href}
+                  aria-label={`More: ${mobileOverflowItems.map((item) => item.label).join(", ")}`}
+                  aria-current={overflowCurrent ? "page" : undefined}
+                  className={cn(
+                    "flex min-h-14 min-w-0 flex-col items-center justify-center gap-1 rounded-lg px-1 text-[10px] transition-colors focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[#191a17]",
+                    overflowCurrent ? "bg-[#ecece5] font-semibold" : "hover:bg-[#ecece5]/70"
+                  )}
+                >
+                  <MoreHorizontal aria-hidden className="size-4" />
+                  <span className="max-w-full truncate">More</span>
+                </Link>
+              );
+            })()
+          ) : null}
         </nav>
       </div>
     </div>
