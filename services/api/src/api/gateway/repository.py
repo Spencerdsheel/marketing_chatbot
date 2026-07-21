@@ -12,6 +12,14 @@ duplicated -- ``admin/`` is the module that *creates* keys, ``gateway/``
 only *validates* them) before the lookup. Same signature, same return shape,
 same ``None``-on-miss behavior; only the WHERE clause + the hash step
 changed.
+
+SR-3 decision 8/9/10: ``get_resume_enabled`` is the widget-session-continuity
+opt-in flag's ONLY read path. It rides the EXISTING ``tenant_bot_settings
+.business_hours`` JSONB column (S12.2, migration 0031) under the key
+``"widget_session_resume"`` -- deliberately NOT a new column/migration (Open
+question 1, locked default). A tenant with no ``tenant_bot_settings`` row, or
+whose ``business_hours`` JSON lacks the key, or whose value is not literally
+``true``, defaults to ``False`` -- opt-in, never a silent upgrade.
 """
 from __future__ import annotations
 
@@ -37,3 +45,27 @@ async def get_tenant_by_client_key(db: Database, client_key: str) -> Row | None:
     )
     record = await db.fetchrow(sql, _hash_client_key(client_key))
     return dict(record) if record is not None else None
+
+
+async def get_resume_enabled(db: Database, tenant_id: str) -> bool:
+    """Read the ``widget_session_resume`` opt-in flag (SR-3 decision 8).
+
+    Migration-free by design: reads the ``widget_session_resume`` boolean key
+    out of the EXISTING ``tenant_bot_settings.business_hours`` JSONB blob
+    (S12.2) rather than a new column. UNSCOPED by ``AuthClaims`` for the same
+    pre-auth reason as ``get_tenant_by_client_key`` -- this runs during
+    admission, before any claims exist; the caller already resolved
+    ``tenant_id`` from the public client key + Origin allowlist. Returns
+    ``False`` (opt-in default, decision 8) when there is no settings row, no
+    ``business_hours`` JSON, or the key is absent/not ``True``.
+    """
+    row = await db.fetchrow(
+        "SELECT business_hours FROM tenant_bot_settings WHERE tenant_id = $1",
+        tenant_id,
+    )
+    if row is None:
+        return False
+    business_hours = row.get("business_hours") if hasattr(row, "get") else row["business_hours"]
+    if not isinstance(business_hours, dict):
+        return False
+    return business_hours.get("widget_session_resume") is True

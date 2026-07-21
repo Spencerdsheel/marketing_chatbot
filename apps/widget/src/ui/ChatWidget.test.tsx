@@ -18,6 +18,12 @@ const fetchSlotsMock = vi.fn<(config: WidgetConfig, input: unknown) => Promise<F
 const mintVisitorSessionMock = vi.fn<(config: WidgetConfig) => Promise<AdmissionResult>>();
 const speakGreetingMock = vi.fn<() => void>();
 const ttsCancelMock = vi.fn<() => void>();
+// SR-3: isResumeEnabled defaults false so every pre-existing test above
+// (none of which opt into resume) sees byte-for-byte the same behavior —
+// no touchResumeRecord call, no sessionStorage write.
+const isResumeEnabledMock = vi.fn<() => boolean>(() => false);
+const touchResumeRecordMock = vi.fn<(conversationId: string | null, now: Date) => void>();
+const clearResumeRecordMock = vi.fn<() => void>();
 
 vi.mock("../turn", () => ({
   sendTurn: (config: WidgetConfig, input: unknown) => sendTurnMock(config, input),
@@ -26,9 +32,18 @@ vi.mock("../turn", () => ({
 // S14.6: mock session's mintVisitorSession so the bounded expired-session
 // re-mint (decision 5) can be asserted without a real fetch — the module
 // also exports authHeader, which ChatWidget doesn't call directly, so it's
-// omitted here.
+// omitted here. SR-3 adds isResumeEnabled (gates touchResumeRecord calls).
 vi.mock("../session", () => ({
   mintVisitorSession: (config: WidgetConfig) => mintVisitorSessionMock(config),
+  isResumeEnabled: () => isResumeEnabledMock(),
+}));
+
+// SR-3: mock resume.ts's write-side helpers so ChatWidget's touch/clear
+// calls can be asserted without touching real sessionStorage here (resume.ts
+// itself is covered by resume.test.ts).
+vi.mock("../resume", () => ({
+  touchResumeRecord: (conversationId: string | null, now: Date) => touchResumeRecordMock(conversationId, now),
+  clearResumeRecord: () => clearResumeRecordMock(),
 }));
 
 // S14.5: mock the TTS module so ChatWidget's gesture-gating logic (only
@@ -80,6 +95,10 @@ beforeEach(() => {
   mintVisitorSessionMock.mockReset();
   speakGreetingMock.mockReset();
   ttsCancelMock.mockReset();
+  isResumeEnabledMock.mockReset();
+  isResumeEnabledMock.mockReturnValue(false);
+  touchResumeRecordMock.mockReset();
+  clearResumeRecordMock.mockReset();
 });
 
 afterEach(() => {
@@ -854,6 +873,214 @@ describe("ChatWidget", () => {
       const botBubbles = container.querySelectorAll(".cw-bubble-row-bot .cw-bubble-bot");
       expect(botBubbles.length).toBe(1);
       expect(botBubbles[0]?.textContent).toContain("Sorry about that");
+    });
+  });
+
+  describe("SR-3: conversation continuity across reload", () => {
+    it("seeded with resumeConversationId, the FIRST turn's request body carries that conversation_id (decision 4)", async () => {
+      sendTurnMock.mockResolvedValueOnce({
+        ok: true,
+        turn: {
+          conversationId: "conv-resumed",
+          messageId: "msg-1",
+          reply: "Continuing our chat.",
+          decision: "answer",
+          confidence: 0.9,
+          sources: [],
+          action: null,
+        },
+      });
+
+      act(() => {
+        root.render(
+          <ChatWidget config={baseConfig} expiresAt="2026-07-16T12:30:00Z" resumeConversationId="conv-resumed" />,
+        );
+      });
+      openPanel();
+
+      typeAndSend("Are you still there?");
+      await flush();
+
+      expect(sendTurnMock).toHaveBeenCalledWith(
+        baseConfig,
+        expect.objectContaining({ message: "Are you still there?", conversationId: "conv-resumed" }),
+      );
+    });
+
+    it("after a successful turn, touchResumeRecord is called with the returned conversation_id, but ONLY when resume_enabled", async () => {
+      isResumeEnabledMock.mockReturnValue(true);
+      sendTurnMock.mockResolvedValueOnce({
+        ok: true,
+        turn: {
+          conversationId: "conv-resumed",
+          messageId: "msg-1",
+          reply: "Continuing our chat.",
+          decision: "answer",
+          confidence: 0.9,
+          sources: [],
+          action: null,
+        },
+      });
+
+      act(() => {
+        root.render(
+          <ChatWidget config={baseConfig} expiresAt="2026-07-16T12:30:00Z" resumeConversationId="conv-resumed" />,
+        );
+      });
+      openPanel();
+
+      typeAndSend("Are you still there?");
+      await flush();
+
+      expect(touchResumeRecordMock).toHaveBeenCalledWith("conv-resumed", expect.any(Date));
+    });
+
+    it("resume_enabled false -> a successful turn does NOT call touchResumeRecord", async () => {
+      isResumeEnabledMock.mockReturnValue(false);
+      sendTurnMock.mockResolvedValueOnce({
+        ok: true,
+        turn: {
+          conversationId: "conv-1",
+          messageId: "msg-1",
+          reply: "Hi!",
+          decision: "answer",
+          confidence: 0.9,
+          sources: [],
+          action: null,
+        },
+      });
+
+      act(() => {
+        root.render(<ChatWidget config={baseConfig} expiresAt="2026-07-16T12:30:00Z" />);
+      });
+      openPanel();
+
+      typeAndSend("Hello");
+      await flush();
+
+      expect(touchResumeRecordMock).not.toHaveBeenCalled();
+    });
+
+    it("RESUME_REJECTED (decision 7 case c): a first post-resume turn returning CONVERSATION_NOT_FOUND clears the stored record, silently retries with conversation_id:null, adopts the backend's fresh conversation_id, renders the REAL reply in a new thread, and shows NO error bubble and NO fabricated prior messages", async () => {
+      const notFound: TurnResult = {
+        ok: false,
+        error: {
+          type: "TURN_ERROR",
+          errorCode: "CONVERSATION_NOT_FOUND",
+          message: "Conversation not found.",
+          correlationId: "corr-nf-1",
+          status: 404,
+          retryAfterSeconds: null,
+        },
+      };
+      sendTurnMock.mockResolvedValueOnce(notFound);
+      sendTurnMock.mockResolvedValueOnce({
+        ok: true,
+        turn: {
+          conversationId: "conv-fresh",
+          messageId: "msg-fresh",
+          reply: "Hi! Starting fresh.",
+          decision: "answer",
+          confidence: 0.9,
+          sources: [],
+          action: null,
+        },
+      });
+      const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      act(() => {
+        root.render(
+          <ChatWidget config={baseConfig} expiresAt="2026-07-16T12:30:00Z" resumeConversationId="conv-stale" />,
+        );
+      });
+      openPanel();
+
+      typeAndSend("Hello again");
+      await flush();
+      await flush();
+
+      // The stale/foreign record was cleared (decision 7).
+      expect(clearResumeRecordMock).toHaveBeenCalledTimes(1);
+
+      // Retried with conversation_id: null (silently), landing the real reply.
+      expect(sendTurnMock).toHaveBeenCalledTimes(2);
+      expect(sendTurnMock).toHaveBeenNthCalledWith(
+        1,
+        baseConfig,
+        expect.objectContaining({ conversationId: "conv-stale" }),
+      );
+      expect(sendTurnMock).toHaveBeenNthCalledWith(
+        2,
+        baseConfig,
+        expect.objectContaining({ conversationId: null }),
+      );
+
+      // The REAL reply rendered, in the backend's freshly-created thread.
+      const botBubbles = container.querySelectorAll(".cw-bubble-row-bot .cw-bubble-bot");
+      expect(botBubbles.length).toBe(1);
+      expect(botBubbles[0]?.textContent).toContain("Hi! Starting fresh.");
+
+      // NO error bubble, NO fabricated prior messages.
+      expect(container.querySelector(".cw-line-error")).toBeNull();
+      expect(container.querySelectorAll(".cw-bubble-row-user").length).toBe(1); // only the one real user message
+
+      // A SECOND turn continues the NEW thread (conv-fresh), never the stale one.
+      sendTurnMock.mockResolvedValueOnce({
+        ok: true,
+        turn: {
+          conversationId: "conv-fresh",
+          messageId: "msg-fresh-2",
+          reply: "Sure thing.",
+          decision: "answer",
+          confidence: 0.9,
+          sources: [],
+          action: null,
+        },
+      });
+      typeAndSend("Follow-up");
+      await flush();
+
+      expect(sendTurnMock).toHaveBeenLastCalledWith(
+        baseConfig,
+        expect.objectContaining({ conversationId: "conv-fresh" }),
+      );
+
+      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining("RESUME_REJECTED"));
+    });
+
+    it("a CONVERSATION_NOT_FOUND with NO resumed id in play keeps the S14.2 honest-error behavior (regression)", async () => {
+      const notFound: TurnResult = {
+        ok: false,
+        error: {
+          type: "TURN_ERROR",
+          errorCode: "CONVERSATION_NOT_FOUND",
+          message: "Conversation not found.",
+          correlationId: "corr-nf-2",
+          status: 404,
+          retryAfterSeconds: null,
+        },
+      };
+      sendTurnMock.mockResolvedValueOnce(notFound);
+      vi.spyOn(console, "error").mockImplementation(() => {});
+
+      act(() => {
+        // NO resumeConversationId prop -- a normal S14.1/S14.2 boot.
+        root.render(<ChatWidget config={baseConfig} expiresAt="2026-07-16T12:30:00Z" />);
+      });
+      openPanel();
+
+      typeAndSend("Hello");
+      await flush();
+
+      // Only ONE attempt -- no silent retry-as-new-conversation happens
+      // when there was no resume in play.
+      expect(sendTurnMock).toHaveBeenCalledTimes(1);
+      expect(clearResumeRecordMock).not.toHaveBeenCalled();
+
+      const errorLine = container.querySelector(".cw-line-error");
+      expect(errorLine).not.toBeNull();
+      expect(errorLine?.textContent).toMatch(/something went wrong/i);
+      expect(container.querySelectorAll(".cw-bubble-row-bot .cw-bubble-bot").length).toBe(0);
     });
   });
 });

@@ -197,7 +197,9 @@ function mapDetailErrorMessage(error: AdminApiError): string {
 // ---------------------------------------------------------------------------
 
 /** A single transcript message -- mirrors `MessageResponse`
- * (admin_routes.py:66-75) exactly. */
+ * (admin_routes.py:66-75) exactly. `sourceCount` (SR-2) is a cheap hint --
+ * NOT the resolved sources payload -- so the transcript pane knows which bot
+ * messages get a "View sources" affordance. */
 export interface ConversationMessage {
   messageId: string;
   role: string;
@@ -206,6 +208,7 @@ export interface ConversationMessage {
   confidence: number | null;
   tokens: number | null;
   createdAt: string;
+  sourceCount: number;
 }
 
 interface MessageResponseBody {
@@ -216,6 +219,7 @@ interface MessageResponseBody {
   confidence: number | null;
   tokens: number | null;
   created_at: string;
+  source_count: number;
 }
 
 export interface ConversationDetail {
@@ -251,6 +255,7 @@ function toConversationMessage(body: MessageResponseBody): ConversationMessage {
     confidence: body.confidence,
     tokens: body.tokens,
     createdAt: body.created_at,
+    sourceCount: body.source_count,
   };
 }
 
@@ -283,6 +288,137 @@ export async function getConversationDetail(
   } catch (error) {
     if (error instanceof AdminApiError) {
       return { status: "error", message: mapDetailErrorMessage(error), correlationId: error.correlationId };
+    }
+    return {
+      status: "error",
+      message: "Unable to reach the server. Please try again.",
+      correlationId: "",
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Grounding spot-check (SR-2) -- GET .../messages/{message_id}/sources.
+// Resolves a bot message's stored `sources` (doc_id/chunk_id/score/
+// matched_by) to the real, live knowledge_chunks.content so a reviewer can
+// read the reply next to what it was supposedly grounded in and judge
+// groundedness for themselves -- no scoring/diff/verdict added here
+// (decision 6). Mirrors `getConversationDetail`'s tenant-scoped-path +
+// `adminApiFetch` + discriminated-result pattern exactly.
+// ---------------------------------------------------------------------------
+
+/** A single resolved citation -- mirrors `MessageSourceItem`
+ * (admin_routes.py) exactly. `content` is `null` and `resolved` is `false`
+ * when the chunk no longer resolves (deleted/re-ingested, or -- by
+ * construction -- a cross-tenant id) -- never dropped, never faked. */
+export interface MessageSourceItem {
+  chunkId: string;
+  docId: string;
+  score: number | null;
+  matchedBy: string[];
+  content: string | null;
+  resolved: boolean;
+}
+
+interface MessageSourceItemResponseBody {
+  chunk_id: string;
+  doc_id: string;
+  score: number | null;
+  matched_by: string[];
+  content: string | null;
+  resolved: boolean;
+}
+
+/** Mirrors `MessageSourcesResponse` (admin_routes.py) exactly -- leak-free
+ * (no `tenant_id`). */
+export interface MessageSourcesDetail {
+  messageId: string;
+  content: string;
+  decision: string | null;
+  confidence: number | null;
+  grounded: boolean | null;
+  sources: MessageSourceItem[];
+}
+
+interface MessageSourcesResponseBody {
+  message_id: string;
+  content: string;
+  decision: string | null;
+  confidence: number | null;
+  grounded: boolean | null;
+  sources: MessageSourceItemResponseBody[];
+}
+
+export type MessageSourcesResult =
+  | { status: "ok"; detail: MessageSourcesDetail }
+  | { status: "error"; message: string; correlationId: string };
+
+function toMessageSourceItem(body: MessageSourceItemResponseBody): MessageSourceItem {
+  return {
+    chunkId: body.chunk_id,
+    docId: body.doc_id,
+    score: body.score,
+    matchedBy: body.matched_by,
+    content: body.content,
+    resolved: body.resolved,
+  };
+}
+
+function toMessageSourcesDetail(body: MessageSourcesResponseBody): MessageSourcesDetail {
+  return {
+    messageId: body.message_id,
+    content: body.content,
+    decision: body.decision,
+    confidence: body.confidence,
+    grounded: body.grounded,
+    sources: body.sources.map(toMessageSourceItem),
+  };
+}
+
+function mapMessageSourcesErrorMessage(error: AdminApiError): string {
+  if (error.status === 404 || error.errorCode === "MESSAGE_NOT_FOUND") {
+    return "This message could not be found.";
+  }
+  if (error.status === 403 || error.errorCode === "ROLE_NOT_PERMITTED") {
+    return "You do not have permission to view this message's sources.";
+  }
+  if (error.status === 401) {
+    return "Your session has expired. Please log in again.";
+  }
+  return `Something went wrong (${error.errorCode || "UNKNOWN_ERROR"}). Correlation ID: ${
+    error.correlationId || "n/a"
+  }.`;
+}
+
+/**
+ * Fetch a bot message's resolved sources for the grounding spot-check
+ * affordance. Mirrors `getConversationDetail`'s tenant-scoped-path
+ * convention exactly. Never sends `tenant_id` -- scoping is entirely the
+ * backend's repository-layer job from the caller's own claims. Never logs
+ * the response body (PII-minimal -- reply text + chunk text never logged).
+ */
+export async function getMessageSources(
+  conversationId: string,
+  messageId: string,
+  tenantId?: string
+): Promise<MessageSourcesResult> {
+  const basePath = tenantId
+    ? `/admin/tenants/${encodeURIComponent(tenantId)}/conversations`
+    : "/admin/conversations";
+
+  try {
+    const response = await adminApiFetch(
+      `${basePath}/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}/sources`
+    );
+    const body = (await response.json()) as MessageSourcesResponseBody;
+    return { status: "ok", detail: toMessageSourcesDetail(body) };
+  } catch (error) {
+    if (error instanceof AdminApiError) {
+      return {
+        status: "error",
+        message: mapMessageSourcesErrorMessage(error),
+        correlationId: error.correlationId,
+      };
     }
     return {
       status: "error",

@@ -1,9 +1,10 @@
 # Widget dev host page — manual test harness
 
 This is the **real acceptance test** for Sprint S14.1, Sprint S14.2, Sprint S14.3, Sprint S14.4, Sprint
-S14.5, and Sprint S14.6 (per `dev_plan/sprints/S14.1.md` / `dev_plan/sprints/S14.2.md` /
+S14.5, Sprint S14.6, and Sprint SR-3 (per `dev_plan/sprints/S14.1.md` / `dev_plan/sprints/S14.2.md` /
 `dev_plan/sprints/S14.3.md` / `dev_plan/sprints/S14.4.md` / `dev_plan/sprints/S14.5.md` /
-`dev_plan/sprints/S14.6.md` / Phase 14's stated test method): a local HTML host page embedding the
+`dev_plan/sprints/S14.6.md` / `dev_plan/sprints/SR-3-widget-conversation-continuity-across-reload.md` /
+Phase 14's stated test method): a local HTML host page embedding the
 widget, loaded against a real, locally-running backend. Not Postman, not the admin-web browser
 walkthrough.
 
@@ -29,7 +30,14 @@ S14.1–S14.5's steps first (S14.5 step 6 already folds in all of them), then S1
 **This is the sprint that most needs the backend process itself stopped/started on purpose and the
 admission rate limit hammered on purpose** — the unit suite proves the bounded-attempt-count and
 backoff-scheduling invariants precisely (with an injected clock), but only a live pass can show a real
-`Network` tab with real timing gaps and a real `429`.
+`Network` tab with real timing gaps and a real `429`. **SR-3**, an out-of-band review-remediation sprint
+(not part of Phase 14 proper), adds an **opt-in, tenant-gated** conversation-continuity mechanism: reload
+the page (or navigate same-tab to another page carrying the widget) and, when the tenant has
+`widget_session_resume` enabled, the SAME conversation continues instead of fragmenting into a new one —
+run S14.1–S14.6's steps first (S14.6 step 7 already folds in all of them), then SR-3's walkthrough below.
+**This is the sprint that most needs `sessionStorage` inspected by hand** — the unit suite proves the TTL/
+PII-minimization/isolation invariants precisely, but only a live pass can show the actual stored JSON, a
+real reload skipping the mint fetch, and a real cross-visitor-rejection round trip in the Network tab.
 
 ## Precondition: seed a dev origin into a tenant's `allowed_origins`
 
@@ -371,6 +379,55 @@ change lands later (flagged as a recommended follow-up, out of scope for this fr
    from the host page) while the retry is still pending, and confirm **no further `POST /public/chat/
    message` request fires** after the close (the unit suite's `ChatWidget.test.tsx` zombie-timer test
    proves this precisely; this step is the live confirmation).
+
+## SR-3 walkthrough steps (spec Tests section — run all 6)
+
+Run these against the same running backend + host page as above (S14.1's–S14.6's steps still apply as
+regressions — see step 6 below). **Additional precondition beyond S14.6's: `widget_session_resume` must be
+enabled for the tenant behind this page's client key.** SR-3 rides the existing `tenant_bot_settings`
+table (S12.2) — no new column, no migration — reading the boolean key `widget_session_resume` out of that
+row's `business_hours` JSON (`api/gateway/repository.py#get_resume_enabled`). To enable it locally: upsert
+a `tenant_bot_settings` row for your tenant with `business_hours` containing
+`{"widget_session_resume": true}` (via the admin API's `PUT /admin/settings`, or a direct SQL update in
+your local dev DB — merge into any existing `business_hours` JSON you already have, don't clobber real
+business-hours data if you're also testing that).
+
+1. **Happy resume.** With `npm run dev` running and `widget_session_resume` **enabled**, open `dev/host.html`
+   and send a message — normal user + bot bubbles, same as S14.2's happy path. Note the `conversation_id` in
+   the Network tab's `POST /public/chat/message` response. Open DevTools' Application/Storage tab and confirm
+   `sessionStorage["cw:resume:v1"]` now exists, and its JSON contains **only** the four keys `{token,
+   expiresAt, conversationId, lastActive}` — **no** `tenant_id`, name, email, phone, or message text.
+2. **Reload reuses the token (the fix).** Reload the page. The Network tab shows **no** new
+   `POST /widget/session` request (the console instead logs `[chatbot-widget] resumed session from
+   sessionStorage, conversation_id=...`). Send a follow-up message — its request body's `conversation_id`
+   matches step 1's value exactly. Check the admin console's conversations list: this is **one** growing
+   thread, not a second 2-message fragment — the product debt this sprint fixes.
+3. **Same-tab navigation resumes; a new tab does not (decision 3).** Open a second copy of `dev/host.html`
+   in the **same browser tab** (e.g. via a link/back-forward, not a new tab) — the widget resumes the same
+   conversation (`sessionStorage` is same-tab, same-origin). Now open `dev/host.html` in a **brand-new tab**
+   — it starts a fresh session/conversation (no `sessionStorage` record is visible cross-tab); confirm no
+   `POST /widget/session` savings there — a full fresh mint happens, exactly like step 1.
+4. **Inactivity expiry (decision 5).** Wait more than 15 minutes without sending a message (or temporarily
+   lower `TTL_MS` in `src/resume.ts` for a faster local check, then revert it), then reload. The console
+   shows a normal fresh mint (no "resumed session" log line), `sessionStorage["cw:resume:v1"]` is gone, and
+   the panel starts a genuinely **new**, empty conversation — never a stale/fabricated history.
+5. **Stale/foreign handle -> RESUME_REJECTED, never a cross-visitor read (decision 7 — the isolation
+   guarantee).** With a resumed session in `sessionStorage` (repeat step 1 to get one), open DevTools and
+   hand-edit `sessionStorage["cw:resume:v1"]`'s `conversationId` to a garbage/foreign value (e.g.
+   `"deadbeefdeadbeefdeadbeefdeadbeef"`), reload, then send a message. Confirm: the widget shows **no**
+   error bubble, the console logs `RESUME_REJECTED` (via the `[chatbot-widget] resume rejected
+   (RESUME_REJECTED): ...` line), the Network tab shows the first `POST /public/chat/message` return `404
+   CONVERSATION_NOT_FOUND`, immediately followed by a **second** request with `conversation_id: null` that
+   succeeds with a **real** reply — and the admin console shows this turn landed in a **brand-new**
+   conversation, never inside the foreign/garbage thread you can't actually own. This is the live proof of
+   this sprint's core security claim: a persisted-then-swapped `conversation_id` can never resume (or read)
+   another visitor's conversation.
+6. **Opt-out regression — `widget_session_resume` off is byte-for-byte S14.1/S14.2 (decision 1/8).** Point
+   the widget at a tenant with `widget_session_resume` **disabled** (or unset — the default) and repeat
+   steps 1–2. Confirm: `sessionStorage["cw:resume:v1"]` is **never** written (check after every send and
+   every reload), `document.cookie`/`localStorage` also stay empty of the token, every reload performs a
+   fresh `POST /widget/session` mint, and every reload starts a brand-new (empty) conversation — exactly
+   S14.1/S14.2's shipped behavior, with zero storage and zero code-path difference a visitor could observe.
 
 ## Notes
 

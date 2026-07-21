@@ -1764,3 +1764,86 @@ async def test_list_conversations_order_by_and_pagination() -> None:
     assert "offset $" in query.lower()
     assert 10 in args
     assert 5 in args
+
+
+# ---------------------------------------------------------------------------
+# get_messages source_count projection (SR-2)
+# ---------------------------------------------------------------------------
+
+
+def _msg_row_with_source_count(
+    message_id: str, role: str, content: str, source_count: int, ts: datetime,
+) -> dict[str, Any]:
+    return {
+        "message_id": message_id,
+        "role": role,
+        "content": content,
+        "intent": None,
+        "confidence": None,
+        "tokens": None,
+        "created_at": ts,
+        "source_count": source_count,
+    }
+
+
+async def test_get_messages_selects_source_count_via_coalesce_jsonb_array_length() -> None:
+    """get_messages' SELECT projects source_count via
+    coalesce(jsonb_array_length(sources), 0) -- NULL-safe -- and Message
+    round-trips it."""
+    now = datetime.now(UTC)
+    rows = [_msg_row_with_source_count("m1", "bot", "The answer.", 3, now)]
+    db = _RecordingDatabase(rows=rows)
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    messages = await get_messages(db, claims, "conv-1")
+
+    assert len(messages) == 1
+    assert messages[0].source_count == 3
+    assert "coalesce(jsonb_array_length(sources), 0)" in db.last_sql.lower()
+
+
+async def test_get_messages_source_count_zero_when_none_cited() -> None:
+    now = datetime.now(UTC)
+    rows = [_msg_row_with_source_count("m1", "user", "Hello", 0, now)]
+    db = _RecordingDatabase(rows=rows)
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    messages = await get_messages(db, claims, "conv-1")
+
+    assert messages[0].source_count == 0
+
+
+async def test_message_source_count_defaults_to_zero_when_row_omits_it() -> None:
+    """Regression guard: existing Message construction sites (get_message,
+    get_window) that don't select source_count still produce a valid Message
+    with source_count defaulting to 0 -- the dataclass default, not a KeyError."""
+    from api.conversation_store.repository import Message
+
+    msg = Message(
+        message_id="m1",
+        role="bot",
+        content="hi",
+        intent=None,
+        confidence=None,
+        tokens=None,
+        created_at=datetime.now(UTC),
+    )
+
+    assert msg.source_count == 0
+
+
+async def test_get_message_unaffected_by_source_count_still_returns_full_sources() -> None:
+    """get_message is explicitly NOT changed by SR-2 -- it still returns the
+    full sources list verbatim (the new /sources route needs it), and its
+    Message.source_count defaults to 0 (get_message doesn't select it)."""
+    row = _message_row_with_sources(
+        sources=[{"doc_id": "d1", "chunk_id": "c1", "score": 0.9, "matched_by": ["vector"]}],
+    )
+    db = _RecordingDatabase(rows=[row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    msg = await get_message(db, claims, "conv-1", "msg-a")
+
+    assert msg is not None
+    assert msg.sources == [{"doc_id": "d1", "chunk_id": "c1", "score": 0.9, "matched_by": ["vector"]}]
+    assert msg.source_count == 0

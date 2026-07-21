@@ -6,14 +6,27 @@
  * held in a module-scoped variable ONLY (decision 4) — never
  * sessionStorage/localStorage/cookie — and exposed via `authHeader()`, a
  * clean seam for the S14.2 turn caller. No turn call is wired here.
+ *
+ * SR-3 extends this module (decisions 2/8) with the OPT-IN token-reuse
+ * seam: `resume_enabled` (parsed from the admission response, absent ->
+ * false) gates whether a fresh mint writes an initial `sessionStorage`
+ * resume record (decision 8), and `hydrateFromResume` sets the SAME
+ * module-scoped `currentSession` from an already-persisted record instead
+ * of performing a mint fetch at all (decision 2 — reuse, never a new/longer
+ * token). Off (the default), this module's behavior is byte-for-byte
+ * S14.1/S14.2 — zero storage, zero new fetch shape.
  */
 import { z } from "zod";
 
+import { writeResumeRecord, type ResumeRecord } from "./resume";
 import type { WidgetConfig } from "./config";
 
 const SessionResponseSchema = z.object({
   visitor_token: z.string().min(1),
   expires_at: z.string().min(1),
+  // SR-3 decision 8: absent -> false (a pre-SR-3 backend, or a tenant with
+  // the flag unset, must behave exactly as S14.1/S14.2 shipped).
+  resume_enabled: z.boolean().optional(),
 });
 
 export interface VisitorSession {
@@ -51,6 +64,14 @@ export type AdmissionResult =
 // other script on the host page.
 let currentSession: VisitorSession | null = null;
 
+// SR-3 module-scoped state (in-memory, mirrors currentSession's lifecycle):
+// whether THIS tenant has resume enabled (decision 8) and the conversationId
+// seed carried by a hydrated resume record (decision 4), if any. Both reset
+// to their defaults on a fresh mint that does not go through
+// `hydrateFromResume`.
+let resumeEnabled = false;
+let resumeSeedConversationId: string | null = null;
+
 /** The in-memory visitor token, if a session has been minted successfully. */
 export function getVisitorSession(): VisitorSession | null {
   return currentSession;
@@ -63,6 +84,35 @@ export function getVisitorSession(): VisitorSession | null {
 export function authHeader(): { Authorization: string } | null {
   if (!currentSession) return null;
   return { Authorization: `Bearer ${currentSession.visitorToken}` };
+}
+
+/** Whether the current tenant has `resume_enabled` (SR-3 decision 8). Off
+ * (the default) unless a mint's admission response, or a hydrated resume
+ * record, established it. */
+export function isResumeEnabled(): boolean {
+  return resumeEnabled;
+}
+
+/** The `conversation_id` carried by a hydrated resume record, for
+ * `entry.tsx`/`ChatWidget` to seed the turn state (SR-3 decision 4). `null`
+ * when no resume is in play (no record, or the record's conversationId was
+ * itself `null` — no first turn happened yet before the reload). */
+export function getResumeSeed(): { conversationId: string | null } | null {
+  if (!resumeEnabled) return null;
+  return { conversationId: resumeSeedConversationId };
+}
+
+/**
+ * Set the in-memory session from an ALREADY-PERSISTED, already-validated
+ * resume record — reusing the still-valid token instead of calling
+ * `mintVisitorSession` (SR-3 decision 2). Issues NO fetch. The caller
+ * (`entry.tsx`) is responsible for having already confirmed the record is
+ * unexpired via `resume.ts#readResumeRecord`.
+ */
+export function hydrateFromResume(record: ResumeRecord): void {
+  currentSession = { visitorToken: record.token, expiresAt: record.expiresAt };
+  resumeEnabled = true;
+  resumeSeedConversationId = record.conversationId;
 }
 
 interface BackendErrorEnvelope {
@@ -171,5 +221,22 @@ export async function mintVisitorSession(config: WidgetConfig): Promise<Admissio
     visitorToken: parsed.data.visitor_token,
     expiresAt: parsed.data.expires_at,
   };
+
+  // SR-3 decision 8: a fresh mint (as opposed to a hydrated resume) resets
+  // the resume state from THIS tenant's own admission answer, and — only
+  // when opted in — writes the initial resume record so the NEXT reload can
+  // resume. resumeSeedConversationId is null here: a fresh mint has no
+  // conversation yet (ChatWidget.tsx starts it on the first turn).
+  resumeEnabled = parsed.data.resume_enabled ?? false;
+  resumeSeedConversationId = null;
+  if (resumeEnabled) {
+    writeResumeRecord({
+      token: currentSession.visitorToken,
+      expiresAt: currentSession.expiresAt,
+      conversationId: null,
+      lastActive: new Date().toISOString(),
+    });
+  }
+
   return { ok: true, session: currentSession };
 }

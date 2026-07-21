@@ -624,6 +624,150 @@ async def test_replace_chunks_global_caller_raises() -> None:
             await replace_chunks(db, _global_claims(), "doc1", [])  # type: ignore[arg-type]
 
 
+async def test_delete_doc_issues_three_deletes_in_order() -> None:
+    """delete_doc issues DELETE knowledge_chunks -> ingestion_runs -> knowledge_docs, in order."""
+    _reset_modules()
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.ingestion.repository import delete_doc
+
+        db = _ChunkRecordingDatabase()
+
+        async def _execute(query: str, *args: Any) -> str:
+            db.executions.append((query, args))
+            q = query.strip().upper()
+            if q.startswith("DELETE FROM KNOWLEDGE_CHUNKS"):
+                return "DELETE 12"
+            if q.startswith("DELETE FROM INGESTION_RUNS"):
+                return "DELETE 1"
+            if q.startswith("DELETE FROM KNOWLEDGE_DOCS"):
+                return "DELETE 1"
+            return "OK"
+
+        db.execute = _execute  # type: ignore[method-assign]
+
+        claims = _admin_claims("tenant-alpha")
+        chunks_deleted, runs_deleted = await delete_doc(db, claims, "doc1")  # type: ignore[arg-type]
+
+    assert chunks_deleted == 12
+    assert runs_deleted == 1
+
+    stmts = [e[0].strip().upper() for e in db.executions]
+    assert len(stmts) == 3
+    assert stmts[0].startswith("DELETE FROM KNOWLEDGE_CHUNKS")
+    assert stmts[1].startswith("DELETE FROM INGESTION_RUNS")
+    assert stmts[2].startswith("DELETE FROM KNOWLEDGE_DOCS")
+
+
+async def test_delete_doc_every_statement_scoped_to_tenant_and_doc() -> None:
+    """MANDATORY isolation: every DELETE binds exactly [tenant_id, doc_id] -- never doc_id alone."""
+    _reset_modules()
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.ingestion.repository import delete_doc
+
+        db = _ChunkRecordingDatabase()
+
+        async def _execute(query: str, *args: Any) -> str:
+            db.executions.append((query, args))
+            q = query.strip().upper()
+            if q.startswith("DELETE FROM KNOWLEDGE_CHUNKS"):
+                return "DELETE 3"
+            if q.startswith("DELETE FROM INGESTION_RUNS"):
+                return "DELETE 1"
+            if q.startswith("DELETE FROM KNOWLEDGE_DOCS"):
+                return "DELETE 1"
+            return "OK"
+
+        db.execute = _execute  # type: ignore[method-assign]
+
+        claims = _admin_claims("tenant-alpha")
+        await delete_doc(db, claims, "doc-scoped")  # type: ignore[arg-type]
+
+    for query, args in db.executions:
+        upper = query.strip().upper()
+        assert "TENANT_ID = $1" in upper and "DOC_ID = $2" in upper, (
+            f"DELETE statement missing tenant_id+doc_id predicate: {query!r}"
+        )
+        assert list(args) == ["tenant-alpha", "doc-scoped"], (
+            f"DELETE statement bound params must be exactly [tenant_id, doc_id]: {args!r}"
+        )
+
+
+async def test_delete_doc_not_found_raises() -> None:
+    """A 0-row knowledge_docs delete (absent/cross-tenant/race) raises NotFoundError DOC_NOT_FOUND."""
+    _reset_modules()
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from common.errors import NotFoundError
+
+        from api.ingestion.repository import delete_doc
+
+        db = _ChunkRecordingDatabase()
+
+        async def _execute(query: str, *args: Any) -> str:
+            db.executions.append((query, args))
+            q = query.strip().upper()
+            if q.startswith("DELETE FROM KNOWLEDGE_CHUNKS"):
+                return "DELETE 0"
+            if q.startswith("DELETE FROM INGESTION_RUNS"):
+                return "DELETE 0"
+            if q.startswith("DELETE FROM KNOWLEDGE_DOCS"):
+                return "DELETE 0"
+            return "OK"
+
+        db.execute = _execute  # type: ignore[method-assign]
+
+        claims = _admin_claims("tenant-alpha")
+        with pytest.raises(NotFoundError) as exc_info:
+            await delete_doc(db, claims, "ghost-doc")  # type: ignore[arg-type]
+
+    assert exc_info.value.code == "DOC_NOT_FOUND"
+    # All three DELETEs must have been issued (no exception swallowed mid-way,
+    # and the count-return path must not be taken).
+    stmts = [e[0].strip().upper() for e in db.executions]
+    assert len(stmts) == 3
+
+
+async def test_delete_doc_global_caller_raises_and_issues_no_delete() -> None:
+    """delete_doc with PLATFORM_ADMIN claims raises ValidationError; no DELETE issued."""
+    _reset_modules()
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.ingestion.repository import delete_doc
+
+        db = _ChunkRecordingDatabase()
+        with pytest.raises(ValidationError):
+            await delete_doc(db, _global_claims(), "doc1")  # type: ignore[arg-type]
+
+    assert db.executions == [], "No DELETE should be issued for a global caller"
+
+
+async def test_delete_doc_ingestion_runs_explicitly_targeted() -> None:
+    """Regression for the non-cascade fact: the second statement targets ingestion_runs."""
+    _reset_modules()
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        from api.ingestion.repository import delete_doc
+
+        db = _ChunkRecordingDatabase()
+
+        async def _execute(query: str, *args: Any) -> str:
+            db.executions.append((query, args))
+            q = query.strip().upper()
+            if q.startswith("DELETE FROM KNOWLEDGE_CHUNKS"):
+                return "DELETE 0"
+            if q.startswith("DELETE FROM INGESTION_RUNS"):
+                return "DELETE 2"
+            if q.startswith("DELETE FROM KNOWLEDGE_DOCS"):
+                return "DELETE 1"
+            return "OK"
+
+        db.execute = _execute  # type: ignore[method-assign]
+
+        claims = _admin_claims("tenant-alpha")
+        chunks_deleted, runs_deleted = await delete_doc(db, claims, "doc-runs")  # type: ignore[arg-type]
+
+    assert runs_deleted == 2
+    stmts = [e[0].strip().upper() for e in db.executions]
+    assert stmts[1].startswith("DELETE FROM INGESTION_RUNS")
+
+
 async def test_update_run_with_chunks_out_binds_value() -> None:
     """update_run accepts chunks_out and includes it in the SQL params."""
     _reset_modules()

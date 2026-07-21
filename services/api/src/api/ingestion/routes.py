@@ -13,6 +13,18 @@ GET /admin/ingestion/docs/{doc_id}
     Returns doc + latest run + first 500 chars of ``parsed.txt`` (if
     available). Response NEVER includes ``tenant_id`` or ``storage_key``.
     Returns 404 ``DOC_NOT_FOUND`` if absent / not visible to the caller.
+
+DELETE /admin/ingestion/docs/{doc_id}
+    (SR-4) Hard-deletes a knowledge document: authorizes via the existing
+    tenant-scoped ``get_doc`` (404 before any delete for absent/cross-tenant
+    doc_id — no leak), then removes its ``knowledge_chunks``, its
+    ``ingestion_runs``, the ``knowledge_docs`` row (DB-first), then the two
+    stored files (raw upload + ``parsed.txt``) via the existing
+    ``StorageProvider.delete``. A storage-delete failure AFTER a successful
+    DB delete is logged as ``document_delete_storage_orphan`` and does not
+    fail the request (the DB delete is authoritative). Records a
+    ``document_deleted`` audit event after the DB delete succeeds. Response
+    NEVER includes ``tenant_id`` or ``storage_key``.
 """
 from __future__ import annotations
 
@@ -237,3 +249,91 @@ async def get_document_for_tenant(
 ) -> dict[str, Any]:
     """PLATFORM_ADMIN super-user variant of ``GET /admin/ingestion/docs/{doc_id}`` (S12.7)."""
     return await _get_document(doc_id, request, claims)
+
+
+async def _delete_document(doc_id: str, request: Request, claims: AuthClaims) -> dict[str, Any]:
+    """Hard-delete a knowledge document: DB rows, then stored files (SR-4).
+
+    Authorizes via the existing tenant-scoped ``get_doc`` first — 404
+    ``DOC_NOT_FOUND`` for an absent or cross-tenant doc_id, indistinguishable,
+    before any delete runs (no leak). Deletes DB rows first (decision 5:
+    authoritative, correctness-critical state), then removes the two stored
+    files; a storage failure after a successful DB delete is logged and does
+    NOT fail the request. Audits ``document_deleted`` only after the DB
+    delete succeeds.
+    """
+    db = request.app.state.db
+
+    doc = await repo.get_doc(db, claims, doc_id)
+    if doc is None:
+        raise NotFoundError(
+            "Knowledge document not found.",
+            code="DOC_NOT_FOUND",
+        )
+
+    # Capture before delete — the row is gone after.
+    filename = doc.filename
+    raw_key = doc.storage_key
+
+    chunks_deleted, runs_deleted = await repo.delete_doc(db, claims, doc_id)
+
+    # -- Storage cleanup (after DB success; never blocks the response) --------
+    storage = get_storage()
+    parsed_key = f"{claims.tenant_id}/{doc_id}/parsed.txt"
+    for key in (raw_key, parsed_key):
+        try:
+            storage.delete(key)
+        except Exception:
+            _log.warning(
+                "document_delete_storage_orphan",
+                extra={
+                    "event": "document_delete_storage_orphan",
+                },
+            )
+
+    await record_audit(
+        db,
+        claims,
+        action="document_deleted",
+        target_type="knowledge_doc",
+        target_id=doc_id,
+        metadata={
+            "filename": filename,
+            "chunks_deleted": chunks_deleted,
+            "runs_deleted": runs_deleted,
+        },
+        actor_context=get_platform_admin_actor(request),
+    )
+
+    _log.info(
+        "document_deleted",
+        extra={
+            "event": "document_deleted",
+        },
+    )
+
+    return {
+        "doc_id": doc_id,
+        "deleted": True,
+        "chunks_deleted": chunks_deleted,
+        "runs_deleted": runs_deleted,
+    }
+
+
+@router.delete("/docs/{doc_id}")
+async def delete_document(
+    doc_id: str,
+    request: Request,
+    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN)),  # noqa: B008
+) -> dict[str, Any]:
+    return await _delete_document(doc_id, request, claims)
+
+
+@tenant_scoped_router.delete("/docs/{doc_id}")
+async def delete_document_for_tenant(
+    doc_id: str,
+    request: Request,
+    claims: AuthClaims = Depends(resolve_tenant_scope(Role.CLIENT_ADMIN)),  # noqa: B008
+) -> dict[str, Any]:
+    """PLATFORM_ADMIN super-user variant of ``DELETE /admin/ingestion/docs/{doc_id}`` (S12.7)."""
+    return await _delete_document(doc_id, request, claims)

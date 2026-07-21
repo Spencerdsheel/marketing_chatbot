@@ -17,10 +17,22 @@
  * cap is hit. A non-retryable admission error (`INVALID_CLIENT_KEY`,
  * `ORIGIN_NOT_ALLOWED`, `TENANT_DISABLED`) is still never retried — the
  * shared `withRetry` classifier already returns those immediately.
+ *
+ * SR-3 (decision 2/7/8, scope item 3): BEFORE minting, check for an
+ * unexpired resume record (`resume.ts#readResumeRecord`). A record can only
+ * exist if a PRIOR load's admission said `resume_enabled` (session.ts only
+ * writes one when opted in) — so the record itself is the on-reload gate;
+ * there is no admission response to consult yet at this point. When found,
+ * `hydrateFromResume` sets the session from the stored token and NO mint
+ * fetch happens at all (decision 2 — reuse, not a new mint). When absent/
+ * expired, the boot falls through to the untouched S14.1/S14.6 mint-with-
+ * retry path below — a tenant that never opts in, or a fresh tab, sees
+ * byte-for-byte the same sequence as before this sprint.
  */
 import { loadConfig } from "./config";
 import { mountWidget } from "./mount";
-import { mintVisitorSession, type AdmissionResult } from "./session";
+import { readResumeRecord } from "./resume";
+import { getResumeSeed, hydrateFromResume, mintVisitorSession, type AdmissionResult } from "./session";
 import { withRetry } from "./retry";
 import { ChatWidget } from "./ui/ChatWidget";
 import { DiagnosticStrip } from "./ui/DiagnosticStrip";
@@ -44,6 +56,23 @@ async function boot(): Promise<void> {
   // Mount the shadow host unconditionally once we have a valid config, so
   // the (opt-in) debug strip has a place to render on failure too.
   const { reactRoot } = mountWidget(config.mountSelector);
+
+  // SR-3 decision 2/7: try resume BEFORE minting. A valid unexpired record
+  // reuses the still-valid token — no fetch, no retry loop needed for it.
+  const resumeRecord = readResumeRecord(new Date());
+  if (resumeRecord) {
+    hydrateFromResume(resumeRecord);
+    const seed = getResumeSeed();
+    console.info(`${LOG_PREFIX} resumed session from sessionStorage, conversation_id=${seed?.conversationId ?? "n/a"}`);
+    reactRoot.render(
+      <ChatWidget
+        config={config}
+        expiresAt={resumeRecord.expiresAt}
+        resumeConversationId={seed?.conversationId ?? null}
+      />,
+    );
+    return;
+  }
 
   const admission = await withRetry<AdmissionResult>(() => mintVisitorSession(config), {
     maxAttempts: BOOT_ADMISSION_MAX_ATTEMPTS,
@@ -72,9 +101,11 @@ async function boot(): Promise<void> {
 
   // S14.1 decision 3 step 4 / decision 5 success proof + S14.2 decision 1:
   // the real interactive chat root replaces the S14.1 placeholder at this
-  // single render site.
+  // single render site. SR-3: a fresh mint never carries a resume seed
+  // (resumeConversationId=null) -- ChatWidget starts a brand-new
+  // conversation on the first turn, exactly as before this sprint.
   console.info(`${LOG_PREFIX} visitor session minted, expires_at=${admission.session.expiresAt}`);
-  reactRoot.render(<ChatWidget config={config} expiresAt={admission.session.expiresAt} />);
+  reactRoot.render(<ChatWidget config={config} expiresAt={admission.session.expiresAt} resumeConversationId={null} />);
 }
 
 // Top-level side effect — the only one in this bundle. Never let a boot

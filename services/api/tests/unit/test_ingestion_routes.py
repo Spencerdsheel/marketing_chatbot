@@ -56,6 +56,8 @@ class _StubDatabase:
         self._docs: dict[tuple[str, str], dict[str, Any]] = {}
         self._runs: dict[tuple[str, str], dict[str, Any]] = {}
         self._hashes: dict[tuple[str, str], str] = {}  # (tenant_id, hash) -> doc_id
+        # (tenant_id, doc_id) -> chunk count, seeded by tests exercising delete.
+        self._chunk_counts: dict[tuple[str, str], int] = {}
 
     async def execute(self, query: str, *args: Any) -> str:
         q = query.strip().upper()
@@ -101,10 +103,38 @@ class _StubDatabase:
         if "UPDATE INGESTION_RUNS" in q:
             return "UPDATE 1"
 
+        if "DELETE FROM KNOWLEDGE_CHUNKS" in q:
+            tenant_id, doc_id = str(args[0]), str(args[1])
+            n = self._chunk_counts.pop((tenant_id, doc_id), 0)
+            return f"DELETE {n}"
+
+        if "DELETE FROM INGESTION_RUNS" in q:
+            tenant_id, doc_id = str(args[0]), str(args[1])
+            keys = [k for k, r in self._runs.items() if k[0] == tenant_id and r["doc_id"] == doc_id]
+            for k in keys:
+                del self._runs[k]
+            return f"DELETE {len(keys)}"
+
+        if "DELETE FROM KNOWLEDGE_DOCS" in q:
+            tenant_id, doc_id = str(args[0]), str(args[1])
+            key = (tenant_id, doc_id)
+            if key in self._docs:
+                del self._docs[key]
+                return "DELETE 1"
+            return "DELETE 0"
+
         return "OK"
 
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
         q = query.upper()
+
+        if "FROM TENANTS" in q:
+            # resolve_tenant_scope's TenantRepository.get(claims, tenant_id) --
+            # treat _TENANT_ID (and any tenant with a seeded doc) as real/enabled.
+            tenant_id = str(args[0])
+            if tenant_id == _TENANT_ID or any(tid == tenant_id for tid, _ in self._docs):
+                return {"id": tenant_id, "name": tenant_id, "slug": tenant_id, "enabled": True}
+            return None
 
         if "FROM KNOWLEDGE_DOCS" in q and "AND CONTENT_HASH" in q:
             # find_doc_by_hash — WHERE ... AND content_hash = $2
@@ -680,6 +710,446 @@ async def test_get_doc_client_agent_returns_403() -> None:
 # ==============================================================================
 # Regression: upload at INFO log level must not crash (reserved 'filename' key)
 # ==============================================================================
+
+
+async def test_delete_doc_happy_path_returns_200_and_removes_everything() -> None:
+    """CLIENT_ADMIN DELETE -> 200 {doc_id, deleted:true, chunks_deleted, runs_deleted};
+    no tenant_id/storage_key in body; DB-before-storage-before-audit ordering."""
+    _reset_modules()
+
+    stub_db = _StubDatabase()
+    stub_storage = _InMemoryStorage()
+
+    doc_id = "doc-delete-happy"
+    storage_key = f"{_TENANT_ID}/{doc_id}/sample.txt"
+    parsed_key = f"{_TENANT_ID}/{doc_id}/parsed.txt"
+    stub_db._docs[(_TENANT_ID, doc_id)] = {
+        "doc_id": doc_id,
+        "source": "upload",
+        "filename": "sample.txt",
+        "content_type": "text/plain",
+        "status": "parsed",
+        "content_hash": "sha256-del",
+        "storage_key": storage_key,
+        "created_at": _NOW,
+        "updated_at": _NOW,
+        "tenant_id": _TENANT_ID,
+    }
+    stub_db._runs[(_TENANT_ID, "run-del")] = {
+        "run_id": "run-del",
+        "doc_id": doc_id,
+        "status": "succeeded",
+        "chars_out": 42,
+        "errors": None,
+        "started_at": _NOW,
+        "finished_at": _NOW,
+        "duration_ms": 100,
+        "tenant_id": _TENANT_ID,
+    }
+    stub_db._chunk_counts[(_TENANT_ID, doc_id)] = 12
+    stub_storage.put(storage_key, b"raw bytes")
+    stub_storage.put(parsed_key, b"parsed text")
+
+    call_order: list[str] = []
+    real_delete_doc = None
+
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        app = _build_app(stub_db)
+        token = _mint_cookie()
+
+        import api.ingestion.repository as repo_mod
+        from api.audit import repository as audit_mod
+
+        real_delete_doc = repo_mod.delete_doc
+        real_delete = stub_storage.delete
+        real_record_audit = audit_mod.record_audit
+
+        async def _tracking_delete_doc(*args: Any, **kwargs: Any) -> Any:
+            call_order.append("delete_doc")
+            return await real_delete_doc(*args, **kwargs)
+
+        def _tracking_storage_delete(key: str) -> None:
+            call_order.append("storage.delete")
+            real_delete(key)
+
+        async def _tracking_record_audit(*args: Any, **kwargs: Any) -> Any:
+            call_order.append("record_audit")
+            return await real_record_audit(*args, **kwargs)
+
+        stub_storage.delete = _tracking_storage_delete  # type: ignore[method-assign]
+
+        with (
+            patch("api.ingestion.routes.get_storage", return_value=stub_storage),
+            patch("api.ingestion.routes.repo.delete_doc", side_effect=_tracking_delete_doc),
+            patch("api.ingestion.routes.record_audit", side_effect=_tracking_record_audit),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.request(
+                    "DELETE",
+                    f"/admin/ingestion/docs/{doc_id}",
+                    cookies={"access_token": token},
+                )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["doc_id"] == doc_id
+    assert body["deleted"] is True
+    assert body["chunks_deleted"] == 12
+    assert body["runs_deleted"] == 1
+    assert "tenant_id" not in body
+    assert "storage_key" not in body
+
+    assert call_order[0] == "delete_doc"
+    assert "storage.delete" in call_order
+    assert call_order.count("storage.delete") == 2
+    assert call_order[-1] == "record_audit"
+    assert call_order.index("delete_doc") < call_order.index("storage.delete")
+    assert call_order.index("storage.delete") < call_order.index("record_audit")
+
+    # Doc is actually gone from the store.
+    assert (_TENANT_ID, doc_id) not in stub_db._docs
+    assert not stub_storage.exists(storage_key)
+    assert not stub_storage.exists(parsed_key)
+
+
+async def test_delete_doc_missing_or_cross_tenant_returns_404_no_destructive_calls() -> None:
+    """MANDATORY isolation: absent/cross-tenant doc_id -> 404 DOC_NOT_FOUND;
+    delete_doc and storage.delete are NEVER reached."""
+    _reset_modules()
+
+    stub_db = _StubDatabase()
+    stub_storage = _InMemoryStorage()
+
+    # Doc exists, but under a DIFFERENT tenant than the caller's cookie.
+    other_tenant = "tenant-other"
+    doc_id = "doc-cross-tenant"
+    stub_db._docs[(other_tenant, doc_id)] = {
+        "doc_id": doc_id,
+        "source": "upload",
+        "filename": "secret.txt",
+        "content_type": "text/plain",
+        "status": "parsed",
+        "content_hash": "sha256-cross",
+        "storage_key": f"{other_tenant}/{doc_id}/secret.txt",
+        "created_at": _NOW,
+        "updated_at": _NOW,
+        "tenant_id": other_tenant,
+    }
+
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        app = _build_app(stub_db)
+        token = _mint_cookie()  # tenant = _TENANT_ID, not other_tenant
+
+        with (
+            patch("api.ingestion.routes.get_storage", return_value=stub_storage) as mock_get_storage,
+            patch("api.ingestion.routes.repo.delete_doc") as mock_delete_doc,
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.request(
+                    "DELETE",
+                    f"/admin/ingestion/docs/{doc_id}",
+                    cookies={"access_token": token},
+                )
+
+    assert resp.status_code == 404
+    assert resp.json()["error_code"] == "DOC_NOT_FOUND"
+    mock_delete_doc.assert_not_called()
+    # get_storage may or may not be constructed lazily, but delete must never fire.
+    if mock_get_storage.return_value is not None:
+        assert not hasattr(mock_get_storage.return_value, "_delete_called")
+
+    # Tenant B's row must be untouched.
+    assert (other_tenant, doc_id) in stub_db._docs
+
+
+async def test_delete_doc_client_admin_returns_200() -> None:
+    """RBAC: CLIENT_ADMIN -> 200 (baseline positive, already covered above but kept explicit)."""
+    _reset_modules()
+
+    stub_db = _StubDatabase()
+    stub_storage = _InMemoryStorage()
+    doc_id = "doc-rbac-admin"
+    stub_db._docs[(_TENANT_ID, doc_id)] = {
+        "doc_id": doc_id,
+        "source": "upload",
+        "filename": "f.txt",
+        "content_type": "text/plain",
+        "status": "parsed",
+        "content_hash": "h-rbac",
+        "storage_key": f"{_TENANT_ID}/{doc_id}/f.txt",
+        "created_at": _NOW,
+        "updated_at": _NOW,
+        "tenant_id": _TENANT_ID,
+    }
+
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        app = _build_app(stub_db)
+        token = _mint_cookie(role=Role.CLIENT_ADMIN)
+
+        with patch("api.ingestion.routes.get_storage", return_value=stub_storage):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.request(
+                    "DELETE",
+                    f"/admin/ingestion/docs/{doc_id}",
+                    cookies={"access_token": token},
+                )
+
+    assert resp.status_code == 200
+
+
+async def test_delete_doc_client_agent_returns_403() -> None:
+    """RBAC: CLIENT_AGENT -> 403 ROLE_NOT_PERMITTED (decision 3 — agents cannot delete knowledge)."""
+    _reset_modules()
+
+    stub_db = _StubDatabase()
+
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        app = _build_app(stub_db)
+        token = _mint_cookie(role=Role.CLIENT_AGENT)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.request(
+                "DELETE",
+                "/admin/ingestion/docs/any-id",
+                cookies={"access_token": token},
+            )
+
+    assert resp.status_code == 403
+
+
+async def test_delete_doc_visitor_returns_403() -> None:
+    """RBAC: VISITOR -> 403."""
+    _reset_modules()
+
+    stub_db = _StubDatabase()
+
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        app = _build_app(stub_db)
+        token = _mint_cookie(role=Role.VISITOR)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.request(
+                "DELETE",
+                "/admin/ingestion/docs/any-id",
+                cookies={"access_token": token},
+            )
+
+    assert resp.status_code == 403
+
+
+async def test_delete_doc_no_cookie_returns_401() -> None:
+    """RBAC: no cookie -> 401."""
+    _reset_modules()
+
+    stub_db = _StubDatabase()
+
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        app = _build_app(stub_db)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.request("DELETE", "/admin/ingestion/docs/any-id")
+
+    assert resp.status_code == 401
+
+
+async def test_delete_doc_global_platform_admin_on_implicit_route_returns_403() -> None:
+    """RBAC: a global PLATFORM_ADMIN (tenant_id=None) on the IMPLICIT route -> 403."""
+    _reset_modules()
+
+    stub_db = _StubDatabase()
+
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        app = _build_app(stub_db)
+        token = _mint_cookie(role=Role.PLATFORM_ADMIN, tenant_id=None)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.request(
+                "DELETE",
+                "/admin/ingestion/docs/any-id",
+                cookies={"access_token": token},
+            )
+
+    assert resp.status_code == 403
+
+
+async def test_delete_doc_platform_admin_via_tenant_scoped_route_returns_200_with_marker() -> None:
+    """PLATFORM_ADMIN reaches a specific tenant's doc via the tenant-scoped route -> 200;
+    the audit call carries the platform_admin actor_context marker."""
+    _reset_modules()
+
+    stub_db = _StubDatabase()
+    stub_storage = _InMemoryStorage()
+    doc_id = "doc-platform-scoped"
+    stub_db._docs[(_TENANT_ID, doc_id)] = {
+        "doc_id": doc_id,
+        "source": "upload",
+        "filename": "scoped.txt",
+        "content_type": "text/plain",
+        "status": "parsed",
+        "content_hash": "h-scoped",
+        "storage_key": f"{_TENANT_ID}/{doc_id}/scoped.txt",
+        "created_at": _NOW,
+        "updated_at": _NOW,
+        "tenant_id": _TENANT_ID,
+    }
+
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        app = _build_app(stub_db)
+        token = _mint_cookie(role=Role.PLATFORM_ADMIN, tenant_id=None)
+
+        captured_kwargs: dict[str, Any] = {}
+        from api.audit.repository import record_audit as real_record_audit
+
+        async def _capturing_record_audit(*args: Any, **kwargs: Any) -> Any:
+            captured_kwargs.update(kwargs)
+            return await real_record_audit(*args, **kwargs)
+
+        with (
+            patch("api.ingestion.routes.get_storage", return_value=stub_storage),
+            patch("api.ingestion.routes.record_audit", side_effect=_capturing_record_audit),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.request(
+                    "DELETE",
+                    f"/admin/tenants/{_TENANT_ID}/ingestion/docs/{doc_id}",
+                    cookies={"access_token": token},
+                )
+
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] is True
+    assert captured_kwargs.get("actor_context") is not None
+
+
+async def test_delete_doc_storage_orphan_degradation_still_returns_200() -> None:
+    """No silent fallback: storage.delete raising AFTER a successful DB delete
+    still returns 200 deleted:true, and a document_delete_storage_orphan warning
+    is logged. The DB delete is authoritative and is not rolled back / not
+    reported as failure."""
+    _reset_modules()
+
+    stub_db = _StubDatabase()
+    stub_storage = _InMemoryStorage()
+    doc_id = "doc-orphan"
+    storage_key = f"{_TENANT_ID}/{doc_id}/f.txt"
+    stub_db._docs[(_TENANT_ID, doc_id)] = {
+        "doc_id": doc_id,
+        "source": "upload",
+        "filename": "f.txt",
+        "content_type": "text/plain",
+        "status": "parsed",
+        "content_hash": "h-orphan",
+        "storage_key": storage_key,
+        "created_at": _NOW,
+        "updated_at": _NOW,
+        "tenant_id": _TENANT_ID,
+    }
+
+    def _raising_delete(key: str) -> None:
+        raise OSError("simulated storage failure")
+
+    stub_storage.delete = _raising_delete  # type: ignore[method-assign]
+
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        app = _build_app(stub_db)
+        token = _mint_cookie()
+
+        with (
+            patch("api.ingestion.routes.get_storage", return_value=stub_storage),
+            patch("api.ingestion.routes._log") as mock_log,
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.request(
+                    "DELETE",
+                    f"/admin/ingestion/docs/{doc_id}",
+                    cookies={"access_token": token},
+                )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["deleted"] is True
+
+    # The DB row is gone regardless of the storage failure.
+    assert (_TENANT_ID, doc_id) not in stub_db._docs
+
+    warning_events = [
+        call.args[0] if call.args else call.kwargs.get("msg")
+        for call in mock_log.warning.call_args_list
+    ]
+    assert any("document_delete_storage_orphan" in str(e) for e in warning_events)
+
+
+async def test_delete_doc_race_not_found_skips_audit() -> None:
+    """Audit-only-after-success: a delete_doc that raises DOC_NOT_FOUND (0-row
+    race after get_doc succeeded) -> 404 to the caller and NO record_audit call."""
+    _reset_modules()
+
+    stub_db = _StubDatabase()
+    stub_storage = _InMemoryStorage()
+    doc_id = "doc-race"
+    stub_db._docs[(_TENANT_ID, doc_id)] = {
+        "doc_id": doc_id,
+        "source": "upload",
+        "filename": "race.txt",
+        "content_type": "text/plain",
+        "status": "parsed",
+        "content_hash": "h-race",
+        "storage_key": f"{_TENANT_ID}/{doc_id}/race.txt",
+        "created_at": _NOW,
+        "updated_at": _NOW,
+        "tenant_id": _TENANT_ID,
+    }
+
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        app = _build_app(stub_db)
+        token = _mint_cookie()
+
+        with (
+            patch("api.ingestion.routes.get_storage", return_value=stub_storage),
+            patch("api.ingestion.routes.repo.delete_doc", side_effect=NotFoundError_factory()),
+            patch("api.ingestion.routes.record_audit") as mock_record_audit,
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.request(
+                    "DELETE",
+                    f"/admin/ingestion/docs/{doc_id}",
+                    cookies={"access_token": token},
+                )
+
+    assert resp.status_code == 404
+    assert resp.json()["error_code"] == "DOC_NOT_FOUND"
+    mock_record_audit.assert_not_called()
+
+
+def NotFoundError_factory() -> Any:
+    """Return a side_effect callable that raises NotFoundError(DOC_NOT_FOUND) — used
+    to simulate the delete_doc 0-row concurrent-delete race in
+    test_delete_doc_race_not_found_skips_audit."""
+    from common.errors import NotFoundError
+
+    async def _raise(*args: Any, **kwargs: Any) -> Any:
+        raise NotFoundError("Knowledge document not found.", code="DOC_NOT_FOUND")
+
+    return _raise
 
 
 async def test_upload_at_info_log_level_returns_200_not_500() -> None:

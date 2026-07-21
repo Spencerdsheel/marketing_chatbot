@@ -1,7 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { WidgetConfig } from "./config";
-import { authHeader, getVisitorSession, mintVisitorSession } from "./session";
+import { RESUME_KEY } from "./resume";
+import {
+  authHeader,
+  getResumeSeed,
+  getVisitorSession,
+  hydrateFromResume,
+  isResumeEnabled,
+  mintVisitorSession,
+} from "./session";
 
 const baseConfig: WidgetConfig = {
   clientKey: "pk_test_123",
@@ -23,10 +31,12 @@ describe("mintVisitorSession", () => {
   beforeEach(() => {
     fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
+    sessionStorage.clear();
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    sessionStorage.clear();
   });
 
   it("stores the token in memory and exposes a working authHeader() on a 200", async () => {
@@ -196,5 +206,130 @@ describe("mintVisitorSession", () => {
     // A failed re-mint must not fake/clear a previously-good token — no
     // silent fallback in either direction.
     expect(getVisitorSession()?.visitorToken).toBe("jwt.good");
+  });
+
+  // =====================================================================
+  // SR-3: resume_enabled parsing + initial-record write on a fresh mint
+  // =====================================================================
+
+  it("parses resume_enabled:true from the admission response and reports it via isResumeEnabled()", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(200, {
+        visitor_token: "jwt.abc.def",
+        expires_at: "2026-07-16T12:30:00Z",
+        resume_enabled: true,
+      }),
+    );
+
+    await mintVisitorSession(baseConfig);
+
+    expect(isResumeEnabled()).toBe(true);
+  });
+
+  it("an absent resume_enabled field is treated as false (opt-in default)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(200, { visitor_token: "jwt.abc.def", expires_at: "2026-07-16T12:30:00Z" }),
+    );
+
+    await mintVisitorSession(baseConfig);
+
+    expect(isResumeEnabled()).toBe(false);
+  });
+
+  it("resume_enabled:false on a successful mint writes NO sessionStorage record (opt-in gate, decision 8)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(200, {
+        visitor_token: "jwt.abc.def",
+        expires_at: "2026-07-16T12:30:00Z",
+        resume_enabled: false,
+      }),
+    );
+
+    await mintVisitorSession(baseConfig);
+
+    expect(sessionStorage.getItem(RESUME_KEY)).toBeNull();
+  });
+
+  it("resume_enabled:true on a successful mint writes an initial sessionStorage record (token + expiresAt, conversationId:null)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(200, {
+        visitor_token: "jwt.abc.def",
+        expires_at: "2026-07-16T12:30:00Z",
+        resume_enabled: true,
+      }),
+    );
+
+    await mintVisitorSession(baseConfig);
+
+    const raw = sessionStorage.getItem(RESUME_KEY);
+    expect(raw).not.toBeNull();
+    const parsed = JSON.parse(raw as string) as Record<string, unknown>;
+    expect(parsed.token).toBe("jwt.abc.def");
+    expect(parsed.expiresAt).toBe("2026-07-16T12:30:00Z");
+    expect(parsed.conversationId).toBeNull();
+  });
+
+  it("a failed mint writes no resume record even when a prior resume_enabled was true", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(422, { error_code: "INVALID_CLIENT_KEY", message: "x", correlation_id: "corr-1" }),
+    );
+
+    await mintVisitorSession(baseConfig);
+
+    expect(sessionStorage.getItem(RESUME_KEY)).toBeNull();
+  });
+});
+
+// =====================================================================
+// SR-3: hydrateFromResume -- token reuse, no mint fetch (decision 2)
+// =====================================================================
+
+describe("hydrateFromResume", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    sessionStorage.clear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+  });
+
+  it("sets authHeader() from the stored token and issues NO POST /widget/session (decision 2)", () => {
+    hydrateFromResume({
+      token: "jwt.resumed",
+      expiresAt: "2026-07-16T12:30:00Z",
+      conversationId: "conv-abc",
+      lastActive: "2026-07-16T12:05:00Z",
+    });
+
+    expect(authHeader()).toEqual({ Authorization: "Bearer jwt.resumed" });
+    expect(getVisitorSession()).toEqual({ visitorToken: "jwt.resumed", expiresAt: "2026-07-16T12:30:00Z" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("exposes the seeded conversationId via getResumeSeed()", () => {
+    hydrateFromResume({
+      token: "jwt.resumed",
+      expiresAt: "2026-07-16T12:30:00Z",
+      conversationId: "conv-abc",
+      lastActive: "2026-07-16T12:05:00Z",
+    });
+
+    expect(getResumeSeed()).toEqual({ conversationId: "conv-abc" });
+  });
+
+  it("marks isResumeEnabled() true after a successful hydrate (the record only exists when the tenant opted in)", () => {
+    hydrateFromResume({
+      token: "jwt.resumed",
+      expiresAt: "2026-07-16T12:30:00Z",
+      conversationId: null,
+      lastActive: "2026-07-16T12:05:00Z",
+    });
+
+    expect(isResumeEnabled()).toBe(true);
   });
 });

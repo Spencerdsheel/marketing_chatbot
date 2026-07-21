@@ -483,3 +483,62 @@ async def test_admin_conversation_detail_route_registered() -> None:
     app = _build_app()
     route_paths = _all_route_paths(app)
     assert "/admin/conversations/{conversation_id}" in route_paths
+
+
+# -- Router registration (SR-2) --------------------------------------------------
+
+
+async def test_admin_message_sources_route_registered() -> None:
+    """GET /admin/conversations/{conversation_id}/messages/{message_id}/sources
+    route exists (SR-2 grounding spot-check, implicit-tenant router)."""
+    app = _build_app()
+    route_paths = _all_route_paths(app)
+    assert "/admin/conversations/{conversation_id}/messages/{message_id}/sources" in route_paths
+
+
+# -- Router registration (SR-4) --------------------------------------------------
+
+
+def _route_methods_by_path(app: Any) -> dict[str, set[str]]:
+    methods_by_path: dict[str, set[str]] = {}
+
+    def _collect(routes: Any) -> None:
+        for r in routes:
+            path = getattr(r, "path", None)
+            methods = getattr(r, "methods", None)
+            if path is not None and methods:
+                methods_by_path.setdefault(path, set()).update(methods)
+            original_router = getattr(r, "original_router", None)
+            if original_router is not None:
+                _collect(original_router.routes)
+
+    _collect(app.routes)
+    return methods_by_path
+
+
+async def test_ingestion_delete_doc_route_registered() -> None:
+    """DELETE /admin/ingestion/docs/{doc_id} route exists (SR-4)."""
+    app = _build_app()
+    methods_by_path = _route_methods_by_path(app)
+    assert "DELETE" in methods_by_path.get("/admin/ingestion/docs/{doc_id}", set())
+
+
+async def test_ingestion_delete_doc_tenant_scoped_route_registered() -> None:
+    """DELETE /admin/tenants/{tenant_id}/ingestion/docs/{doc_id} route exists (SR-4,
+    PLATFORM_ADMIN super-user variant)."""
+    app = _build_app()
+    methods_by_path = _route_methods_by_path(app)
+    assert "DELETE" in methods_by_path.get(
+        "/admin/tenants/{tenant_id}/ingestion/docs/{doc_id}", set()
+    )
+
+
+async def test_admin_message_sources_tenant_scoped_route_registered() -> None:
+    """GET /admin/tenants/{tenant_id}/conversations/{conversation_id}/messages/
+    {message_id}/sources route exists (SR-2, PLATFORM_ADMIN super-user variant)."""
+    app = _build_app()
+    route_paths = _all_route_paths(app)
+    assert (
+        "/admin/tenants/{tenant_id}/conversations/{conversation_id}/messages/{message_id}/sources"
+        in route_paths
+    )

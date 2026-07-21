@@ -1824,3 +1824,206 @@ async def test_stream_classify_llm_error_raises_not_error_event() -> None:
     assert len(p._append_calls) == 1
     assert p._append_calls[0]["role"] == "user"
     p.provider.stream.assert_not_called()
+
+
+# =====================================================================================
+# SR-3: widget conversation continuity -- the MANDATORY cross-visitor
+# isolation test, exercised through the REAL conversation_store.repository
+# (not mocked -- every other test above patches append_message/get_message
+# entirely, which never actually runs `_verify_conversation_visible`'s SQL
+# scoping). This section patches ONLY the LLM/RAG/orchestrator-config seam
+# and lets `create_conversation`/`append_message` hit a real in-memory
+# `conversations`/`messages` store, proving the exact invariant SR-3's
+# frontend RESUME_REJECTED path depends on: a conversation_id created under
+# visitor A, presented by a session carrying visitor B (same tenant), is
+# rejected -- never a cross-visitor read of A's thread.
+# =====================================================================================
+
+
+class _FakeConversationDb:
+    """A minimal, REAL-semantics in-memory `conversations`/`messages` store.
+
+    Interprets the actual SQL text `conversation_store/repository.py` emits
+    (its WHERE-clause shape is stable across S10.x/S12.x) well enough to
+    honor tenant_id + conversation_id + the VISITOR `visitor_id` scope
+    clause (`_scope_filter` / the EXISTS-join in `count_messages`), and the
+    `ON CONFLICT (tenant_id, conversation_id, message_id) DO NOTHING`
+    idempotent insert. This is NOT a SQL parser -- it is a narrow interpreter
+    of exactly the query shapes this module's repository functions produce,
+    which is enough to prove the visitor_id-scoped authorization behavior
+    end-to-end without a real Postgres.
+    """
+
+    def __init__(self) -> None:
+        # (tenant_id, conversation_id) -> visitor_id
+        self.conversations: dict[tuple[str, str], str | None] = {}
+        # (tenant_id, conversation_id, message_id) -> role
+        self.messages: dict[tuple[str, str, str], str] = {}
+
+    async def execute(self, query: str, *args: Any) -> str:
+        if query.startswith("INSERT INTO conversations"):
+            conversation_id, tenant_id, visitor_id = args[0], args[1], args[2]
+            self.conversations[(tenant_id, conversation_id)] = visitor_id
+            return "INSERT 1"
+        if query.startswith("INSERT INTO messages"):
+            message_id, tenant_id, conversation_id, role = args[0], args[1], args[2], args[3]
+            key = (tenant_id, conversation_id, message_id)
+            if key not in self.messages:  # ON CONFLICT ... DO NOTHING
+                self.messages[key] = role
+            return "INSERT 1"
+        raise AssertionError(f"unexpected execute(): {query}")
+
+    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
+        if "count(*)" in query:
+            tenant_id, conversation_id = args[0], args[1]
+            role_filter = args[2] if "role = $3" in query else None
+            count = sum(
+                1
+                for (t, c, m), role in self.messages.items()
+                if t == tenant_id and c == conversation_id and (role_filter is None or role == role_filter)
+            )
+            return {"count": count}
+        if query.startswith("SELECT 1 FROM conversations") or query.startswith(
+            "SELECT conversation_id"
+        ):
+            tenant_id, conversation_id = args[0], args[1]
+            key = (tenant_id, conversation_id)
+            if key not in self.conversations:
+                return None
+            if "visitor_id = $3" in query:
+                visitor_id = args[2]
+                if self.conversations[key] != visitor_id:
+                    return None
+            return {"1": 1}
+        raise AssertionError(f"unexpected fetchrow(): {query}")
+
+    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        raise AssertionError(f"unexpected fetch(): {query}")
+
+    async def close(self) -> None:
+        pass
+
+
+def _claims_visitor(tenant_id: str, visitor_id: str) -> AuthClaims:
+    return AuthClaims(subject=visitor_id, role=Role.VISITOR, tenant_id=tenant_id)
+
+
+class _RealStorePatched:
+    """Like `_Patched`, but leaves `create_conversation`/`append_message`/
+    `get_message`/`count_messages` as the REAL `conversation_store
+    .repository` functions -- only the LLM/RAG/orchestrator-config seam is
+    mocked. Used exclusively by the SR-3 isolation tests below."""
+
+    def __init__(self) -> None:
+        self.config = _config()
+        self.orchestrator_config = _orch_cfg()
+        self.get_llm_config = AsyncMock(return_value=self.config)
+        self.get_orchestrator_config = AsyncMock(return_value=self.orchestrator_config)
+        self.get_working_memory = AsyncMock(return_value=_wm())
+        self.get_availability = AsyncMock(return_value=None)
+        self.retrieve_hybrid = AsyncMock(
+            return_value=HybridResult(chunks=[_chunk()], confidence=0.8)
+        )
+        provider = AsyncMock()
+        provider.generate = AsyncMock(
+            return_value=Completion(
+                text="The grounded answer.", model="claude-opus-4-8",
+                input_tokens=10, output_tokens=5,
+            )
+        )
+        provider.classify = AsyncMock(return_value="question")
+        self.provider = provider
+        self.provider_for = AsyncMock(return_value=provider)
+        self.settings = MagicMock(llm_max_tokens=256)
+
+    def __enter__(self) -> _RealStorePatched:
+        self._patchers = [
+            patch("api.orchestrator.service.get_llm_config", self.get_llm_config),
+            patch("api.orchestrator.service.get_orchestrator_config", self.get_orchestrator_config),
+            patch("api.orchestrator.service.get_working_memory", self.get_working_memory),
+            patch("api.orchestrator.service.retrieve_hybrid", self.retrieve_hybrid),
+            patch("api.orchestrator.service.provider_for", lambda cfg: self.provider),
+            patch("api.orchestrator.service.get_availability", self.get_availability),
+            patch("api.orchestrator.service.get_api_settings", return_value=self.settings),
+        ]
+        for p in self._patchers:
+            p.start()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        for p in self._patchers:
+            p.stop()
+
+
+async def test_sr3_cross_visitor_conversation_id_rejected_real_store() -> None:
+    """MANDATORY (SR-3): a conversation_id created under visitor A, presented
+    on a turn whose claims carry visitor B (same tenant), is rejected with
+    NotFoundError(CONVERSATION_NOT_FOUND) via the REAL
+    append_message -> _verify_conversation_visible path (not a mock). B's
+    turn must NOT append to A's conversation -- proving a persisted-then-
+    swapped/stale conversation_id can never resume another visitor's
+    thread. This is the guarantee the widget's RESUME_REJECTED path
+    (decision 7) relies on."""
+    from common.errors import NotFoundError
+
+    db = _FakeConversationDb()
+    tenant = "tenant-shared"
+    claims_a = _claims_visitor(tenant, "visitor-a")
+    claims_b = _claims_visitor(tenant, "visitor-b")
+
+    with _RealStorePatched():
+        # Visitor A creates a conversation (first turn, no conversation_id supplied).
+        result_a = await answer_turn(db=db, claims=claims_a, message="hello from A")
+        conv_a = result_a.conversation_id
+        assert conv_a in {c for (_t, c) in db.conversations}
+        assert db.conversations[(tenant, conv_a)] == "visitor-a"
+
+        # Visitor B presents A's conversation_id (simulating a persisted-then
+        # -swapped/stale/foreign resume record) -- must be rejected, never
+        # append to A's thread.
+        with pytest.raises(NotFoundError) as exc_info:
+            await answer_turn(
+                db=db, claims=claims_b, message="hello from B, trying to hijack A's thread",
+                conversation_id=conv_a,
+            )
+        assert exc_info.value.code == "CONVERSATION_NOT_FOUND"
+
+    # A's conversation carries ONLY A's own turn (user + the bot reply to it)
+    # -- exactly 2 messages, never a 3rd row from B's rejected hijack attempt.
+    a_messages = [
+        role for (t, c, _m), role in db.messages.items() if t == tenant and c == conv_a
+    ]
+    assert sorted(a_messages) == ["bot", "user"]
+    assert len(a_messages) == 2  # B's turn never landed a row here
+
+
+async def test_sr3_same_visitor_resume_appends_to_existing_conversation_real_store() -> None:
+    """MANDATORY positive case (SR-3): the SAME visitor_id presenting the
+    same conversation_id again (the legitimate resume) succeeds -- the turn
+    appends to the existing conversation, no CONVERSATION_NOT_FOUND -- proving
+    reuse works when visitor_id matches (the property that makes token-reuse
+    resume actually functional, per the spec's Investigation)."""
+    db = _FakeConversationDb()
+    tenant = "tenant-shared"
+    claims_a = _claims_visitor(tenant, "visitor-a")
+
+    with _RealStorePatched():
+        result_1 = await answer_turn(db=db, claims=claims_a, message="first message")
+        conv_a = result_1.conversation_id
+
+        # Same visitor, same conversation_id, on a later "page load" (a fresh
+        # AuthClaims object with the identical subject/tenant_id -- mirroring
+        # a re-hydrated session from a reused token).
+        claims_a_resumed = _claims_visitor(tenant, "visitor-a")
+        result_2 = await answer_turn(
+            db=db, claims=claims_a_resumed, message="second message, same thread",
+            conversation_id=conv_a,
+        )
+
+    assert result_2.conversation_id == conv_a  # no new conversation created
+    a_user_messages = [
+        role
+        for (t, c, _m), role in db.messages.items()
+        if t == tenant and c == conv_a and role == "user"
+    ]
+    assert len(a_user_messages) == 2  # both turns landed in the same thread

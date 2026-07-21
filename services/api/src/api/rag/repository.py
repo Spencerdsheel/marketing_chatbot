@@ -148,3 +148,43 @@ async def keyword_search(
         )
         for row in rows
     ]
+
+
+async def resolve_chunks(
+    db: Database, claims: AuthClaims, chunk_ids: list[str],
+) -> dict[str, str]:
+    """Resolve chunk_ids to live content, tenant-scoped (PK = (tenant_id, chunk_id)).
+
+    Used by the SR-2 grounding spot-check endpoint to resolve a bot message's
+    historical, stored ``sources`` chunk_ids back to the real
+    ``knowledge_chunks.content`` so a reviewer can judge groundedness for
+    themselves. Returns a map ONLY for chunk_ids that resolve within the
+    caller's tenant; an unresolved id (deleted/re-ingested chunk, or a
+    cross-tenant id) is simply absent from the map -- the caller marks it
+    content=null/resolved=false (no silent fallback, no placeholder text).
+
+    The tenant filter is applied INSIDE this query (via
+    ``common.tenancy.tenant_filter``, the same helper ``keyword_search``
+    uses) -- not a post-fetch check -- so a chunk_id recorded in tenant A's
+    historical sources that happens to equal a real tenant B chunk id cannot
+    resolve to B's text: B's row simply fails the ``tenant_id = $N``
+    predicate and is absent from the result set. This is the load-bearing
+    cross-tenant-resolution guarantee for this sprint (SR-2 decision 4).
+
+    Rejects global (PLATFORM_ADMIN) callers -- retrieval is tenant-scoped.
+    Empty ``chunk_ids`` short-circuits to ``{}`` with no query issued.
+    """
+    _reject_global(claims)
+    if not chunk_ids:
+        return {}
+
+    params: list[Any] = [chunk_ids]  # $1 (bound array, never interpolated)
+    frag, fparams = tenant_filter(claims, next_param=len(params) + 1)
+    params += fparams
+    sql = (
+        "SELECT chunk_id, content FROM knowledge_chunks "  # noqa: S608
+        "WHERE chunk_id = ANY($1::text[]) "
+        f"{frag}"
+    )
+    rows = await db.fetch(sql, *params)
+    return {str(r["chunk_id"]): str(r["content"]) for r in rows}

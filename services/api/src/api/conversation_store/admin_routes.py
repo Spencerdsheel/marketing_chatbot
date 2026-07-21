@@ -24,9 +24,11 @@ from api.auth.dependencies import require_roles, resolve_tenant_scope
 from api.conversation_store.repository import (
     ConversationSummaryRow,
     get_conversation,
+    get_message,
     get_messages,
     list_conversations,
 )
+from api.rag.repository import resolve_chunks
 
 _log = get_logger(__name__)
 
@@ -73,6 +75,11 @@ class MessageResponse(BaseModel):
     confidence: float | None
     tokens: int | None
     created_at: datetime
+    source_count: int
+    """Cheap hint (``jsonb_array_length(sources)``, SR-2) so the transcript
+    UI knows which bot messages have a "View sources" affordance -- NOT the
+    full sources payload (that's the separate ``/messages/{id}/sources``
+    route, fetched lazily on expand)."""
 
 
 class ConversationDetailResponse(BaseModel):
@@ -259,6 +266,7 @@ async def _get_conversation_detail(
                 confidence=m.confidence,
                 tokens=m.tokens,
                 created_at=m.created_at,
+                source_count=m.source_count,
             )
             for m in messages
         ],
@@ -283,3 +291,132 @@ async def get_conversation_detail_for_tenant(
     """PLATFORM_ADMIN super-user variant of
     ``GET /admin/conversations/{conversation_id}`` (S12.7)."""
     return await _get_conversation_detail(conversation_id, request, claims)
+
+
+# ---------------------------------------------------------------------------
+# Grounding spot-check: GET .../{conversation_id}/messages/{message_id}/sources
+# (SR-2) -- resolves a bot message's stored `sources` (doc_id/chunk_id/score/
+# matched_by) to the real, live `knowledge_chunks.content` so a reviewer can
+# read the reply next to what it was supposedly grounded in and judge
+# groundedness for themselves. Read-only; no scoring/diff/verdict (decision 6).
+# ---------------------------------------------------------------------------
+
+
+class MessageSourceItem(BaseModel):
+    """A single resolved citation -- leak-free (no ``tenant_id``).
+
+    ``chunk_id``/``doc_id``/``score``/``matched_by`` come from the message's
+    stored (historical) ``sources`` entry; ``content``/``resolved`` come from
+    the LIVE ``knowledge_chunks`` lookup. ``content`` is ``None`` and
+    ``resolved`` is ``False`` when the chunk no longer resolves (deleted/
+    re-ingested, or -- by construction -- a cross-tenant id) -- never
+    silently dropped, never given placeholder text (no silent fallback).
+    """
+
+    chunk_id: str
+    doc_id: str
+    score: float | None
+    matched_by: list[str]
+    content: str | None
+    resolved: bool
+
+
+class MessageSourcesResponse(BaseModel):
+    """Response for the grounding spot-check endpoint -- leak-free (no
+    ``tenant_id``). ``sources`` is always present (an empty list, never a
+    404/422, for a message with no citations -- decision 7)."""
+
+    message_id: str
+    content: str
+    decision: str | None
+    confidence: float | None
+    grounded: bool | None
+    sources: list[MessageSourceItem]
+
+
+async def _get_message_sources(
+    conversation_id: str,
+    message_id: str,
+    request: Request,
+    claims: AuthClaims,
+) -> MessageSourcesResponse:
+    """Fetch a message (tenant-scoped via ``get_message``) and resolve its
+    stored ``sources`` chunk_ids to live content (tenant-scoped via
+    ``resolve_chunks`` -- the tenant filter is INSIDE that query, so a
+    cross-tenant/guessed chunk_id can never resolve). Returns 404
+    ``MESSAGE_NOT_FOUND`` if the message is absent or not visible to the
+    caller (indistinguishable from cross-tenant, no leak). A message with no
+    stored sources (``NULL`` or ``[]``) returns ``sources: []`` with a 200 --
+    never an error (decision 7).
+    """
+    db = request.app.state.db
+
+    msg = await get_message(db, claims, conversation_id, message_id)
+    if msg is None:
+        raise NotFoundError(
+            "Message not found.", code="MESSAGE_NOT_FOUND",
+        )
+
+    stored_sources = msg.sources or []
+    chunk_ids = [str(s["chunk_id"]) for s in stored_sources]
+    resolved = await resolve_chunks(db, claims, chunk_ids)
+
+    items = [
+        MessageSourceItem(
+            chunk_id=str(s["chunk_id"]),
+            doc_id=str(s.get("doc_id", "")),
+            score=s.get("score"),
+            matched_by=list(s.get("matched_by") or []),
+            content=resolved.get(str(s["chunk_id"])),
+            resolved=str(s["chunk_id"]) in resolved,
+        )
+        for s in stored_sources
+    ]
+
+    resolved_count = sum(1 for item in items if item.resolved)
+    unresolved_count = len(items) - resolved_count
+    _log.info(
+        "message_sources_viewed conversation_id=%s message_id=%s "
+        "source_count=%d resolved_count=%d unresolved_count=%d",
+        conversation_id,
+        message_id,
+        len(items),
+        resolved_count,
+        unresolved_count,
+        extra={
+            "event": "message_sources_viewed",
+            "tenant_id": claims.tenant_id,
+            "conversation_id": conversation_id,
+        },
+    )
+
+    return MessageSourcesResponse(
+        message_id=msg.message_id,
+        content=msg.content,
+        decision=msg.decision,
+        confidence=msg.confidence,
+        grounded=msg.grounded,
+        sources=items,
+    )
+
+
+@router.get("/{conversation_id}/messages/{message_id}/sources")
+async def get_message_sources(
+    conversation_id: str,
+    message_id: str,
+    request: Request,
+    claims: AuthClaims = Depends(require_roles(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> MessageSourcesResponse:
+    return await _get_message_sources(conversation_id, message_id, request, claims)
+
+
+@tenant_scoped_router.get("/{conversation_id}/messages/{message_id}/sources")
+async def get_message_sources_for_tenant(
+    conversation_id: str,
+    message_id: str,
+    request: Request,
+    claims: AuthClaims = Depends(resolve_tenant_scope(Role.CLIENT_ADMIN, Role.CLIENT_AGENT)),  # noqa: B008
+) -> MessageSourcesResponse:
+    """PLATFORM_ADMIN super-user variant of the grounding spot-check
+    endpoint (S12.7 pattern)."""
+    return await _get_message_sources(conversation_id, message_id, request, claims)

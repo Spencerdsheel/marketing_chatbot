@@ -50,6 +50,11 @@ class Message:
     grounded: bool | None = None
     guardrail_flag: str | None = None
     action: str | None = None
+    source_count: int = 0
+    """Cheap ``jsonb_array_length(sources)`` projection (SR-2) -- only
+    ``get_messages`` selects this; other constructors (``get_message``,
+    ``get_window``) leave it at the default 0 (they already return the full
+    ``sources`` payload where needed, so this hint isn't required there)."""
 
 
 @dataclass(frozen=True)
@@ -360,7 +365,7 @@ async def get_messages(
     # ruff: noqa: S608
     sql = (
         "SELECT message_id, role, content, intent, confidence, tokens, "
-        "created_at "
+        "created_at, coalesce(jsonb_array_length(sources), 0) AS source_count "
         "FROM messages "
         "WHERE tenant_id = $1 AND conversation_id = $2" + extra + " "
         "ORDER BY created_at, message_id"
@@ -375,6 +380,7 @@ async def get_messages(
             confidence=r["confidence"],
             tokens=r["tokens"],
             created_at=r["created_at"],
+            source_count=int(r["source_count"]) if "source_count" in r else 0,
         )
         for r in rows
     ]

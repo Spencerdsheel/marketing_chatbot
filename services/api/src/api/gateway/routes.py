@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from api.config import get_api_settings
 from api.gateway.dependencies import get_visitor_claims
-from api.gateway.repository import get_tenant_by_client_key
+from api.gateway.repository import get_resume_enabled, get_tenant_by_client_key
 from api.gateway.sessions import mint_visitor_session, origin_allowed
 from api.ratelimit import client_ip, enforce_rate_limit
 
@@ -34,7 +34,7 @@ class WidgetSessionRequest(BaseModel):
 async def widget_session(
     body: WidgetSessionRequest,
     request: Request,
-) -> dict[str, str]:
+) -> dict[str, str | bool]:
     """Validate client key + Origin, mint a visitor session token."""
     settings = get_api_settings()
 
@@ -75,11 +75,20 @@ async def widget_session(
         ttl_seconds=settings.visitor_session_ttl_seconds,
     )
 
+    # SR-3 decision 8: a single read-only flag, echoed in the admission
+    # response. Defaults false (opt-in) -- never changes mint_visitor_session,
+    # the JWT, or any authorization SQL.
+    resume_enabled = await get_resume_enabled(db, tenant["id"])
+
     _log.info(
         "visitor session minted",
         extra={"event": "widget_session", "tenant_id": tenant["id"]},
     )
-    return {"visitor_token": token, "expires_at": expires_at}
+    return {
+        "visitor_token": token,
+        "expires_at": expires_at,
+        "resume_enabled": resume_enabled,
+    }
 
 
 @router.get("/whoami")

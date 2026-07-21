@@ -12,12 +12,16 @@ import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { WidgetConfig } from "./config";
+import type { ResumeRecord } from "./resume";
 import type { AdmissionResult } from "./session";
 
 const renderMock = vi.fn();
 const loadConfigMock = vi.fn<() => { ok: true; config: WidgetConfig }>();
 const mountWidgetMock = vi.fn<(mountSelector: string | null) => { reactRoot: { render: typeof renderMock } }>();
 const mintVisitorSessionMock = vi.fn<(config: WidgetConfig) => Promise<AdmissionResult>>();
+const hydrateFromResumeMock = vi.fn<(record: ResumeRecord) => void>();
+const getResumeSeedMock = vi.fn<() => { conversationId: string | null } | null>();
+const readResumeRecordMock = vi.fn<(now: Date) => ResumeRecord | null>();
 
 vi.mock("./config", () => ({
   loadConfig: () => loadConfigMock(),
@@ -29,6 +33,12 @@ vi.mock("./mount", () => ({
 
 vi.mock("./session", () => ({
   mintVisitorSession: (config: WidgetConfig) => mintVisitorSessionMock(config),
+  hydrateFromResume: (record: ResumeRecord) => hydrateFromResumeMock(record),
+  getResumeSeed: () => getResumeSeedMock(),
+}));
+
+vi.mock("./resume", () => ({
+  readResumeRecord: (now: Date) => readResumeRecordMock(now),
 }));
 
 // entry.tsx renders <ChatWidget>/<DiagnosticStrip> via reactRoot.render — stub
@@ -67,6 +77,14 @@ describe("entry.tsx boot()", () => {
     mountWidgetMock.mockReset();
     mintVisitorSessionMock.mockReset();
     renderMock.mockReset();
+    hydrateFromResumeMock.mockReset();
+    getResumeSeedMock.mockReset();
+    readResumeRecordMock.mockReset();
+    // Default: no resume record present -- the standard S14.1/S14.2
+    // mint-fresh boot path, unaffected by SR-3 (existing tests above rely
+    // on this default so they need no changes).
+    readResumeRecordMock.mockReturnValue(null);
+    getResumeSeedMock.mockReturnValue(null);
     mountWidgetMock.mockReturnValue({ reactRoot: { render: renderMock } });
     vi.spyOn(console, "error").mockImplementation(() => {});
     vi.spyOn(console, "info").mockImplementation(() => {});
@@ -167,5 +185,85 @@ describe("entry.tsx boot()", () => {
 
     expect(mintVisitorSessionMock).toHaveBeenCalledTimes(2);
     expect(renderMock).toHaveBeenCalledTimes(1);
+  });
+
+  // =====================================================================
+  // SR-3: resume-before-mint boot orchestration (decision 2/7)
+  // =====================================================================
+
+  it("a valid resume record hydrates the session and skips mintVisitorSession entirely (decision 2)", async () => {
+    loadConfigMock.mockReturnValue({ ok: true, config: baseConfig });
+    const record = {
+      token: FIXTURE_SESSION_A,
+      expiresAt: "2026-07-16T13:00:00Z",
+      conversationId: "conv-resumed",
+      lastActive: "2026-07-16T12:50:00Z",
+    };
+    readResumeRecordMock.mockReturnValue(record);
+    getResumeSeedMock.mockReturnValue({ conversationId: "conv-resumed" });
+
+    await act(async () => {
+      await import("./entry");
+    });
+    await flushRetries();
+
+    expect(hydrateFromResumeMock).toHaveBeenCalledWith(record);
+    expect(mintVisitorSessionMock).not.toHaveBeenCalled();
+    expect(renderMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("a valid resume record's conversationId is passed to ChatWidget as resumeConversationId", async () => {
+    loadConfigMock.mockReturnValue({ ok: true, config: baseConfig });
+    readResumeRecordMock.mockReturnValue({
+      token: FIXTURE_SESSION_A,
+      expiresAt: "2026-07-16T13:00:00Z",
+      conversationId: "conv-resumed",
+      lastActive: "2026-07-16T12:50:00Z",
+    });
+    getResumeSeedMock.mockReturnValue({ conversationId: "conv-resumed" });
+
+    await act(async () => {
+      await import("./entry");
+    });
+    await flushRetries();
+
+    const rendered = renderMock.mock.calls[0]?.[0] as { props: { resumeConversationId?: string | null } };
+    expect(rendered.props.resumeConversationId).toBe("conv-resumed");
+  });
+
+  it("no resume record present -> the normal S14.1 mint-fresh boot runs (regression: default behavior unchanged)", async () => {
+    loadConfigMock.mockReturnValue({ ok: true, config: baseConfig });
+    readResumeRecordMock.mockReturnValue(null);
+    mintVisitorSessionMock.mockResolvedValue({
+      ok: true,
+      session: { visitorToken: FIXTURE_SESSION_A, expiresAt: "2026-07-16T13:00:00Z" },
+    });
+
+    await act(async () => {
+      await import("./entry");
+    });
+    await flushRetries();
+
+    expect(hydrateFromResumeMock).not.toHaveBeenCalled();
+    expect(mintVisitorSessionMock).toHaveBeenCalledTimes(1);
+    expect(renderMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("a fresh mint (no resume record) renders ChatWidget with resumeConversationId null", async () => {
+    loadConfigMock.mockReturnValue({ ok: true, config: baseConfig });
+    readResumeRecordMock.mockReturnValue(null);
+    getResumeSeedMock.mockReturnValue(null);
+    mintVisitorSessionMock.mockResolvedValue({
+      ok: true,
+      session: { visitorToken: FIXTURE_SESSION_A, expiresAt: "2026-07-16T13:00:00Z" },
+    });
+
+    await act(async () => {
+      await import("./entry");
+    });
+    await flushRetries();
+
+    const rendered = renderMock.mock.calls[0]?.[0] as { props: { resumeConversationId?: string | null } };
+    expect(rendered.props.resumeConversationId ?? null).toBeNull();
   });
 });

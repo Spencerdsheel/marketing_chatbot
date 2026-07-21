@@ -12,6 +12,7 @@ const {
   buildConversationsQuery,
   listConversations,
   getConversationDetail,
+  getMessageSources,
   CONVERSATION_STATUSES,
 } = await import("@/lib/conversations");
 
@@ -284,6 +285,7 @@ describe("getConversationDetail", () => {
               confidence: null,
               tokens: null,
               created_at: "2026-07-19T00:00:01Z",
+              source_count: 0,
             },
             {
               message_id: "msg-2",
@@ -293,6 +295,7 @@ describe("getConversationDetail", () => {
               confidence: 0.94,
               tokens: 42,
               created_at: "2026-07-19T00:00:05Z",
+              source_count: 3,
             },
           ],
         }),
@@ -308,6 +311,8 @@ describe("getConversationDetail", () => {
       expect(result.conversation.messages).toHaveLength(2);
       expect(result.conversation.messages[1].confidence).toBe(0.94);
       expect(result.conversation.messages[1].intent).toBe("pricing_question");
+      expect(result.conversation.messages[0].sourceCount).toBe(0);
+      expect(result.conversation.messages[1].sourceCount).toBe(3);
     }
   });
 
@@ -375,5 +380,233 @@ describe("getConversationDetail", () => {
     if (result.status === "error") {
       expect(result.message).toMatch(/unable to reach/i);
     }
+  });
+});
+
+describe("getMessageSources", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    getMock.mockReset();
+  });
+
+  it("maps a 200 envelope with resolved sources to an ok result", async () => {
+    getMock.mockReturnValue(undefined);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          message_id: "msg-2",
+          content: "You can run Meta ads alongside lead-gen.",
+          decision: "answer",
+          confidence: 0.57,
+          grounded: true,
+          sources: [
+            {
+              chunk_id: "c1",
+              doc_id: "doc-1",
+              score: 0.83,
+              matched_by: ["vector", "keyword"],
+              content: "Real chunk text.",
+              resolved: true,
+            },
+            {
+              chunk_id: "c2-deleted",
+              doc_id: "doc-2",
+              score: 0.61,
+              matched_by: ["vector"],
+              content: null,
+              resolved: false,
+            },
+          ],
+        }),
+        { status: 200 }
+      )
+    );
+
+    const result = await getMessageSources("conv-1", "msg-2");
+
+    expect(result.status).toBe("ok");
+    if (result.status === "ok") {
+      expect(result.detail.messageId).toBe("msg-2");
+      expect(result.detail.content).toBe("You can run Meta ads alongside lead-gen.");
+      expect(result.detail.decision).toBe("answer");
+      expect(result.detail.confidence).toBe(0.57);
+      expect(result.detail.grounded).toBe(true);
+      expect(result.detail.sources).toHaveLength(2);
+      expect(result.detail.sources[0]).toEqual({
+        chunkId: "c1",
+        docId: "doc-1",
+        score: 0.83,
+        matchedBy: ["vector", "keyword"],
+        content: "Real chunk text.",
+        resolved: true,
+      });
+      expect(result.detail.sources[1].resolved).toBe(false);
+      expect(result.detail.sources[1].content).toBeNull();
+      expect(result.detail).not.toHaveProperty("tenant_id");
+    }
+  });
+
+  it("maps a 200 envelope with an empty sources list to an ok result", async () => {
+    getMock.mockReturnValue(undefined);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          message_id: "msg-chitchat",
+          content: "Hi there!",
+          decision: "answer",
+          confidence: null,
+          grounded: null,
+          sources: [],
+        }),
+        { status: 200 }
+      )
+    );
+
+    const result = await getMessageSources("conv-1", "msg-chitchat");
+
+    expect(result.status).toBe("ok");
+    if (result.status === "ok") {
+      expect(result.detail.sources).toEqual([]);
+    }
+  });
+
+  it("maps a 404 MESSAGE_NOT_FOUND to a not-found message", async () => {
+    getMock.mockReturnValue(undefined);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({ error_code: "MESSAGE_NOT_FOUND", message: "x", correlation_id: "c" }),
+        { status: 404 }
+      )
+    );
+
+    const result = await getMessageSources("conv-1", "msg-missing");
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.message).toMatch(/not be found/i);
+    }
+  });
+
+  it("maps a 403 to a friendly permission message", async () => {
+    getMock.mockReturnValue(undefined);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({ error_code: "ROLE_NOT_PERMITTED", message: "x", correlation_id: "c" }),
+        { status: 403 }
+      )
+    );
+
+    const result = await getMessageSources("conv-1", "msg-1");
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.message).toMatch(/permission/i);
+    }
+  });
+
+  it("maps a 401 to a session-expired message", async () => {
+    getMock.mockReturnValue(undefined);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({ error_code: "AUTHENTICATION_ERROR", message: "x", correlation_id: "c" }),
+        { status: 401 }
+      )
+    );
+
+    const result = await getMessageSources("conv-1", "msg-1");
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.message).toMatch(/session/i);
+    }
+  });
+
+  it("targets the implicit path when tenantId is omitted, never sending tenant_id", async () => {
+    getMock.mockReturnValue(undefined);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          message_id: "msg-1",
+          content: "hi",
+          decision: null,
+          confidence: null,
+          grounded: null,
+          sources: [],
+        }),
+        { status: 200 }
+      )
+    );
+
+    await getMessageSources("conv-1", "msg-1");
+
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("http://localhost:8000/admin/conversations/conv-1/messages/msg-1/sources");
+    const body = init?.body ? String(init.body) : "";
+    expect(body).not.toContain("tenant_id");
+  });
+
+  it("targets the tenant-scoped path when tenantId is provided (PLATFORM_ADMIN)", async () => {
+    getMock.mockReturnValue(undefined);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          message_id: "msg-1",
+          content: "hi",
+          decision: null,
+          confidence: null,
+          grounded: null,
+          sources: [],
+        }),
+        { status: 200 }
+      )
+    );
+
+    await getMessageSources("conv-1", "msg-1", "tenant-x");
+
+    const [url] = fetchSpy.mock.calls[0] as [string];
+    expect(url).toBe(
+      "http://localhost:8000/admin/tenants/tenant-x/conversations/conv-1/messages/msg-1/sources"
+    );
+  });
+
+  it("maps a non-AdminApiError network throw to a generic network message", async () => {
+    getMock.mockReturnValue(undefined);
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("down"));
+
+    const result = await getMessageSources("conv-1", "msg-1");
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.message).toMatch(/unable to reach/i);
+    }
+  });
+
+  it("never logs the response body", async () => {
+    getMock.mockReturnValue(undefined);
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          message_id: "msg-1",
+          content: "secret reply text",
+          decision: "answer",
+          confidence: 0.9,
+          grounded: true,
+          sources: [
+            {
+              chunk_id: "c1",
+              doc_id: "doc-1",
+              score: 0.9,
+              matched_by: ["vector"],
+              content: "secret chunk text",
+              resolved: true,
+            },
+          ],
+        }),
+        { status: 200 }
+      )
+    );
+
+    await getMessageSources("conv-1", "msg-1");
+
+    expect(consoleSpy).not.toHaveBeenCalled();
+    expect(errorSpy).not.toHaveBeenCalled();
   });
 });

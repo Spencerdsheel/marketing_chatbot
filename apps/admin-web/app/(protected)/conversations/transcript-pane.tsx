@@ -20,7 +20,25 @@
  *     and no admin-send-message endpoint to wire it to.
  */
 import { formatDateTime, statusBadgeStyle } from "@/app/(protected)/conversations/presentation";
-import type { ConversationDetail } from "@/lib/conversations";
+import { MessageSources } from "@/app/(protected)/conversations/message-sources";
+import { shouldShowSourcesAffordance } from "@/app/(protected)/conversations/message-sources-presentation";
+import { getMessageSources, type ConversationDetail, type MessageSourcesResult } from "@/lib/conversations";
+
+/**
+ * Grounding spot-check (SR-2) -- a Server Function bound with this
+ * conversation's `conversationId`/`tenantId` and passed down to the
+ * client-side `MessageSources` toggle so it can fetch a bot message's
+ * resolved sources on expand without exposing `lib/conversations.ts`
+ * (marked `import "server-only"`) to client bundling. Mirrors the
+ * `updatePostAction` inline-`"use server"` pattern.
+ */
+function bindFetchMessageSources(conversationId: string, tenantId: string | undefined) {
+  async function fetchMessageSources(messageId: string): Promise<MessageSourcesResult> {
+    "use server";
+    return getMessageSources(conversationId, messageId, tenantId);
+  }
+  return fetchMessageSources;
+}
 
 function MessageBubble({
   role,
@@ -28,12 +46,18 @@ function MessageBubble({
   intent,
   confidence,
   createdAt,
+  messageId,
+  sourceCount,
+  fetchSourcesAction,
 }: {
   role: string;
   content: string;
   intent: string | null;
   confidence: number | null;
   createdAt: string;
+  messageId: string;
+  sourceCount: number;
+  fetchSourcesAction: (messageId: string) => Promise<MessageSourcesResult>;
 }) {
   const isVisitor = role === "user" || role === "visitor";
   const isBot = role === "assistant" || role === "bot";
@@ -74,12 +98,29 @@ function MessageBubble({
           {intent ? `${intent} · ` : ""}confidence {confidence.toFixed(2)}
         </span>
       ) : null}
+      {shouldShowSourcesAffordance(role, sourceCount) ? (
+        <div className="ml-9">
+          <MessageSources
+            messageId={messageId}
+            sourceCount={sourceCount}
+            replyContent={content}
+            fetchSourcesAction={fetchSourcesAction}
+          />
+        </div>
+      ) : null}
     </div>
   );
 }
 
-export function TranscriptPane({ conversation }: { conversation: ConversationDetail }) {
+export function TranscriptPane({
+  conversation,
+  tenantId,
+}: {
+  conversation: ConversationDetail;
+  tenantId?: string;
+}) {
   const badge = statusBadgeStyle(conversation.status);
+  const fetchSourcesAction = bindFetchMessageSources(conversation.conversationId, tenantId);
 
   return (
     <div className="flex flex-1 flex-col bg-[#f7f7f3]">
@@ -122,6 +163,9 @@ export function TranscriptPane({ conversation }: { conversation: ConversationDet
               intent={message.intent}
               confidence={message.confidence}
               createdAt={message.createdAt}
+              messageId={message.messageId}
+              sourceCount={message.sourceCount}
+              fetchSourcesAction={fetchSourcesAction}
             />
           ))
         )}

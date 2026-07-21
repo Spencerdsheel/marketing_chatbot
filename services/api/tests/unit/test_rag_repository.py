@@ -17,9 +17,16 @@ import pytest
 from common.auth import AuthClaims, Role
 from common.errors import ValidationError
 
-from api.rag.repository import ChunkMatch, KeywordMatch, keyword_search, search_chunks
+from api.rag.repository import (
+    ChunkMatch,
+    KeywordMatch,
+    keyword_search,
+    resolve_chunks,
+    search_chunks,
+)
 
 _TENANT_ID = "tenant-abc"
+_OTHER_TENANT_ID = "tenant-xyz"
 
 
 def _claims(tenant_id: str | None = _TENANT_ID, role: Role = Role.CLIENT_ADMIN) -> AuthClaims:
@@ -168,3 +175,121 @@ async def test_keyword_search_empty_result_returns_empty_list() -> None:
     result = await keyword_search(db, claims, "nothing matches", top_k=5)
 
     assert result == []
+
+
+# -- resolve_chunks (SR-2) -------------------------------------------------------
+#
+# resolve_chunks(db, claims, chunk_ids) resolves a message's historical
+# `sources` chunk_ids to their LIVE knowledge_chunks.content, tenant-scoped
+# INSIDE the query (decision 4, the sprint's load-bearing guarantee) via
+# common.tenancy.tenant_filter -- never a post-fetch check.
+
+
+class _StubResolveDb:
+    """Captures the SQL + bound args passed to ``fetch`` for resolve_chunks."""
+
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self._rows = rows
+        self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+    async def fetch(self, query: str, *args: object) -> list[dict[str, object]]:
+        self.calls.append((query, args))
+        return self._rows
+
+
+async def test_resolve_chunks_binds_chunk_ids_array_and_tenant_filter() -> None:
+    """MANDATORY tenant scoping: the query's WHERE includes tenant_filter's
+    fragment (`AND tenant_id = $2`) and the caller's tenant_id is bound as a
+    param; chunk_ids are bound as the $1 array via `chunk_id = ANY($1::text[])`
+    -- never string-interpolated into the SQL text."""
+    db = _StubResolveDb([{"chunk_id": "c1", "content": "Real chunk text."}])
+    claims = _claims()
+
+    result = await resolve_chunks(db, claims, ["c1"])
+
+    assert result == {"c1": "Real chunk text."}
+    assert len(db.calls) == 1
+    sql, args = db.calls[0]
+    assert "chunk_id = ANY($1::text[])" in sql
+    assert "tenant_id = $2" in sql
+    assert args[0] == ["c1"]
+    assert args[1] == _TENANT_ID
+    # Never interpolated: no chunk_id literal appears inline in the SQL text.
+    assert "c1" not in sql
+
+
+async def test_resolve_chunks_cross_tenant_id_cannot_resolve() -> None:
+    """MANDATORY isolation: a chunk_id that (per a stub DB keyed on tenant)
+    only "exists" for tenant B is absent from the map when resolved with
+    tenant-A claims -- the tenant predicate excludes it at the SQL level, not
+    via a post-fetch filter. Asserts the bound tenant param is A's."""
+
+    class _TenantScopedStubDb:
+        """Simulates real DB behavior: only returns rows matching the bound
+        tenant_id param, mirroring what a real `tenant_id = $N` predicate
+        would enforce."""
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[object, ...]]] = []
+            # tenant B "owns" chunk "shared-id" with real content.
+            self._rows_by_tenant = {
+                _OTHER_TENANT_ID: [{"chunk_id": "shared-id", "content": "Tenant B's secret content."}],
+            }
+
+        async def fetch(self, query: str, *args: object) -> list[dict[str, object]]:
+            self.calls.append((query, args))
+            bound_tenant = args[1]
+            return self._rows_by_tenant.get(str(bound_tenant), [])
+
+    db = _TenantScopedStubDb()
+    claims_a = _claims(tenant_id=_TENANT_ID)
+
+    result = await resolve_chunks(db, claims_a, ["shared-id"])
+
+    assert result == {}
+    assert "shared-id" not in result
+    # The bound tenant param is tenant A's -- never B's, never omitted.
+    _, args = db.calls[0]
+    assert args[1] == _TENANT_ID
+
+
+async def test_resolve_chunks_global_caller_raises_and_issues_no_query() -> None:
+    """MANDATORY: PLATFORM_ADMIN (tenant_id=None) -> ValidationError
+    GLOBAL_CALLER_NOT_PERMITTED; no query issued."""
+    db = _StubResolveDb([])
+    claims = _claims(tenant_id=None, role=Role.PLATFORM_ADMIN)
+
+    with pytest.raises(ValidationError) as exc_info:
+        await resolve_chunks(db, claims, ["c1"])
+
+    assert exc_info.value.code == "GLOBAL_CALLER_NOT_PERMITTED"
+    assert db.calls == []
+
+
+async def test_resolve_chunks_empty_list_returns_empty_dict_no_query() -> None:
+    """chunk_ids=[] -> {} with no query issued (short-circuit)."""
+    db = _StubResolveDb([])
+    claims = _claims()
+
+    result = await resolve_chunks(db, claims, [])
+
+    assert result == {}
+    assert db.calls == []
+
+
+async def test_resolve_chunks_partial_resolution() -> None:
+    """Three chunk_ids requested, stub returns rows for only two -> the map
+    has exactly those two keys; the third is absent (drives the route's
+    content:null/resolved:false marker)."""
+    db = _StubResolveDb(
+        [
+            {"chunk_id": "c1", "content": "First chunk."},
+            {"chunk_id": "c2", "content": "Second chunk."},
+        ]
+    )
+    claims = _claims()
+
+    result = await resolve_chunks(db, claims, ["c1", "c2", "c3-deleted"])
+
+    assert result == {"c1": "First chunk.", "c2": "Second chunk."}
+    assert "c3-deleted" not in result

@@ -98,13 +98,25 @@
       needs the backend process stopped/started and the admission rate
       limit hammered on purpose, not just a normal chat flow).
 
+      SR-3 likewise adds no new data-* attributes / no new embed snippet —
+      the same <script> tag now OPT-IN persists a resume record
+      (sessionStorage["cw:resume:v1"] = {token, expiresAt, conversationId,
+      lastActive}, NEVER localStorage/a cookie) when — and only when — the
+      tenant behind this client key has `widget_session_resume` enabled
+      (see dev/README.md's SR-3 walkthrough section + precondition). A
+      reload/same-tab navigation then reuses the still-valid token and
+      continues the SAME conversation instead of minting a fresh session
+      and starting a new (fragmented) one — that is the fix this sprint
+      ships. A tenant with the flag off (the default) behaves exactly as
+      S14.1/S14.2 shipped — zero storage, zero behavior change.
+
       Replace the client key below with a real pk_... key before testing
       (see dev/README.md step 3).
     -->
     <script
       src="/src/entry.tsx"
       type="module"
-      data-client-key="pk_rDEpRNAAX2b9EWNRY2FFH25IHl01vd8i"
+      data-client-key="pk_zmDvHxyOJV9aUL7LVEQtbTEO5_OPfoDA"
       data-api-base="http://localhost:8000"
       data-debug="true"
     ></script>

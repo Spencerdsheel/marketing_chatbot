@@ -25,12 +25,28 @@
  * announces state *transitions* politely (not every retry tick); all
  * retry/reconnect timers are guarded by an `unmounted` ref so no fetch fires
  * after the panel/component is gone (the zombie-retry guard, decision 7).
+ *
+ * SR-3 adds (decisions 4/7/8, scope item 4): an optional `resumeConversationId`
+ * prop seeds `conversationIdRef` instead of always starting `null` (decision
+ * 4 -- the first turn after a resume carries the SAME conversation_id, so
+ * the thread continues server-side). After each successful turn,
+ * `touchResumeRecord` refreshes the stored record's `lastActive`/
+ * `conversationId` -- but ONLY when `session.ts#isResumeEnabled()` says the
+ * tenant opted in (no writes at all when off, decision 8). If the FIRST turn
+ * after a resume returns `CONVERSATION_NOT_FOUND` (the stored id was stale/
+ * foreign/rejected -- decision 7's isolation-safety path made visible), the
+ * widget clears the stored record, adopts the backend's freshly-created
+ * conversation_id from that same response, and continues with the real
+ * reply in a new thread -- no error bubble, no fabricated history. A
+ * `CONVERSATION_NOT_FOUND` with no resumed id in play keeps S14.2's honest
+ * error line unchanged (this is a NEW branch, not a replacement).
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { WidgetConfig } from "../config";
 import { sendTurn, type TurnResult } from "../turn";
-import { mintVisitorSession } from "../session";
+import { clearResumeRecord, touchResumeRecord } from "../resume";
+import { isResumeEnabled, mintVisitorSession } from "../session";
 import { withRetry } from "../retry";
 import * as tts from "../tts";
 import type { ChatMessage } from "./Bubble";
@@ -70,6 +86,10 @@ function ChatGlyph({ name }: { name: "chat" | "close" | "sound" | "muted" | "sen
 export interface ChatWidgetProps {
   config: WidgetConfig;
   expiresAt: string;
+  /** SR-3 decision 4: seeds the conversation thread from a resumed
+   * sessionStorage record's `conversationId`. `null` on a fresh boot (no
+   * resume in play) -- unchanged S14.2 behavior. */
+  resumeConversationId?: string | null;
 }
 
 let messageIdCounter = 0;
@@ -95,13 +115,21 @@ function getFocusableElements(panel: HTMLElement): HTMLElement[] {
   );
 }
 
-export function ChatWidget({ config, expiresAt }: ChatWidgetProps) {
+export function ChatWidget({ config, expiresAt, resumeConversationId = null }: ChatWidgetProps) {
   const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputValue, setInputValue] = useState("");
   const [pending, setPending] = useState(false);
-  // In-memory only (decision 4) — never persisted, gone on reload.
-  const conversationIdRef = useRef<string | null>(null);
+  // In-memory only (S14.2 decision 4) — never persisted here (SR-3's
+  // sessionStorage mirror, when opted in, lives in resume.ts, not this
+  // ref). Seeded from resumeConversationId when a resume is in play (SR-3
+  // decision 4), otherwise null exactly as before this sprint.
+  const conversationIdRef = useRef<string | null>(resumeConversationId);
+  // SR-3 decision 7: tracks whether the CURRENTLY in-flight/most-recent
+  // conversation_id came from a resume, so a CONVERSATION_NOT_FOUND on that
+  // specific turn can be distinguished from an ordinary mid-conversation
+  // 404 (which keeps S14.2's plain error line, a regression guard).
+  const resumedConversationInPlayRef = useRef<boolean>(resumeConversationId !== null);
 
   // S14.6: connection status + retry/reconnect state (decisions 1-7). All
   // in-memory (decision 7); nothing keyed by tenant_id.
@@ -236,6 +264,14 @@ export function ChatWidget({ config, expiresAt }: ChatWidgetProps) {
     return false;
   }, [config]);
 
+  // SR-3: a stable ref to the latest `runSend` closure, so the
+  // RESUME_REJECTED recovery branch inside `runSend` itself can call it
+  // again (a fresh conversation_id: null send) without a TDZ self-reference
+  // on the `const runSend = useCallback(...)` binding.
+  const runSendRef = useRef<(trimmed: string, conversationId: string | null) => Promise<void>>(
+    async () => {},
+  );
+
   const runSend = useCallback(
     async (trimmed: string, conversationId: string | null) => {
       setPending(true);
@@ -269,6 +305,23 @@ export function ChatWidget({ config, expiresAt }: ChatWidgetProps) {
         console.error(
           `${LOG_PREFIX} turn failed: ${errorCode} (status=${status ?? "n/a"}, correlation_id=${correlationId ?? "n/a"}, attempts=${attemptCount}): ${result.error.message}`,
         );
+
+        // SR-3 decision 7 case (c): CONVERSATION_NOT_FOUND on a turn that
+        // was carrying a RESUMED conversation_id (stale/foreign/rejected
+        // handle) -- clear the bad resume record and silently continue as a
+        // brand-new conversation from this same send (conversation_id:
+        // null), never surfacing an error bubble or fabricating history.
+        // An ordinary CONVERSATION_NOT_FOUND with no resume in play (should
+        // not happen mid-conversation in practice, but is not this branch's
+        // concern) falls through to the honest-failure path below unchanged
+        // (S14.2 regression guard).
+        if (errorCode === "CONVERSATION_NOT_FOUND" && resumedConversationInPlayRef.current) {
+          console.error(`${LOG_PREFIX} resume rejected (RESUME_REJECTED): stale/foreign conversation_id, starting a new conversation.`);
+          clearResumeRecord();
+          resumedConversationInPlayRef.current = false;
+          await runSendRef.current(trimmed, null);
+          return;
+        }
 
         // Bounded expired-session reconnect (decision 5) — only for an
         // actual auth failure, not every retryable transport error.
@@ -317,6 +370,18 @@ export function ChatWidget({ config, expiresAt }: ChatWidgetProps) {
 
       setConnectionState({ kind: "online" });
       conversationIdRef.current = result.turn.conversationId;
+      // From here on, whatever conversation_id is in play was NOT
+      // necessarily the originally-resumed one (it may be the fresh id from
+      // a RESUME_REJECTED recovery above) -- either way it's now a normal,
+      // server-confirmed thread; only a genuine future CONVERSATION_NOT_FOUND
+      // on a still-resumed id should hit the special path again, so this
+      // flag naturally reflects "was the id we just successfully used the
+      // resumed one" via the caller's own tracking, not re-derived here.
+      // SR-3 decision 8: only touch the persisted record when the tenant
+      // opted in -- a no-op (and no sessionStorage write at all) otherwise.
+      if (isResumeEnabled()) {
+        touchResumeRecord(result.turn.conversationId, new Date());
+      }
       setMessages((prev) => [
         ...prev,
         {
@@ -329,6 +394,10 @@ export function ChatWidget({ config, expiresAt }: ChatWidgetProps) {
     },
     [config, attemptSessionReconnect],
   );
+
+  useEffect(() => {
+    runSendRef.current = runSend;
+  }, [runSend]);
 
   const sendMessage = useCallback(async (message: string) => {
     const trimmed = message.trim();

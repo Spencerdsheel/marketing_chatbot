@@ -61,11 +61,23 @@ _CLIENT_KEY_DB: dict[str, dict[str, Any]] = {
     _hash_client_key("pk_disabled"): _TENANT_DISABLED_ROW,
 }
 
+# SR-3: tenant_bot_settings.business_hours JSON keyed by tenant_id -- the
+# migration-free home of the widget_session_resume opt-in flag (decision 8/9).
+# Populated per-test via `_StubDatabase(bot_settings=...)`.
+
 
 class _StubDatabase:
     """Database double for gateway queries (lookup by client_key_hash)."""
 
+    def __init__(self, *, bot_settings: dict[str, dict[str, Any]] | None = None) -> None:
+        # tenant_id -> tenant_bot_settings row (SR-3: only business_hours matters here).
+        self._bot_settings = bot_settings or {}
+
     async def fetchrow(self, query: str, *args: object) -> dict[str, Any] | None:
+        if "tenant_bot_settings" in query:
+            tenant_id = str(args[0]) if args else None
+            row = self._bot_settings.get(tenant_id) if tenant_id else None
+            return {"business_hours": row.get("business_hours")} if row is not None else None
         if args:
             # The raw client key must NEVER be the bound param -- only its hash.
             bound = str(args[0])
@@ -118,7 +130,7 @@ _TEST_SETTINGS_ENV = {
 }
 
 
-def _build_app() -> Any:
+def _build_app(*, bot_settings: dict[str, dict[str, Any]] | None = None) -> Any:
     """Create app with test doubles."""
     from common.settings import get_settings
 
@@ -131,7 +143,7 @@ def _build_app() -> Any:
         from api.app import create_app
         app = create_app()
 
-    app.state.db = _StubDatabase()
+    app.state.db = _StubDatabase(bot_settings=bot_settings)
     app.state.redis = _StubRedis()
     app.state.cache = InMemoryCache()
     app.state.rate_limiter = None
@@ -323,6 +335,76 @@ async def test_widget_whoami_tampered_token() -> None:
         )
     assert resp.status_code == 401
     assert resp.json()["error_code"] == "UNAUTHENTICATED"
+
+
+async def test_widget_session_valid_key_and_origin_default_tenant_resume_disabled() -> None:
+    """SR-3: a tenant with no tenant_bot_settings row -> resume_enabled=False,
+    the S14.1/S14.2 default-off posture (decision 8). No other field changes."""
+    app = _build_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/widget/session",
+            json={"client_key": _CLIENT_KEY_A},
+            headers={"Origin": "http://localhost:3000"},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["resume_enabled"] is False
+    assert set(body.keys()) == {"visitor_token", "expires_at", "resume_enabled"}
+
+
+async def test_widget_session_resume_enabled_tenant_echoes_true() -> None:
+    """SR-3: a tenant whose tenant_bot_settings.business_hours JSON carries
+    widget_session_resume=true -> resume_enabled=True in the admission
+    response (decision 8/9). mint_visitor_session is otherwise unchanged."""
+    app = _build_app(
+        bot_settings={_TENANT_A_ID: {"business_hours": {"widget_session_resume": True}}},
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/widget/session",
+            json={"client_key": _CLIENT_KEY_A},
+            headers={"Origin": "http://localhost:3000"},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["resume_enabled"] is True
+
+    from api.auth.tokens import decode_access_token
+    payload = decode_access_token(body["visitor_token"], secret=_TEST_JWT_SECRET)
+    assert payload["role"] == "VISITOR"
+    assert payload["tenant_id"] == _TENANT_A_ID
+
+
+async def test_widget_session_resume_flag_false_when_business_hours_missing_key() -> None:
+    """A tenant_bot_settings row exists but its business_hours JSON does not
+    carry widget_session_resume -> defaults False (never a KeyError, never a
+    silent true)."""
+    app = _build_app(
+        bot_settings={_TENANT_A_ID: {"business_hours": {"mon": [["09:00", "17:00"]]}}},
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/widget/session",
+            json={"client_key": _CLIENT_KEY_A},
+            headers={"Origin": "http://localhost:3000"},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["resume_enabled"] is False
+
+
+async def test_widget_session_resume_flag_false_when_business_hours_null() -> None:
+    """A tenant_bot_settings row with business_hours=NULL -> resume_enabled
+    defaults False, never raises."""
+    app = _build_app(bot_settings={_TENANT_A_ID: {"business_hours": None}})
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/widget/session",
+            json={"client_key": _CLIENT_KEY_A},
+            headers={"Origin": "http://localhost:3000"},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["resume_enabled"] is False
 
 
 async def test_widget_whoami_expired_token() -> None:

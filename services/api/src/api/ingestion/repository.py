@@ -378,6 +378,64 @@ async def replace_chunks(
         )
 
 
+async def delete_doc(
+    db: Database,
+    claims: AuthClaims,
+    doc_id: str,
+) -> tuple[int, int]:
+    """Hard-delete a doc's DB footprint, tenant-scoped.
+
+    Returns ``(chunks_deleted, runs_deleted)``.
+
+    Order (SR-4 decision — see Investigation in the sprint spec):
+      1. ``DELETE FROM knowledge_chunks WHERE tenant_id=$1 AND doc_id=$2``
+         -> chunks_deleted. Redundant with the migration-0011 FK
+         ``ON DELETE CASCADE``, but issued explicitly so the count is known
+         and the delete is self-contained/independent of FK config.
+      2. ``DELETE FROM ingestion_runs WHERE tenant_id=$1 AND doc_id=$2``
+         -> runs_deleted. NOT cascaded — ``ingestion_runs`` FKs to
+         ``tenants``, not ``knowledge_docs`` (migration 0010) — so this must
+         be explicit or the run rows orphan.
+      3. ``DELETE FROM knowledge_docs WHERE tenant_id=$1 AND doc_id=$2`` — the
+         authoritative row; a cascade would also drop chunks, already gone
+         from step 1.
+
+    Raises ``NotFoundError`` (``DOC_NOT_FOUND``) if step 3 removes 0 rows
+    (absent / cross-tenant / concurrent-delete race). Rejects global
+    (PLATFORM_ADMIN) callers via ``_reject_global``.
+
+    Every statement is ``WHERE tenant_id = $1 AND doc_id = $2`` — parameterized,
+    positional, asyncpg, no ORM, never ``doc_id`` alone.
+    """
+    _reject_global(claims)
+
+    params: list[Any] = [claims.tenant_id, doc_id]
+
+    chunks_result = await db.execute(
+        "DELETE FROM knowledge_chunks WHERE tenant_id = $1 AND doc_id = $2",
+        *params,
+    )
+    chunks_deleted = _parse_delete_count(chunks_result)
+
+    runs_result = await db.execute(
+        "DELETE FROM ingestion_runs WHERE tenant_id = $1 AND doc_id = $2",
+        *params,
+    )
+    runs_deleted = _parse_delete_count(runs_result)
+
+    docs_result = await db.execute(
+        "DELETE FROM knowledge_docs WHERE tenant_id = $1 AND doc_id = $2",
+        *params,
+    )
+    if _parse_delete_count(docs_result) == 0:
+        raise NotFoundError(
+            "Knowledge document not found.",
+            code="DOC_NOT_FOUND",
+        )
+
+    return chunks_deleted, runs_deleted
+
+
 async def get_latest_run(
     db: Database,
     claims: AuthClaims,
@@ -402,6 +460,22 @@ async def get_latest_run(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _parse_delete_count(result: str) -> int:
+    """Parse asyncpg's ``"DELETE <n>"`` command tag into ``<n>``.
+
+    Mirrors the ``"UPDATE <n>"`` parsing already used by ``update_doc_status``/
+    ``update_run``. Returns 0 if the tag is unrecognized (defensive; asyncpg
+    always returns this shape for a DELETE).
+    """
+    parts = result.split()
+    if len(parts) == 2 and parts[0].upper() == "DELETE":
+        try:
+            return int(parts[1])
+        except ValueError:
+            return 0
+    return 0
 
 
 def _row_to_doc(row: Any) -> KnowledgeDoc:
