@@ -54,6 +54,7 @@ class EventContact:
     timezone: str
     starts_at: datetime
     status: str
+    email: str | None = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,8 @@ class ScheduleEvent:
     event_id: str
     lead_id: str | None
     visitor_id: str | None
+    email: str | None
+    name: str | None
     starts_at: datetime
     ends_at: datetime
     timezone: str
@@ -70,6 +73,7 @@ class ScheduleEvent:
     calendar_ref: str | None
     consent: dict[str, Any]
     created_at: datetime
+    source: str = "native"
 
 
 def _reject_global(claims: AuthClaims) -> None:
@@ -158,6 +162,8 @@ async def create_event(
     visitor_id: str | None,
     lead_id: str | None,
     consent: dict[str, Any],
+    email: str | None = None,
+    name: str | None = None,
 ) -> ScheduleEvent:
     """Insert a new ``schedule_events`` row with ``status='booked'``.
 
@@ -174,19 +180,22 @@ async def create_event(
     try:
         await db.execute(
             "INSERT INTO schedule_events "
-            "(tenant_id, event_id, lead_id, visitor_id, starts_at, ends_at, "
-            " timezone, status, calendar_ref, consent) "
-            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            "(tenant_id, event_id, lead_id, visitor_id, email, name, starts_at, ends_at, "
+            " timezone, status, calendar_ref, consent, source) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
             claims.tenant_id,
             new_event_id,
             lead_id,
             visitor_id,
+            email,
+            name,
             starts_at,
             ends_at,
             timezone,
             "booked",
             None,  # calendar_ref (S8.2)
             consent,
+            "native",  # source (SR-6 decision 7) -- explicit, never implied
         )
     except asyncpg.UniqueViolationError as exc:
         raise ValidationError(
@@ -200,6 +209,8 @@ async def create_event(
         event_id=new_event_id,
         lead_id=lead_id,
         visitor_id=visitor_id,
+        email=email,
+        name=name,
         starts_at=starts_at,
         ends_at=ends_at,
         timezone=timezone,
@@ -207,6 +218,7 @@ async def create_event(
         calendar_ref=None,
         consent=consent,
         created_at=datetime.now(UTC),
+        source="native",
     )
 
 
@@ -261,7 +273,7 @@ async def get_event_contact(
     _reject_global(claims)
 
     row = await db.fetchrow(
-        "SELECT lead_id, visitor_id, timezone, starts_at, status "
+        "SELECT lead_id, visitor_id, email, timezone, starts_at, status "
         "FROM schedule_events WHERE tenant_id = $1 AND event_id = $2",
         claims.tenant_id,
         event_id,
@@ -274,6 +286,125 @@ async def get_event_contact(
         timezone=str(row["timezone"]),
         starts_at=row["starts_at"],
         status=str(row["status"]),
+        email=row["email"],
+    )
+
+
+async def get_upcoming_booking(
+    db: Database, claims: AuthClaims, visitor_id: str
+) -> ScheduleEvent | None:
+    """Return the caller visitor's soonest future booked event, if any.
+
+    Both tenant and visitor predicates are required: a visitor identifier is
+    not globally unique and must never be queried without the tenant boundary.
+    """
+    _reject_global(claims)
+    now = datetime.now(UTC)
+    row = await db.fetchrow(
+        "SELECT event_id, lead_id, visitor_id, email, name, starts_at, ends_at, "
+        "timezone, status, calendar_ref, consent, created_at FROM schedule_events "
+        "WHERE tenant_id = $1 AND visitor_id = $2 AND status = 'booked' "
+        "AND starts_at > $3 ORDER BY starts_at LIMIT 1",
+        claims.tenant_id,
+        visitor_id,
+        now,
+    )
+    if row is None:
+        return None
+    return ScheduleEvent(
+        event_id=str(row["event_id"]), lead_id=row["lead_id"], visitor_id=row["visitor_id"],
+        email=row["email"], name=row["name"], starts_at=row["starts_at"], ends_at=row["ends_at"],
+        timezone=str(row["timezone"]), status=str(row["status"]), calendar_ref=row["calendar_ref"],
+        consent=row["consent"], created_at=row["created_at"],
+    )
+
+
+async def ingest_calendly_event(
+    db: Database,
+    tenant_id: str,
+    *,
+    calendly_uuid: str,
+    starts_at: datetime,
+    ends_at: datetime,
+    timezone: str,
+    email: str | None,
+    name: str | None,
+    visitor_id: str | None,
+) -> ScheduleEvent:
+    """Idempotently UPSERT a Calendly ``invitee.created`` event (SR-6, Scope §8).
+
+    Claims-less (called ONLY from the signature-verified Calendly webhook,
+    which has no session) -- ``tenant_id`` comes from the webhook's already-
+    verified path parameter, never from the payload. ``calendar_ref`` is
+    ``f"calendly:{calendly_uuid}"`` (mirrors the existing
+    ``f"{provider}:{external_id}"`` text convention from ``book_slot``'s
+    native calendar sync) -- this is the DB-level idempotency key: the
+    partial unique index ``schedule_events_calendly_idempotent`` on
+    ``(tenant_id, calendar_ref) WHERE source = 'calendly'`` (migration 0034)
+    makes ``ON CONFLICT`` UPDATE the existing row on a re-delivered event
+    rather than double-inserting (SR-6 decision 6a) -- never an app-level
+    SELECT-then-INSERT race. ``visitor_id`` is the 5a email-correlation
+    result, or ``None`` on honest no-match (decision 5b) -- never fabricated.
+    ``consent`` records provenance only (decision 6b) -- we do not fabricate
+    our own consent object; Calendly's own flow captured it.
+    """
+    new_event_id = uuid4().hex
+    calendar_ref = f"calendly:{calendly_uuid}"
+    consent = {
+        "granted": True,
+        "purpose": "calendly_booking",
+        "text": "Consent captured by Calendly's own booking flow.",
+        "provenance": "calendly",
+    }
+
+    row = await db.fetchrow(
+        "INSERT INTO schedule_events "
+        "(tenant_id, event_id, lead_id, visitor_id, email, name, starts_at, ends_at, "
+        " timezone, status, calendar_ref, consent, source) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) "
+        "ON CONFLICT (tenant_id, calendar_ref) WHERE source = 'calendly' DO UPDATE SET "
+        "starts_at = EXCLUDED.starts_at, ends_at = EXCLUDED.ends_at, "
+        "timezone = EXCLUDED.timezone, email = EXCLUDED.email, name = EXCLUDED.name, "
+        "status = 'booked', visitor_id = COALESCE(schedule_events.visitor_id, EXCLUDED.visitor_id) "
+        "RETURNING event_id, lead_id, visitor_id, email, name, starts_at, ends_at, "
+        "timezone, status, calendar_ref, consent, created_at, source",
+        tenant_id,
+        new_event_id,
+        None,  # lead_id -- Calendly bookings never create a CRM lead (decision, "Isn't" list)
+        visitor_id,
+        email,
+        name,
+        starts_at,
+        ends_at,
+        timezone,
+        "booked",
+        calendar_ref,
+        consent,
+        "calendly",
+    )
+    assert row is not None  # noqa: S101  # INSERT ... ON CONFLICT ... RETURNING always returns a row
+
+    return ScheduleEvent(
+        event_id=str(row["event_id"]), lead_id=row["lead_id"], visitor_id=row["visitor_id"],
+        email=row["email"], name=row["name"], starts_at=row["starts_at"], ends_at=row["ends_at"],
+        timezone=str(row["timezone"]), status=str(row["status"]), calendar_ref=row["calendar_ref"],
+        consent=row["consent"], created_at=row["created_at"], source=str(row["source"]),
+    )
+
+
+async def cancel_calendly_event(db: Database, tenant_id: str, calendly_uuid: str) -> None:
+    """Idempotent ``status='cancelled'`` flip for a Calendly ``invitee.canceled`` event.
+
+    Claims-less (webhook-only, see ``ingest_calendly_event`` docstring).
+    Tenant-scoped by the already-verified path ``tenant_id``. A cancel for an
+    unknown/never-ingested Calendly UUID is a no-op success -- never an
+    error, never a fabricated row (SR-6 decision 6c).
+    """
+    await db.execute(
+        "UPDATE schedule_events SET status = 'cancelled' "
+        "WHERE tenant_id = $1 AND calendar_ref = $2 AND source = 'calendly'",
+        tenant_id,
+        f"calendly:{calendly_uuid}",
     )
 
 

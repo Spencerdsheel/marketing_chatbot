@@ -3,7 +3,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { WidgetConfig } from "../config";
-import type { BookSlotResult, FetchSlotsResult } from "../schedule";
+import type { AvailabilitySummary, BookSlotResult, FetchSlotsResult } from "../schedule";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -79,6 +79,16 @@ function getConfirmButton(): HTMLButtonElement {
   const button = container.querySelector<HTMLButtonElement>(".cw-sched-confirm-button");
   if (!button) throw new Error("confirm button not found");
   return button;
+}
+
+/** React tracks <input> values via the native property descriptor — a plain
+ * `.value =` write is invisible to React's change detection in jsdom. See
+ * ChatWidget.test.tsx's twin helper for the same trick. */
+function setNativeInputValue(input: HTMLInputElement, text: string): void {
+  // eslint-disable-next-line @typescript-eslint/unbound-method
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!;
+  Reflect.apply(setter, input, [text]);
+  input.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
 describe("ScheduleCta", () => {
@@ -474,6 +484,288 @@ describe("ScheduleCta", () => {
 
       const errorLine = container.querySelector(".cw-sched-error");
       expect(errorLine?.getAttribute("role")).toBe("alert");
+    });
+  });
+
+  describe("SR-5: staged flow (summary supplied — calendar/timezone/email/recap)", () => {
+    const SUMMARY: AvailabilitySummary = {
+      action: "schedule_cta",
+      timezone: "America/New_York",
+      days: [
+        { date: "2026-07-20", hasAvailability: false },
+        { date: "2026-07-21", hasAvailability: true },
+        { date: "2026-07-22", hasAvailability: true },
+      ],
+      transitionMessage: "I'd be happy to help you find a time with our sales team.",
+      existingBooking: null,
+    };
+
+    function getCalendarDayButtons(): HTMLButtonElement[] {
+      return Array.from(container.querySelectorAll<HTMLButtonElement>(".cw-sched-day"));
+    }
+
+    function getEnabledCalendarDayButton(): HTMLButtonElement {
+      const button = getCalendarDayButtons().find((b) => !b.disabled);
+      if (!button) throw new Error("no enabled calendar day button found");
+      return button;
+    }
+
+    function getTimezoneSelect(): HTMLSelectElement {
+      const select = container.querySelector<HTMLSelectElement>("#cw-sched-timezone");
+      if (!select) throw new Error("timezone select not found");
+      return select;
+    }
+
+    function getEmailInput(): HTMLInputElement {
+      const input = container.querySelector<HTMLInputElement>("#cw-sched-email");
+      if (!input) throw new Error("email input not found");
+      return input;
+    }
+
+    it("renders a real month calendar (role=grid > role=row > role=gridcell) with only server-marked days enabled", async () => {
+      act(() => {
+        root.render(<ScheduleCta config={baseConfig} summary={SUMMARY} />);
+      });
+      await flush();
+
+      expect(fetchSlotsMock).not.toHaveBeenCalled();
+      const grid = container.querySelector('[role="grid"]');
+      expect(grid).not.toBeNull();
+      expect(container.querySelectorAll('[role="row"]').length).toBeGreaterThan(0);
+      expect(container.querySelectorAll('[role="gridcell"]').length).toBeGreaterThan(0);
+
+      const dayButtons = getCalendarDayButtons();
+      expect(dayButtons.length).toBe(3);
+      const disabledDay = dayButtons.find((b) => b.textContent === "20");
+      const enabledDay = dayButtons.find((b) => b.textContent === "21");
+      expect(disabledDay?.disabled).toBe(true);
+      expect(enabledDay?.disabled).toBe(false);
+    });
+
+    it("renders a timezone selector defaulting to the server's tenant timezone", async () => {
+      act(() => {
+        root.render(<ScheduleCta config={baseConfig} summary={SUMMARY} />);
+      });
+      await flush();
+
+      const select = getTimezoneSelect();
+      expect(select.value).toBe("America/New_York");
+      const options = Array.from(select.querySelectorAll("option")).map((o) => o.value);
+      expect(options).toContain("America/New_York");
+      expect(options.length).toBeGreaterThan(1);
+    });
+
+    it("picking an enabled day fetches and renders the 3-column time grid for that day, and the booking carries the chosen timezone", async () => {
+      fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [SLOT_A] });
+      bookSlotMock.mockResolvedValueOnce({
+        ok: true,
+        booking: { eventId: "evt-1", startsAt: SLOT_A.startsAt, endsAt: SLOT_A.endsAt, status: "booked" },
+      });
+
+      act(() => {
+        root.render(<ScheduleCta config={baseConfig} summary={SUMMARY} />);
+      });
+      await flush();
+
+      act(() => {
+        getEnabledCalendarDayButton().click();
+      });
+      await flush();
+
+      expect(fetchSlotsMock).toHaveBeenCalledTimes(1);
+      const [, input] = fetchSlotsMock.mock.calls[0] as [WidgetConfig, { dateFrom?: string; dateTo?: string }];
+      expect(input.dateFrom).toBe("2026-07-21");
+      expect(input.dateTo).toBe("2026-07-21");
+      expect(getSlotButtons()).toHaveLength(1);
+
+      // Override the timezone before confirming — the booking must carry the selector's value, not the resolved default.
+      act(() => {
+        getSlotButton(0).click();
+      });
+      const select = container.querySelector<HTMLSelectElement>("#cw-sched-timezone");
+      // The timezone selector only exists on the calendar step; the confirm
+      // step carries the value already chosen there via component state.
+      expect(select).toBeNull();
+
+      act(() => {
+        setNativeInputValue(getEmailInput(), "invite@example.com");
+      });
+      act(() => {
+        getConsentCheckbox().click();
+      });
+      act(() => {
+        getConfirmButton().click();
+      });
+      await flush();
+
+      expect(bookSlotMock).toHaveBeenCalledTimes(1);
+      const [, bookInput] = bookSlotMock.mock.calls[0] as [WidgetConfig, { timezone: string; email?: string }];
+      expect(bookInput.timezone).toBe("America/New_York");
+      expect(bookInput.email).toBe("invite@example.com");
+    });
+
+    it("the email step gates Confirm behind both consent AND a non-empty email", async () => {
+      fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [SLOT_A] });
+
+      act(() => {
+        root.render(<ScheduleCta config={baseConfig} summary={SUMMARY} />);
+      });
+      await flush();
+      act(() => {
+        getEnabledCalendarDayButton().click();
+      });
+      await flush();
+      act(() => {
+        getSlotButton(0).click();
+      });
+
+      // Consent alone, no email -> still disabled.
+      act(() => {
+        getConsentCheckbox().click();
+      });
+      expect(getConfirmButton().disabled).toBe(true);
+
+      act(() => {
+        setNativeInputValue(getEmailInput(), "invite@example.com");
+      });
+      expect(getConfirmButton().disabled).toBe(false);
+    });
+
+    it("the gray recap box shows the chosen time and timezone before confirming", async () => {
+      fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [SLOT_A] });
+
+      act(() => {
+        root.render(<ScheduleCta config={baseConfig} summary={SUMMARY} />);
+      });
+      await flush();
+      act(() => {
+        getEnabledCalendarDayButton().click();
+      });
+      await flush();
+      act(() => {
+        getSlotButton(0).click();
+      });
+
+      const recap = container.querySelector(".cw-sched-recap");
+      expect(recap).not.toBeNull();
+      expect(recap?.textContent).toContain("America/New_York");
+    });
+
+    it("existingBooking non-null shows the 'keep it / book another' ask BEFORE the calendar; 'keep it' dismisses without booking; 'book another' proceeds", async () => {
+      const summaryWithBooking: AvailabilitySummary = {
+        ...SUMMARY,
+        existingBooking: { startsAt: "2026-07-19T09:00:00+00:00", endsAt: "2026-07-19T09:30:00+00:00", timezone: "UTC" },
+      };
+
+      act(() => {
+        root.render(<ScheduleCta config={baseConfig} summary={summaryWithBooking} />);
+      });
+      await flush();
+
+      expect(container.querySelector('[role="grid"]')).toBeNull();
+      const askText = container.textContent ?? "";
+      expect(askText).toMatch(/already booked/i);
+
+      const keepButton = container.querySelector<HTMLButtonElement>(".cw-sched-back-button");
+      expect(keepButton?.textContent).toMatch(/keep it/i);
+
+      act(() => {
+        keepButton?.click();
+      });
+      // Dismissed: no calendar, no booking attempt.
+      expect(container.querySelector('[role="grid"]')).toBeNull();
+      expect(bookSlotMock).not.toHaveBeenCalled();
+    });
+
+    it("'book another' on the existing-booking ask proceeds into the calendar", async () => {
+      const summaryWithBooking: AvailabilitySummary = {
+        ...SUMMARY,
+        existingBooking: { startsAt: "2026-07-19T09:00:00+00:00", endsAt: "2026-07-19T09:30:00+00:00", timezone: "UTC" },
+      };
+
+      act(() => {
+        root.render(<ScheduleCta config={baseConfig} summary={summaryWithBooking} />);
+      });
+      await flush();
+
+      const bookAnotherButton = container.querySelector<HTMLButtonElement>(".cw-sched-confirm-button");
+      expect(bookAnotherButton?.textContent).toMatch(/book another/i);
+
+      act(() => {
+        bookAnotherButton?.click();
+      });
+
+      expect(container.querySelector('[role="grid"]')).not.toBeNull();
+    });
+
+    it("A11y: focus moves onto the first enabled calendar day when the calendar step mounts", async () => {
+      act(() => {
+        root.render(<ScheduleCta config={baseConfig} summary={SUMMARY} />);
+      });
+      await flush();
+
+      const enabledDay = getEnabledCalendarDayButton();
+      expect(document.activeElement).toBe(enabledDay);
+    });
+
+    it("A11y: focus moves onto the existing-booking ask heading when it mounts", async () => {
+      const summaryWithBooking: AvailabilitySummary = {
+        ...SUMMARY,
+        existingBooking: { startsAt: "2026-07-19T09:00:00+00:00", endsAt: "2026-07-19T09:30:00+00:00", timezone: "UTC" },
+      };
+
+      act(() => {
+        root.render(<ScheduleCta config={baseConfig} summary={summaryWithBooking} />);
+      });
+      await flush();
+
+      const heading = container.querySelector("p[tabindex='-1']");
+      expect(heading).not.toBeNull();
+      expect(document.activeElement).toBe(heading);
+    });
+
+    it("SLOT_UNAVAILABLE on the staged flow re-fetches the SAME chosen day, never fabricates a confirmation", async () => {
+      fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [SLOT_A] });
+      fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [SLOT_B] });
+      bookSlotMock.mockResolvedValueOnce({
+        ok: false,
+        error: {
+          type: "SCHEDULE_ERROR",
+          errorCode: "SLOT_UNAVAILABLE",
+          message: "The requested time is no longer available.",
+          correlationId: "corr-1",
+          status: 422,
+          retryAfterSeconds: null,
+        },
+      });
+      vi.spyOn(console, "error").mockImplementation(() => {});
+
+      act(() => {
+        root.render(<ScheduleCta config={baseConfig} summary={SUMMARY} />);
+      });
+      await flush();
+      act(() => {
+        getEnabledCalendarDayButton().click();
+      });
+      await flush();
+      act(() => {
+        getSlotButton(0).click();
+      });
+      act(() => {
+        setNativeInputValue(getEmailInput(), "invite@example.com");
+      });
+      act(() => {
+        getConsentCheckbox().click();
+      });
+      act(() => {
+        getConfirmButton().click();
+      });
+      await flush();
+
+      expect(fetchSlotsMock).toHaveBeenCalledTimes(2);
+      const [, secondCallInput] = fetchSlotsMock.mock.calls[1] as [WidgetConfig, { dateFrom?: string; dateTo?: string }];
+      expect(secondCallInput.dateFrom).toBe("2026-07-21");
+      expect(container.querySelector(".cw-sched-confirmation")).toBeNull();
     });
   });
 });

@@ -70,6 +70,7 @@ class _StubDatabase:
         self._events: dict[tuple[str, str], dict[str, Any]] = {}
         self._calendar_configs: dict[str, dict[str, Any]] = {}
         self._reminder_jobs: dict[str, dict[str, Any]] = {}
+        self._handoff_intents: list[dict[str, Any]] = []
 
     def seed_availability(self, *, tenant_id: str, timezone: str = "UTC", rules: dict[str, Any] = _RULES) -> None:
         self._availability[tenant_id] = {
@@ -77,6 +78,16 @@ class _StubDatabase:
             "timezone": timezone,
             "rules": rules,
             "updated_at": datetime(2026, 1, 1, tzinfo=UTC),
+        }
+
+    def seed_calendly(
+        self, *, tenant_id: str, scheduling_url: str = "https://calendly.com/acme/intro",
+        enabled: bool = True,
+    ) -> None:
+        self._calendar_configs[tenant_id] = {
+            "provider": "calendly", "calendar_id": None,
+            "credentials_ciphertext": None, "busy": [],
+            "enabled": enabled, "scheduling_url": scheduling_url,
         }
 
     async def execute(self, query: str, *args: Any) -> str:
@@ -91,26 +102,35 @@ class _StubDatabase:
             return "INSERT 0 1"
 
         if q.startswith("INSERT INTO SCHEDULE_EVENTS"):
-            (tenant_id, event_id, lead_id, visitor_id, starts_at, ends_at,
-             timezone, status, calendar_ref, consent) = args
+            (tenant_id, event_id, lead_id, visitor_id, email, name, starts_at, ends_at,
+             timezone, status, calendar_ref, consent, source) = args
             for (t_id, _e_id), existing in self._events.items():
                 if t_id == tenant_id and existing["starts_at"] == starts_at and existing["status"] == "booked":
                     raise asyncpg.UniqueViolationError("duplicate key value violates unique constraint")
             self._events[(tenant_id, event_id)] = {
                 "tenant_id": tenant_id, "event_id": event_id, "lead_id": lead_id,
-                "visitor_id": visitor_id, "starts_at": starts_at, "ends_at": ends_at,
+                "visitor_id": visitor_id, "email": email, "name": name, "starts_at": starts_at, "ends_at": ends_at,
                 "timezone": timezone, "status": status, "calendar_ref": calendar_ref,
                 "consent": consent, "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+                "source": source,
             }
             return "INSERT 0 1"
 
         if q.startswith("INSERT INTO TENANT_CALENDAR_CONFIGS"):
-            tenant_id, provider, calendar_id, credentials_ciphertext, busy, enabled = args
+            (tenant_id, provider, calendar_id, credentials_ciphertext, busy, enabled,
+             scheduling_url) = args
             self._calendar_configs[tenant_id] = {
                 "provider": provider, "calendar_id": calendar_id,
                 "credentials_ciphertext": credentials_ciphertext, "busy": busy,
-                "enabled": enabled,
+                "enabled": enabled, "scheduling_url": scheduling_url,
             }
+            return "INSERT 0 1"
+
+        if q.startswith("INSERT INTO CALENDLY_HANDOFF_INTENTS"):
+            tenant_id, visitor_id, email, ttl_seconds = args
+            self._handoff_intents.append(
+                {"tenant_id": tenant_id, "visitor_id": visitor_id, "email": email}
+            )
             return "INSERT 0 1"
 
         if q.startswith("UPDATE SCHEDULE_EVENTS"):
@@ -160,6 +180,10 @@ class _StubDatabase:
         if "FROM TENANT_CALENDAR_CONFIGS" in q:
             tenant_id = args[0]
             return self._calendar_configs.get(tenant_id)
+        if "FROM SCHEDULE_EVENTS" in q and "VISITOR_ID = $2" in q:
+            tenant_id, visitor_id, now = args
+            rows = [row for row in self._events.values() if row["tenant_id"] == tenant_id and row["visitor_id"] == visitor_id and row["status"] == "booked" and row["starts_at"] > now]
+            return min(rows, key=lambda row: row["starts_at"]) if rows else None
         return None
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
@@ -916,3 +940,205 @@ async def test_post_book_repeat_dedupe_key_does_not_double_delay() -> None:
 
     assert response.status_code == 201
     mock_task.delay.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# SR-5: invite contact + booking awareness
+# ---------------------------------------------------------------------------
+
+
+async def test_post_book_stores_invite_email_and_name() -> None:
+    db = _StubDatabase()
+    db.seed_availability(tenant_id=_TENANT_ID)
+    app = _build_app(db)
+    body = _book_body()
+    body.update({"email": "invite@example.com", "name": "Visitor Name"})
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/public/schedule/book", json=body, headers={"Authorization": f"Bearer {_visitor_token()}"}
+        )
+
+    assert response.status_code == 201
+    stored = next(iter(db._events.values()))
+    assert stored["email"] == "invite@example.com"
+    assert stored["name"] == "Visitor Name"
+    assert "email" not in response.json()
+
+
+async def test_availability_summary_is_tenant_and_visitor_scoped() -> None:
+    db = _StubDatabase()
+    db.seed_availability(tenant_id=_TENANT_ID)
+    db.seed_availability(tenant_id=_OTHER_TENANT_ID)
+    app = _build_app(db)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        first = await client.post(
+            "/public/schedule/book", json=_book_body(),
+            headers={"Authorization": f"Bearer {_visitor_token(visitor_id='visitor-a')}"},
+        )
+        assert first.status_code == 201
+        own = await client.get(
+            "/public/schedule/availability-summary",
+            headers={"Authorization": f"Bearer {_visitor_token(visitor_id='visitor-a')}"},
+        )
+        other_visitor = await client.get(
+            "/public/schedule/availability-summary",
+            headers={"Authorization": f"Bearer {_visitor_token(visitor_id='visitor-b')}"},
+        )
+        other_tenant = await client.get(
+            "/public/schedule/availability-summary",
+            headers={"Authorization": f"Bearer {_visitor_token(tenant_id=_OTHER_TENANT_ID, visitor_id='visitor-a')}"},
+        )
+
+    assert own.status_code == 200
+    assert own.json()["action"] == "schedule_cta"
+    assert own.json()["existing_booking"] is not None
+    assert own.json()["days"]
+    assert other_visitor.json()["existing_booking"] is None
+    assert other_tenant.json()["existing_booking"] is None
+    assert "tenant_id" not in own.json()
+    assert "visitor_id" not in own.json()
+
+
+# ---------------------------------------------------------------------------
+# SR-6: calendly_handoff action + POST /public/schedule/handoff-intent
+# ---------------------------------------------------------------------------
+
+
+async def test_availability_summary_calendly_configured_returns_handoff_action() -> None:
+    db = _StubDatabase()
+    db.seed_calendly(tenant_id=_TENANT_ID)
+    app = _build_app(db)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            "/public/schedule/availability-summary",
+            headers={"Authorization": f"Bearer {_visitor_token()}"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["action"] == "calendly_handoff"
+    assert data["scheduling_url"] == "https://calendly.com/acme/intro"
+    assert data["days"] == []
+    assert "tenant_id" not in data
+    assert "visitor_id" not in data
+
+
+async def test_availability_summary_calendly_disabled_falls_through_to_native() -> None:
+    db = _StubDatabase()
+    db.seed_calendly(tenant_id=_TENANT_ID, enabled=False)
+    db.seed_availability(tenant_id=_TENANT_ID)
+    app = _build_app(db)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            "/public/schedule/availability-summary",
+            headers={"Authorization": f"Bearer {_visitor_token()}"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["action"] == "schedule_cta"
+
+
+async def test_availability_summary_calendly_no_scheduling_url_falls_through() -> None:
+    """A calendly provider row with no scheduling_url never short-circuits (defensive)."""
+    db = _StubDatabase()
+    db.seed_calendly(tenant_id=_TENANT_ID, scheduling_url="")
+    db.seed_availability(tenant_id=_TENANT_ID)
+    app = _build_app(db)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            "/public/schedule/availability-summary",
+            headers={"Authorization": f"Bearer {_visitor_token()}"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["action"] == "schedule_cta"
+
+
+async def test_availability_summary_native_tenant_unchanged_by_calendly_branch() -> None:
+    """A native (non-Calendly) tenant's schedule_cta/lead_form behavior is unchanged."""
+    db = _StubDatabase()
+    db.seed_availability(tenant_id=_TENANT_ID)
+    app = _build_app(db)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            "/public/schedule/availability-summary",
+            headers={"Authorization": f"Bearer {_visitor_token()}"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["action"] == "schedule_cta"
+    assert response.json()["scheduling_url"] is None
+
+
+async def test_post_handoff_intent_writes_intent_scoped_to_claims() -> None:
+    db = _StubDatabase()
+    app = _build_app(db)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        token = _visitor_token(tenant_id=_TENANT_ID, visitor_id="visitor-real")
+        response = await client.post(
+            "/public/schedule/handoff-intent",
+            json={"email": "invite@example.com"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"recorded": True}
+    assert len(db._handoff_intents) == 1
+    stored = db._handoff_intents[0]
+    assert stored["tenant_id"] == _TENANT_ID
+    assert stored["visitor_id"] == "visitor-real"
+    assert stored["email"] == "invite@example.com"
+
+
+async def test_post_handoff_intent_ignores_body_supplied_ids() -> None:
+    db = _StubDatabase()
+    app = _build_app(db)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        token = _visitor_token(tenant_id=_TENANT_ID, visitor_id="visitor-real")
+        response = await client.post(
+            "/public/schedule/handoff-intent",
+            json={"email": "invite@example.com", "visitor_id": "visitor-fake", "tenant_id": "tenant-fake"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert response.status_code == 200
+    stored = db._handoff_intents[0]
+    assert stored["visitor_id"] == "visitor-real"
+    assert stored["tenant_id"] == _TENANT_ID
+
+
+async def test_post_handoff_intent_no_bearer_returns_401() -> None:
+    db = _StubDatabase()
+    app = _build_app(db)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/public/schedule/handoff-intent", json={"email": "a@example.com"}
+        )
+
+    assert response.status_code == 401
+    assert db._handoff_intents == []
+
+
+async def test_post_handoff_intent_invalid_email_returns_422() -> None:
+    db = _StubDatabase()
+    app = _build_app(db)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        token = _visitor_token()
+        response = await client.post(
+            "/public/schedule/handoff-intent",
+            json={"email": "not-an-email"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert response.status_code == 422
+    assert db._handoff_intents == []

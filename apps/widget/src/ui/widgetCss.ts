@@ -86,7 +86,8 @@ button { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
 .cw-mute-toggle:focus-visible, .cw-close-button:focus-visible, .cw-send-button:focus-visible,
 .cw-lead-input:focus-visible, .cw-lead-checkbox:focus-visible, .cw-lead-submit:focus-visible,
 .cw-sched-slot:focus-visible, .cw-sched-checkbox:focus-visible, .cw-sched-confirm-button:focus-visible,
-.cw-sched-back-button:focus-visible, .cw-sched-retry:focus-visible, .cw-status-retry:focus-visible {
+.cw-sched-back-button:focus-visible, .cw-sched-retry:focus-visible, .cw-status-retry:focus-visible,
+.cw-sched-handoff-link-button:focus-visible, .cw-sched-handoff-continue-button:focus-visible {
   outline: 2px solid var(--cw-ink);
   outline-offset: 2px;
 }
@@ -349,6 +350,54 @@ button { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
 }
 .cw-sched-back-button:hover:not(:disabled) { background: var(--cw-cool-paper); }
 .cw-sched-back-button:disabled { color: var(--cw-dim); cursor: not-allowed; }
+.cw-connect-sales-button { width: calc(100% - 28px); margin: 8px 14px 0; min-height: 40px; border: 1px solid var(--cw-ink); border-radius: 10px; background: var(--cw-citron); color: var(--cw-ink); font: inherit; font-size: 13px; font-weight: 700; cursor: pointer; }
+.cw-connect-sales-button:disabled { opacity: .55; cursor: not-allowed; }
+.cw-sched-month-nav { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.cw-sched-month-nav .cw-sched-back-button { padding: 4px 10px; }
+.cw-sched-month-label { font-size: 12px; font-weight: 700; color: var(--cw-ink); }
+.cw-sched-weekday-row { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+.cw-sched-weekday { text-align: center; font-size: 10px; font-weight: 700; color: var(--cw-dim); text-transform: uppercase; }
+.cw-sched-calendar { display: flex; flex-direction: column; gap: 4px; }
+
+/* Calendly hosted handoff (SR-6 decision 1) — the compact pre-handoff email
+   step + the link-out button. Reuses existing tokens/consent-note styling;
+   the link-out button is a REAL focusable <button> (never an anchor with a
+   fake target) with an accessible "opens in a new tab" label. */
+.cw-sched-handoff { color: var(--cw-ink); font-size: 12px; display: flex; flex-direction: column; gap: 8px; }
+.cw-sched-handoff-consent-note { color: #5a5b54; font-size: 11px; line-height: 1.45; margin: 0; }
+.cw-sched-handoff-continue-button, .cw-sched-handoff-link-button {
+  min-height: 44px;
+  align-self: stretch;
+  text-align: center;
+  padding: 10px 15px;
+  border: 1px solid var(--cw-ink);
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 160ms ease;
+}
+.cw-sched-handoff-continue-button {
+  border: none;
+  background: var(--cw-ink);
+  color: var(--cw-citron);
+}
+.cw-sched-handoff-continue-button:hover:not(:disabled) { background: #30312c; }
+.cw-sched-handoff-continue-button:disabled { background: var(--cw-line); color: var(--cw-dim); cursor: not-allowed; }
+.cw-sched-handoff-link-button {
+  background: var(--cw-citron);
+  color: var(--cw-ink);
+}
+.cw-sched-handoff-link-button:hover { background: var(--cw-citron-soft); }
+.cw-sched-week-row { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+.cw-sched-week-row [role="gridcell"] { display: flex; }
+.cw-sched-day-blank { flex: 1; }
+.cw-sched-day { flex: 1; padding: 6px 0; min-width: 0; }
+.cw-sched-calendar .cw-sched-slot:disabled { color: var(--cw-dim); background: var(--cw-cool-paper); cursor: not-allowed; }
+.cw-sched-tz-label { color: #5a5b54; font-size: 11px; font-weight: 600; }
+.cw-sched-tz-select { width: 100%; }
+.cw-sched-recap { display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; border-radius: 8px; background: var(--cw-cool-paper); font-size: 12px; }
+.cw-sched-recap-label { color: var(--cw-dim); font-weight: 600; margin-right: 4px; }
 
 @media (prefers-reduced-motion: no-preference) {
   .cw-typing-dot { animation: cw-typing-bounce 1.2s infinite ease-in-out; }

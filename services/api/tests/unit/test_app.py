@@ -542,3 +542,17 @@ async def test_admin_message_sources_tenant_scoped_route_registered() -> None:
         "/admin/tenants/{tenant_id}/conversations/{conversation_id}/messages/{message_id}/sources"
         in route_paths
     )
+
+
+async def test_calendly_webhook_route_registered() -> None:
+    """POST /public/calendly/webhook/{tenant_id} route exists (SR-6)."""
+    app = _build_app()
+    methods_by_path = _route_methods_by_path(app)
+    assert "POST" in methods_by_path.get("/public/calendly/webhook/{tenant_id}", set())
+
+
+async def test_handoff_intent_route_registered() -> None:
+    """POST /public/schedule/handoff-intent route exists (SR-6)."""
+    app = _build_app()
+    methods_by_path = _route_methods_by_path(app)
+    assert "POST" in methods_by_path.get("/public/schedule/handoff-intent", set())

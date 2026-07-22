@@ -35,6 +35,7 @@ def _contact(**overrides: object) -> EventContact:
         "timezone": "UTC",
         "starts_at": _NOW,
         "status": "booked",
+        "email": None,
     }
     fields.update(overrides)
     return EventContact(**fields)  # type: ignore[arg-type]
@@ -115,6 +116,62 @@ async def test_returns_none_when_event_contact_missing() -> None:
         result = await resolve_event_recipient(object(), _claims(), "event-missing")
 
     assert result is None
+
+
+# ==============================================================================
+# SR-5: event's own invite email is preferred over lead_id/visitor_id fallback
+# ==============================================================================
+
+
+async def test_prefers_event_email_over_lead_id() -> None:
+    """The invite email typed in-flow (SR-5) wins even when a lead_id is also set."""
+    contact = _contact(lead_id="lead-1", visitor_id="visitor-1", email="invite@example.com")
+    lead = AsyncMock()
+    lead.email = "lead@example.com"
+
+    with (
+        patch("api.notifications.recipients.get_event_contact", AsyncMock(return_value=contact)),
+        patch("api.notifications.recipients.get_lead", AsyncMock(return_value=lead)) as mock_get_lead,
+        patch(
+            "api.notifications.recipients.get_lead_email_by_visitor_id", AsyncMock()
+        ) as mock_by_visitor,
+    ):
+        result = await resolve_event_recipient(object(), _claims(), "event-1")
+
+    assert result == "invite@example.com"
+    mock_get_lead.assert_not_called()
+    mock_by_visitor.assert_not_called()
+
+
+async def test_prefers_event_email_over_visitor_fallback() -> None:
+    contact = _contact(lead_id=None, visitor_id="visitor-1", email="invite@example.com")
+
+    with (
+        patch("api.notifications.recipients.get_event_contact", AsyncMock(return_value=contact)),
+        patch(
+            "api.notifications.recipients.get_lead_email_by_visitor_id", AsyncMock(return_value="visitor@example.com")
+        ) as mock_by_visitor,
+    ):
+        result = await resolve_event_recipient(object(), _claims(), "event-1")
+
+    assert result == "invite@example.com"
+    mock_by_visitor.assert_not_called()
+
+
+async def test_falls_back_to_lead_id_when_event_email_is_null() -> None:
+    """Unchanged behavior when the event has no invite email (null, not set)."""
+    contact = _contact(lead_id="lead-1", visitor_id=None, email=None)
+    lead = AsyncMock()
+    lead.email = "lead@example.com"
+
+    with (
+        patch("api.notifications.recipients.get_event_contact", AsyncMock(return_value=contact)),
+        patch("api.notifications.recipients.get_lead", AsyncMock(return_value=lead)) as mock_get_lead,
+    ):
+        result = await resolve_event_recipient(object(), _claims(), "event-1")
+
+    assert result == "lead@example.com"
+    mock_get_lead.assert_awaited_once()
 
 
 # ==============================================================================

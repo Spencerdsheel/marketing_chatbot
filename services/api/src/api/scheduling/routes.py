@@ -31,18 +31,22 @@ from api.notifications.tasks import send_notification
 from api.notifications.templates import booking_confirmation_message
 from api.scheduling.calendar import CalendarEvent, calendar_provider_for
 from api.scheduling.calendar_config_repository import get_calendar_config
+from api.scheduling.handoff_intent_repository import create_handoff_intent
 from api.scheduling.reminder_repository import create_reminder_jobs
 from api.scheduling.repository import (
     Availability,
     create_event,
     delete_event,
     get_availability,
+    get_upcoming_booking,
     list_booked,
     update_event_calendar_ref,
 )
 from api.scheduling.slots import Slot, compute_slots
 
 _log = get_logger(__name__)
+
+_SCHEDULE_TRANSITION_MESSAGE = "I'd be happy to help you find a time with our sales team."
 
 router = APIRouter(prefix="/public/schedule", tags=["scheduling"])
 
@@ -69,6 +73,8 @@ class BookRequest(BaseModel):
     timezone: str
     consent: ConsentPayload | None = None
     lead_id: str | None = None
+    email: str | None = None
+    name: str | None = None
 
     @field_validator("starts_at")
     @classmethod
@@ -86,6 +92,13 @@ class BookRequest(BaseModel):
             raise ValueError(f"invalid IANA timezone: {v}") from exc
         return v
 
+    @field_validator("email")
+    @classmethod
+    def _validate_email(cls, v: str | None) -> str | None:
+        if v is not None and ("@" not in v or v.startswith("@") or v.endswith("@")):
+            raise ValueError("invalid email address")
+        return v
+
 
 class BookResponse(BaseModel):
     """Leak-free (no tenant_id/visitor_id) response for POST /public/schedule/book."""
@@ -94,6 +107,47 @@ class BookResponse(BaseModel):
     starts_at: datetime
     ends_at: datetime
     status: str
+
+
+class AvailabilityDayResponse(BaseModel):
+    date: date
+    has_availability: bool
+
+
+class ExistingBookingResponse(BaseModel):
+    starts_at: datetime
+    ends_at: datetime
+    timezone: str
+
+
+class AvailabilitySummaryResponse(BaseModel):
+    action: str
+    timezone: str
+    days: list[AvailabilityDayResponse]
+    transition_message: str
+    existing_booking: ExistingBookingResponse | None
+    # SR-6: the tenant's Calendly hosted-scheduling page, present only when
+    # action="calendly_handoff". Leak-free (no tenant_id/visitor_id).
+    scheduling_url: str | None = None
+
+
+class HandoffIntentRequest(BaseModel):
+    """Body for POST /public/schedule/handoff-intent (SR-6)."""
+
+    email: str
+
+    @field_validator("email")
+    @classmethod
+    def _validate_email(cls, v: str) -> str:
+        if "@" not in v or v.startswith("@") or v.endswith("@"):
+            raise ValueError("invalid email address")
+        return v
+
+
+class HandoffIntentResponse(BaseModel):
+    """Leak-free (no tenant_id/visitor_id) response for POST /public/schedule/handoff-intent."""
+
+    recorded: bool
 
 
 def _resolve_window(
@@ -222,6 +276,70 @@ async def get_slots(
     return [SlotResponse(starts_at=s.starts_at, ends_at=s.ends_at) for s in slots]
 
 
+@router.get("/availability-summary")
+async def get_availability_summary(
+    request: Request,
+    claims: AuthClaims = Depends(get_visitor_claims),  # noqa: B008
+) -> AvailabilitySummaryResponse:
+    """Server-authoritative entry decision and bookable-day map for the widget."""
+    db = request.app.state.db
+    settings = get_api_settings()
+
+    # SR-6 decision 3: Calendly is detected here, BEFORE any native
+    # availability computation or provider construction -- it never
+    # participates in calendar_provider_for/free_busy/create_event. A
+    # Calendly-configured, enabled tenant with a scheduling_url short-
+    # circuits straight to the hosted-handoff action.
+    calendar_config = await get_calendar_config(db, claims)
+    upcoming = await get_upcoming_booking(db, claims, claims.subject)
+    existing = (
+        ExistingBookingResponse(
+            starts_at=upcoming.starts_at, ends_at=upcoming.ends_at, timezone=upcoming.timezone
+        )
+        if upcoming is not None else None
+    )
+    if (
+        calendar_config is not None
+        and calendar_config.provider == "calendly"
+        and calendar_config.enabled
+        and calendar_config.scheduling_url
+    ):
+        return AvailabilitySummaryResponse(
+            action="calendly_handoff", timezone="UTC", days=[],
+            transition_message=_SCHEDULE_TRANSITION_MESSAGE, existing_booking=existing,
+            scheduling_url=calendar_config.scheduling_url,
+        )
+
+    availability = await get_availability(db, claims)
+    if availability is None:
+        return AvailabilitySummaryResponse(
+            action="lead_form", timezone="UTC", days=[],
+            transition_message=_SCHEDULE_TRANSITION_MESSAGE, existing_booking=existing,
+        )
+
+    start, end = _resolve_window(settings, None, None)
+    zone = ZoneInfo(availability.timezone)
+    window_start, _ = _day_bounds_utc(start, zone)
+    _, window_end = _day_bounds_utc(end, zone)
+    extra_busy = await _calendar_busy_for_window(db, claims, window_start, window_end, settings)
+    slots = await _open_slots_for_window(
+        db, claims, availability, start, end,
+        window_max_days=settings.schedule_slot_window_max_days, extra_busy=extra_busy,
+    )
+    available_dates = {slot.starts_at.astimezone(zone).date() for slot in slots}
+    days = [
+        AvailabilityDayResponse(
+            date=start + timedelta(days=offset),
+            has_availability=(start + timedelta(days=offset)) in available_dates,
+        )
+        for offset in range((end - start).days + 1)
+    ]
+    return AvailabilitySummaryResponse(
+        action="schedule_cta", timezone=availability.timezone, days=days,
+        transition_message=_SCHEDULE_TRANSITION_MESSAGE, existing_booking=existing,
+    )
+
+
 @router.post("/book", status_code=201)
 async def book_slot(
     body: BookRequest,
@@ -281,6 +399,8 @@ async def book_slot(
         timezone=body.timezone,
         visitor_id=claims.subject,
         lead_id=body.lead_id,
+        email=str(body.email) if body.email is not None else None,
+        name=body.name,
         consent=consent_with_timestamp,
     )
 
@@ -392,3 +512,31 @@ async def book_slot(
         ends_at=event.ends_at,
         status=event.status,
     )
+
+
+@router.post("/handoff-intent", status_code=200)
+async def post_handoff_intent(
+    body: HandoffIntentRequest,
+    request: Request,
+    claims: AuthClaims = Depends(get_visitor_claims),  # noqa: B008
+) -> HandoffIntentResponse:
+    """Record the pre-Calendly-handoff email correlation intent (SR-6 decision 5a).
+
+    Called by the widget right before the Calendly link-out, so the later
+    webhook can backfill ``visitor_id`` onto the ingested booking by
+    matching this email. ``visitor_id`` is ALWAYS ``claims.subject`` (the
+    visitor session), never a body-supplied id. Leak-free 200 (no
+    tenant_id/visitor_id echoed).
+    """
+    db = request.app.state.db
+    settings = get_api_settings()
+
+    await create_handoff_intent(
+        db,
+        claims,
+        visitor_id=claims.subject,
+        email=body.email,
+        ttl_seconds=settings.calendly_handoff_intent_ttl_seconds,
+    )
+
+    return HandoffIntentResponse(recorded=True)

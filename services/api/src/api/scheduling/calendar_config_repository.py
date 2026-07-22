@@ -28,6 +28,7 @@ class CalendarConfig:
     credentials: str  # DECRYPTED
     busy: list[dict[str, Any]]
     enabled: bool
+    scheduling_url: str | None = None
 
 
 def _reject_global(claims: AuthClaims) -> None:
@@ -53,13 +54,40 @@ async def get_calendar_config(db: Database, claims: AuthClaims) -> CalendarConfi
     _reject_global(claims)
 
     row = await db.fetchrow(
-        "SELECT provider, calendar_id, credentials_ciphertext, busy, enabled "
+        "SELECT provider, calendar_id, credentials_ciphertext, busy, enabled, scheduling_url "
         "FROM tenant_calendar_configs WHERE tenant_id = $1",
         claims.tenant_id,
     )
     if row is None:
         return None
 
+    return _row_to_calendar_config(row)
+
+
+async def get_calendar_config_by_tenant_id(db: Database, tenant_id: str) -> CalendarConfig | None:
+    """Fetch a tenant's calendar config by RAW tenant id -- NO ``AuthClaims``.
+
+    Used ONLY by the Calendly webhook receiver (``api.scheduling.calendly_webhook``),
+    which has no session/claims at all (SR-6 decision 4a): the signature IS
+    the auth, and the path ``{tenant_id}`` is used solely to load that
+    tenant's decrypted signing secret to VERIFY the signature -- it is never
+    trusted as authentication on its own. Every other caller in this module
+    MUST go through the ``AuthClaims``-scoped ``get_calendar_config`` above;
+    this function exists to serve the one legitimate claims-less caller
+    without weakening the tenant-scoping convention elsewhere.
+    """
+    row = await db.fetchrow(
+        "SELECT provider, calendar_id, credentials_ciphertext, busy, enabled, scheduling_url "
+        "FROM tenant_calendar_configs WHERE tenant_id = $1",
+        tenant_id,
+    )
+    if row is None:
+        return None
+
+    return _row_to_calendar_config(row)
+
+
+def _row_to_calendar_config(row: Any) -> CalendarConfig:
     credentials = ""
     ciphertext = row["credentials_ciphertext"]
     if ciphertext:
@@ -74,6 +102,9 @@ async def get_calendar_config(db: Database, claims: AuthClaims) -> CalendarConfi
         credentials=credentials,
         busy=list(busy),
         enabled=bool(row["enabled"]),
+        scheduling_url=(
+            str(row["scheduling_url"]) if row["scheduling_url"] is not None else None
+        ),
     )
 
 
@@ -86,8 +117,13 @@ async def upsert_calendar_config(
     credentials: str,
     busy: list[dict[str, Any]],
     enabled: bool,
+    scheduling_url: str | None = None,
 ) -> None:
     """Insert or update the caller's tenant calendar config, encrypting credentials.
+
+    ``scheduling_url`` (SR-6) is NOT a secret -- stored plaintext, unlike
+    ``credentials``. Only meaningful for ``provider="calendly"``; the caller
+    passes ``None`` for other providers.
 
     Raises ``ValidationError`` for global callers.
     """
@@ -98,15 +134,16 @@ async def upsert_calendar_config(
 
     await db.execute(
         "INSERT INTO tenant_calendar_configs "
-        "(tenant_id, provider, calendar_id, credentials_ciphertext, busy, enabled) "
-        "VALUES ($1, $2, $3, $4, $5, $6) "
+        "(tenant_id, provider, calendar_id, credentials_ciphertext, busy, enabled, scheduling_url) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7) "
         "ON CONFLICT (tenant_id) DO UPDATE SET "
         "provider = $2, calendar_id = $3, credentials_ciphertext = $4, busy = $5, "
-        "enabled = $6, updated_at = now()",
+        "enabled = $6, scheduling_url = $7, updated_at = now()",
         claims.tenant_id,
         provider,
         calendar_id,
         ciphertext,
         busy,
         enabled,
+        scheduling_url,
     )

@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { WidgetConfig } from "../config";
 import type { TurnResult } from "../turn";
-import type { FetchSlotsResult } from "../schedule";
+import type { FetchSlotsResult, FetchAvailabilitySummaryResult, PostHandoffIntentResult } from "../schedule";
 import type { AdmissionResult } from "../session";
 
 // React 19's `act()` only batches/flushes updates when this flag is set —
@@ -15,6 +15,8 @@ import type { AdmissionResult } from "../session";
 
 const sendTurnMock = vi.fn<(config: WidgetConfig, input: unknown) => Promise<TurnResult>>();
 const fetchSlotsMock = vi.fn<(config: WidgetConfig, input: unknown) => Promise<FetchSlotsResult>>();
+const fetchAvailabilitySummaryMock = vi.fn<(config: WidgetConfig) => Promise<FetchAvailabilitySummaryResult>>();
+const postHandoffIntentMock = vi.fn<(config: WidgetConfig, input: { email: string }) => Promise<PostHandoffIntentResult>>();
 const mintVisitorSessionMock = vi.fn<(config: WidgetConfig) => Promise<AdmissionResult>>();
 const speakGreetingMock = vi.fn<() => void>();
 const ttsCancelMock = vi.fn<() => void>();
@@ -63,6 +65,8 @@ vi.mock("../schedule", async () => {
   return {
     ...actual,
     fetchSlots: (config: WidgetConfig, input: unknown) => fetchSlotsMock(config, input),
+    fetchAvailabilitySummary: (config: WidgetConfig) => fetchAvailabilitySummaryMock(config),
+    postHandoffIntent: (config: WidgetConfig, input: { email: string }) => postHandoffIntentMock(config, input),
   };
 });
 
@@ -92,6 +96,9 @@ beforeEach(() => {
   sendTurnMock.mockReset();
   fetchSlotsMock.mockReset();
   fetchSlotsMock.mockResolvedValue({ ok: true, slots: [] });
+  fetchAvailabilitySummaryMock.mockReset();
+  postHandoffIntentMock.mockReset();
+  postHandoffIntentMock.mockResolvedValue({ ok: true, recorded: true });
   mintVisitorSessionMock.mockReset();
   speakGreetingMock.mockReset();
   ttsCancelMock.mockReset();
@@ -1081,6 +1088,407 @@ describe("ChatWidget", () => {
       expect(errorLine).not.toBeNull();
       expect(errorLine?.textContent).toMatch(/something went wrong/i);
       expect(container.querySelectorAll(".cw-bubble-row-bot .cw-bubble-bot").length).toBe(0);
+    });
+  });
+
+  describe("SR-5: persistent 'Connect with a sales rep' CTA", () => {
+    function getConnectButton(): HTMLButtonElement {
+      const button = container.querySelector<HTMLButtonElement>(".cw-connect-sales-button");
+      if (!button) throw new Error("connect-sales button not found");
+      return button;
+    }
+
+    it("the persistent CTA is visible above the input before any conversation", () => {
+      act(() => {
+        root.render(<ChatWidget config={baseConfig} expiresAt="2026-07-16T12:30:00Z" />);
+      });
+      openPanel();
+
+      expect(container.querySelector(".cw-connect-sales-button")).not.toBeNull();
+      expect(container.querySelectorAll(".cw-bubble-row").length).toBe(0);
+    });
+
+    it("clicking the CTA calls fetchAvailabilitySummary (NOT sendTurn) and renders a user bubble + the fixed transition bot bubble + the in-thread staged picker", async () => {
+      fetchAvailabilitySummaryMock.mockResolvedValueOnce({
+        ok: true,
+        summary: {
+          action: "schedule_cta",
+          timezone: "UTC",
+          days: [{ date: "2026-07-22", hasAvailability: true }],
+          transitionMessage: "I'd be happy to help you find a time with our sales team.",
+          existingBooking: null,
+        },
+      });
+      fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [] });
+
+      act(() => {
+        root.render(<ChatWidget config={baseConfig} expiresAt="2026-07-16T12:30:00Z" />);
+      });
+      openPanel();
+
+      act(() => {
+        getConnectButton().click();
+      });
+      await flush();
+
+      expect(fetchAvailabilitySummaryMock).toHaveBeenCalledTimes(1);
+      expect(sendTurnMock).not.toHaveBeenCalled();
+
+      expect(container.querySelector(".cw-bubble-row-user")?.textContent).toBe("Connect with a sales rep");
+      const botBubbles = container.querySelectorAll(".cw-bubble-row-bot .cw-bubble-bot");
+      expect(botBubbles.length).toBe(1);
+      expect(botBubbles[0]?.textContent).toContain("I'd be happy to help you find a time with our sales team.");
+      // The staged picker (calendar) renders IN the bot bubble, inside the message thread.
+      expect(container.querySelector(".cw-bubble-row-bot .cw-sched-calendar")).not.toBeNull();
+    });
+
+    it("action=lead_form renders the fixed transition bubble + the lead form, not the picker", async () => {
+      fetchAvailabilitySummaryMock.mockResolvedValueOnce({
+        ok: true,
+        summary: {
+          action: "lead_form",
+          timezone: "UTC",
+          days: [],
+          transitionMessage: "I'd be happy to help you find a time with our sales team.",
+          existingBooking: null,
+        },
+      });
+
+      act(() => {
+        root.render(<ChatWidget config={baseConfig} expiresAt="2026-07-16T12:30:00Z" />);
+      });
+      openPanel();
+
+      act(() => {
+        getConnectButton().click();
+      });
+      await flush();
+
+      expect(container.querySelector("form.cw-lead-form")).not.toBeNull();
+      expect(container.querySelector(".cw-sched-calendar")).toBeNull();
+    });
+
+    it("existingBooking non-null shows the keep-vs-book-another ask before the picker", async () => {
+      fetchAvailabilitySummaryMock.mockResolvedValueOnce({
+        ok: true,
+        summary: {
+          action: "schedule_cta",
+          timezone: "UTC",
+          days: [{ date: "2026-07-22", hasAvailability: true }],
+          transitionMessage: "I'd be happy to help you find a time with our sales team.",
+          existingBooking: { startsAt: "2026-07-22T09:00:00+00:00", endsAt: "2026-07-22T09:30:00+00:00", timezone: "UTC" },
+        },
+      });
+
+      act(() => {
+        root.render(<ChatWidget config={baseConfig} expiresAt="2026-07-16T12:30:00Z" />);
+      });
+      openPanel();
+
+      act(() => {
+        getConnectButton().click();
+      });
+      await flush();
+
+      expect(container.querySelector(".cw-sched-calendar")).toBeNull();
+      const askText = container.querySelector(".cw-bubble-row-bot .cw-sched")?.textContent ?? "";
+      expect(askText).toMatch(/already booked/i);
+      expect(askText).toMatch(/keep it/i);
+    });
+
+    it("a fetchAvailabilitySummary failure shows an honest error with manual retry, never a fabricated picker", async () => {
+      fetchAvailabilitySummaryMock.mockResolvedValueOnce({
+        ok: false,
+        error: {
+          type: "SCHEDULE_ERROR",
+          errorCode: "NETWORK_ERROR",
+          message: "Network request failed.",
+          correlationId: null,
+          status: null,
+          retryAfterSeconds: null,
+        },
+      });
+      const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      act(() => {
+        root.render(<ChatWidget config={baseConfig} expiresAt="2026-07-16T12:30:00Z" />);
+      });
+      openPanel();
+
+      act(() => {
+        getConnectButton().click();
+      });
+      await flush();
+
+      expect(container.querySelector(".cw-sched-calendar")).toBeNull();
+      expect(container.querySelectorAll(".cw-bubble-row-bot .cw-bubble-bot").length).toBe(0);
+      const errorLine = container.querySelector(".cw-sched-error");
+      expect(errorLine).not.toBeNull();
+      expect(errorLine?.querySelector(".cw-sched-retry")).not.toBeNull();
+      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining("NETWORK_ERROR"));
+    });
+
+    it("a 401 on the CTA click triggers the bounded session-reconnect + retry (mirrors runSend's decision 5), succeeding on a valid re-mint", async () => {
+      fetchAvailabilitySummaryMock.mockResolvedValueOnce({
+        ok: false,
+        error: {
+          type: "SCHEDULE_ERROR",
+          errorCode: "AUTHENTICATION_ERROR",
+          message: "Token has expired.",
+          correlationId: "corr-401",
+          status: 401,
+          retryAfterSeconds: null,
+        },
+      });
+      mintVisitorSessionMock.mockResolvedValueOnce({
+        ok: true,
+        session: { visitorToken: "jwt.fresh", expiresAt: "2026-07-16T13:00:00Z" },
+      });
+      fetchAvailabilitySummaryMock.mockResolvedValueOnce({
+        ok: true,
+        summary: {
+          action: "schedule_cta",
+          timezone: "UTC",
+          days: [{ date: "2026-07-22", hasAvailability: true }],
+          transitionMessage: "I'd be happy to help you find a time with our sales team.",
+          existingBooking: null,
+        },
+      });
+      fetchSlotsMock.mockResolvedValueOnce({ ok: true, slots: [] });
+      vi.spyOn(console, "error").mockImplementation(() => {});
+
+      act(() => {
+        root.render(<ChatWidget config={baseConfig} expiresAt="2026-07-16T12:30:00Z" />);
+      });
+      openPanel();
+
+      act(() => {
+        getConnectButton().click();
+      });
+      await flush();
+      await flush();
+
+      expect(mintVisitorSessionMock).toHaveBeenCalledTimes(1);
+      expect(fetchAvailabilitySummaryMock).toHaveBeenCalledTimes(2);
+      const botBubbles = container.querySelectorAll(".cw-bubble-row-bot .cw-bubble-bot");
+      expect(botBubbles.length).toBe(1);
+      expect(botBubbles[0]?.textContent).toContain("I'd be happy to help you find a time with our sales team.");
+      expect(container.querySelector(".cw-sched-error")).toBeNull();
+    });
+
+    it("a 401 on the CTA click that fails to reconnect shows an honest error, never a fabricated picker", async () => {
+      fetchAvailabilitySummaryMock.mockResolvedValueOnce({
+        ok: false,
+        error: {
+          type: "SCHEDULE_ERROR",
+          errorCode: "AUTHENTICATION_ERROR",
+          message: "Token has expired.",
+          correlationId: "corr-401",
+          status: 401,
+          retryAfterSeconds: null,
+        },
+      });
+      mintVisitorSessionMock.mockResolvedValue({
+        ok: false,
+        error: {
+          type: "ADMISSION_ERROR",
+          errorCode: "NETWORK_ERROR",
+          message: "Network request failed.",
+          correlationId: null,
+          status: null,
+          retryAfterSeconds: null,
+        },
+      });
+      vi.spyOn(console, "error").mockImplementation(() => {});
+
+      act(() => {
+        root.render(<ChatWidget config={baseConfig} expiresAt="2026-07-16T12:30:00Z" />);
+      });
+      openPanel();
+
+      act(() => {
+        getConnectButton().click();
+      });
+      await flush();
+      await flush();
+
+      expect(mintVisitorSessionMock.mock.calls.length).toBeGreaterThan(0);
+      expect(container.querySelectorAll(".cw-bubble-row-bot .cw-bubble-bot").length).toBe(0);
+      expect(container.querySelector(".cw-sched-error")).not.toBeNull();
+    });
+
+    // SR-6: Calendly hosted-handoff flow.
+    describe("action=calendly_handoff (SR-6)", () => {
+      const calendlySummary = {
+        action: "calendly_handoff" as const,
+        timezone: "UTC",
+        days: [],
+        transitionMessage: "I'd be happy to help you find a time with our sales team.",
+        existingBooking: null,
+        schedulingUrl: "https://calendly.com/acme/intro",
+      };
+
+      it("renders the fixed transition message + the email step, NOT the native ScheduleCta picker", async () => {
+        fetchAvailabilitySummaryMock.mockResolvedValueOnce({ ok: true, summary: calendlySummary });
+
+        act(() => {
+          root.render(<ChatWidget config={baseConfig} expiresAt="2026-07-16T12:30:00Z" />);
+        });
+        openPanel();
+        act(() => {
+          getConnectButton().click();
+        });
+        await flush();
+
+        const botBubbles = container.querySelectorAll(".cw-bubble-row-bot .cw-bubble-bot");
+        expect(botBubbles.length).toBe(1);
+        expect(botBubbles[0]?.textContent).toContain("I'd be happy to help you find a time with our sales team.");
+        expect(container.querySelector(".cw-sched-calendar")).toBeNull();
+        expect(container.querySelector("#cw-sched-handoff-email")).not.toBeNull();
+      });
+
+      it("submitting the email calls postHandoffIntent, then reveals the link-out button", async () => {
+        fetchAvailabilitySummaryMock.mockResolvedValueOnce({ ok: true, summary: calendlySummary });
+
+        act(() => {
+          root.render(<ChatWidget config={baseConfig} expiresAt="2026-07-16T12:30:00Z" />);
+        });
+        openPanel();
+        act(() => {
+          getConnectButton().click();
+        });
+        await flush();
+
+        const emailInput = container.querySelector<HTMLInputElement>("#cw-sched-handoff-email");
+        if (!emailInput) throw new Error("email input not found");
+        act(() => {
+          setNativeInputValue(emailInput, "visitor@example.com");
+          emailInput.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+
+        const continueButton = container.querySelector<HTMLButtonElement>(".cw-sched-handoff-continue-button");
+        if (!continueButton) throw new Error("continue button not found");
+        act(() => {
+          continueButton.click();
+        });
+        await flush();
+
+        expect(postHandoffIntentMock).toHaveBeenCalledTimes(1);
+        expect(postHandoffIntentMock).toHaveBeenCalledWith(baseConfig, { email: "visitor@example.com" });
+
+        const linkButton = container.querySelector<HTMLButtonElement>(".cw-sched-handoff-link-button");
+        expect(linkButton).not.toBeNull();
+      });
+
+      it("clicking the link-out button calls window.open(schedulingUrl, '_blank', 'noopener,noreferrer') and never injects a script/iframe", async () => {
+        fetchAvailabilitySummaryMock.mockResolvedValueOnce({ ok: true, summary: calendlySummary });
+        const windowOpenSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+
+        act(() => {
+          root.render(<ChatWidget config={baseConfig} expiresAt="2026-07-16T12:30:00Z" />);
+        });
+        openPanel();
+        act(() => {
+          getConnectButton().click();
+        });
+        await flush();
+
+        const emailInput = container.querySelector<HTMLInputElement>("#cw-sched-handoff-email");
+        if (!emailInput) throw new Error("email input not found");
+        act(() => {
+          setNativeInputValue(emailInput, "visitor@example.com");
+          emailInput.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        act(() => {
+          container.querySelector<HTMLButtonElement>(".cw-sched-handoff-continue-button")?.click();
+        });
+        await flush();
+
+        const linkButton = container.querySelector<HTMLButtonElement>(".cw-sched-handoff-link-button");
+        if (!linkButton) throw new Error("link-out button not found");
+        act(() => {
+          linkButton.click();
+        });
+
+        expect(windowOpenSpy).toHaveBeenCalledTimes(1);
+        expect(windowOpenSpy).toHaveBeenCalledWith(
+          "https://calendly.com/acme/intro",
+          "_blank",
+          "noopener,noreferrer",
+        );
+        expect(container.querySelector("script[src*='calendly']")).toBeNull();
+        expect(container.querySelector("iframe")).toBeNull();
+      });
+
+      it("a postHandoffIntent failure shows an honest error + retry and does NOT reveal the link-out button", async () => {
+        fetchAvailabilitySummaryMock.mockResolvedValueOnce({ ok: true, summary: calendlySummary });
+        postHandoffIntentMock.mockResolvedValueOnce({
+          ok: false,
+          error: {
+            type: "SCHEDULE_ERROR",
+            errorCode: "NETWORK_ERROR",
+            message: "Network request failed.",
+            correlationId: null,
+            status: null,
+            retryAfterSeconds: null,
+          },
+        });
+        const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        const windowOpenSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+
+        act(() => {
+          root.render(<ChatWidget config={baseConfig} expiresAt="2026-07-16T12:30:00Z" />);
+        });
+        openPanel();
+        act(() => {
+          getConnectButton().click();
+        });
+        await flush();
+
+        const emailInput = container.querySelector<HTMLInputElement>("#cw-sched-handoff-email");
+        if (!emailInput) throw new Error("email input not found");
+        act(() => {
+          setNativeInputValue(emailInput, "visitor@example.com");
+          emailInput.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        act(() => {
+          container.querySelector<HTMLButtonElement>(".cw-sched-handoff-continue-button")?.click();
+        });
+        await flush();
+
+        expect(container.querySelector(".cw-sched-handoff-link-button")).toBeNull();
+        expect(container.querySelector(".cw-sched-error")).not.toBeNull();
+        expect(windowOpenSpy).not.toHaveBeenCalled();
+        expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining("NETWORK_ERROR"));
+      });
+
+      it("the link-out button is a focusable <button> with an accessible 'opens in a new tab' label", async () => {
+        fetchAvailabilitySummaryMock.mockResolvedValueOnce({ ok: true, summary: calendlySummary });
+
+        act(() => {
+          root.render(<ChatWidget config={baseConfig} expiresAt="2026-07-16T12:30:00Z" />);
+        });
+        openPanel();
+        act(() => {
+          getConnectButton().click();
+        });
+        await flush();
+
+        const emailInput = container.querySelector<HTMLInputElement>("#cw-sched-handoff-email");
+        if (!emailInput) throw new Error("email input not found");
+        act(() => {
+          setNativeInputValue(emailInput, "visitor@example.com");
+          emailInput.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        act(() => {
+          container.querySelector<HTMLButtonElement>(".cw-sched-handoff-continue-button")?.click();
+        });
+        await flush();
+
+        const linkButton = container.querySelector<HTMLButtonElement>(".cw-sched-handoff-link-button");
+        expect(linkButton?.tagName).toBe("BUTTON");
+        expect(linkButton?.getAttribute("aria-label")?.toLowerCase()).toContain("new tab");
+      });
     });
   });
 });

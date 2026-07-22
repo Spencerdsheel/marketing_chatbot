@@ -5,18 +5,34 @@
  * renders the real consent-gated `<LeadForm>` (S14.3); `action="schedule_cta"`
  * renders the real consent-gated `<ScheduleCta>` (S14.4). `ActionStub` has
  * no live callers after S14.4 and has been removed.
+ *
+ * SR-5 decision 5: when the persistent "Connect with a sales rep" CTA
+ * (not an orchestrator turn) triggers the flow, the bot bubble carries the
+ * server-authoritative `scheduleSummary` alongside `action`, so the SAME
+ * in-thread `<ScheduleCta>` renders the staged calendar/grid/timezone/
+ * email picker (decision 1) rather than a separate panel element outside
+ * the message list.
  */
 import { Markdown } from "./Markdown";
 import { LeadForm } from "./LeadForm";
 import { ScheduleCta } from "./ScheduleCta";
+import { CalendlyHandoff } from "./CalendlyHandoff";
 import type { WidgetConfig } from "../config";
+import type { AvailabilitySummary } from "../schedule";
 
 export interface ChatMessage {
   id: string;
   role: "user" | "bot" | "system-error";
   text: string;
-  /** Only ever set on a bot message (decision 5). */
-  action?: "lead_form" | "schedule_cta" | null;
+  /** Only ever set on a bot message (decision 5). SR-6 adds
+   * "calendly_handoff" -- a Calendly-configured tenant's hosted-handoff
+   * flow, rendered by <CalendlyHandoff> instead of the native <ScheduleCta>
+   * picker (SR-6 decision 1). */
+  action?: "lead_form" | "schedule_cta" | "calendly_handoff" | null;
+  /** Only ever set on a bot message carrying action="schedule_cta"/
+   * "calendly_handoff" that originated from the persistent CTA (SR-5
+   * decision 5), never from an orchestrator turn. */
+  scheduleSummary?: AvailabilitySummary;
 }
 
 export function Bubble({ message, config }: { message: ChatMessage; config: WidgetConfig }) {
@@ -34,7 +50,12 @@ export function Bubble({ message, config }: { message: ChatMessage; config: Widg
       <div className={`cw-bubble ${isUser ? "cw-bubble-user" : "cw-bubble-bot"}`}>
         {isUser ? message.text : <Markdown text={message.text} />}
         {!isUser && message.action === "lead_form" ? <LeadForm config={config} /> : null}
-        {!isUser && message.action === "schedule_cta" ? <ScheduleCta config={config} /> : null}
+        {!isUser && message.action === "schedule_cta" ? (
+          <ScheduleCta config={config} {...(message.scheduleSummary ? { summary: message.scheduleSummary } : {})} />
+        ) : null}
+        {!isUser && message.action === "calendly_handoff" && message.scheduleSummary ? (
+          <CalendlyHandoff config={config} summary={message.scheduleSummary} />
+        ) : null}
       </div>
     </div>
   );

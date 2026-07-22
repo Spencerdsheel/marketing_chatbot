@@ -52,6 +52,20 @@ const BookingResponseSchema = z.object({
   ends_at: z.string().min(1),
   status: z.string().min(1),
 });
+// SR-6: action enum gains "calendly_handoff"; scheduling_url present only
+// for that action (optional -- absent/undefined for schedule_cta/lead_form).
+const AvailabilitySummarySchema = z.object({
+  action: z.enum(["schedule_cta", "lead_form", "calendly_handoff"]),
+  timezone: z.string().min(1),
+  days: z.array(z.object({ date: z.string().min(1), has_availability: z.boolean() })),
+  transition_message: z.string().min(1),
+  existing_booking: z.object({ starts_at: z.string(), ends_at: z.string(), timezone: z.string() }).nullable(),
+  scheduling_url: z.string().url().nullable().optional(),
+});
+
+const HandoffIntentResponseSchema = z.object({
+  recorded: z.boolean(),
+});
 
 export interface Slot {
   /** Raw UTC ISO-8601 string exactly as returned by the server — echo verbatim on booking. */
@@ -64,6 +78,16 @@ export interface Booking {
   startsAt: string;
   endsAt: string;
   status: string;
+}
+export interface AvailabilitySummary {
+  action: "schedule_cta" | "lead_form" | "calendly_handoff";
+  timezone: string;
+  days: Array<{ date: string; hasAvailability: boolean }>;
+  transitionMessage: string;
+  existingBooking: { startsAt: string; endsAt: string; timezone: string } | null;
+  /** Present only when action === "calendly_handoff" (SR-6) -- the tenant's
+   * hosted Calendly page, the window.open link-out target. */
+  schedulingUrl?: string;
 }
 
 /** The typed shape of the backend's central error envelope, mirroring TurnError/LeadError. */
@@ -86,6 +110,8 @@ export interface ScheduleError {
 
 export type FetchSlotsResult = { ok: true; slots: Slot[] } | { ok: false; error: ScheduleError };
 export type BookSlotResult = { ok: true; booking: Booking } | { ok: false; error: ScheduleError };
+export type FetchAvailabilitySummaryResult = { ok: true; summary: AvailabilitySummary } | { ok: false; error: ScheduleError };
+export type PostHandoffIntentResult = { ok: true; recorded: true } | { ok: false; error: ScheduleError };
 
 export interface FetchSlotsInput {
   /** Optional ISO date (YYYY-MM-DD) window bounds; omitted -> server default window. */
@@ -107,6 +133,8 @@ export interface BookSlotInput {
   consent: BookSlotConsent;
   /** Optional linkage to a lead captured earlier in this in-memory page session (decision 6). */
   leadId?: string;
+  email?: string;
+  name?: string;
 }
 
 interface BackendErrorEnvelope {
@@ -236,6 +264,104 @@ export async function fetchSlots(config: WidgetConfig, input: FetchSlotsInput = 
   };
 }
 
+/** Fetch the server-authoritative scheduling entry decision and day map. */
+export async function fetchAvailabilitySummary(config: WidgetConfig): Promise<FetchAvailabilitySummaryResult> {
+  const auth = authHeader();
+  if (!auth) return { ok: false, error: noSessionError("fetch scheduling availability") };
+  let response: Response;
+  try {
+    response = await fetch(`${config.apiBase}/public/schedule/availability-summary`, { method: "GET", headers: { ...auth }, credentials: "omit" });
+  } catch (err) {
+    return { ok: false, error: networkError(err) };
+  }
+  let body: unknown;
+  try { body = await response.json(); } catch { body = null; }
+  if (!response.ok) {
+    const { errorCode, message, correlationId } = parseErrorEnvelope(body, "Failed to fetch scheduling availability.");
+    return { ok: false, error: { type: "SCHEDULE_ERROR", errorCode: response.status === 429 ? "RATE_LIMITED" : errorCode, message, correlationId, status: response.status, retryAfterSeconds: parseRetryAfterSeconds(response) } };
+  }
+  const parsed = AvailabilitySummarySchema.safeParse(body);
+  if (!parsed.success) return { ok: false, error: { type: "SCHEDULE_ERROR", errorCode: "INVALID_RESPONSE_SHAPE", message: "Scheduling availability response failed validation.", correlationId: null, status: response.status, retryAfterSeconds: null } };
+  const value = parsed.data;
+  return { ok: true, summary: {
+    action: value.action, timezone: value.timezone,
+    days: value.days.map((day) => ({ date: day.date, hasAvailability: day.has_availability })),
+    transitionMessage: value.transition_message,
+    existingBooking: value.existing_booking ? { startsAt: value.existing_booking.starts_at, endsAt: value.existing_booking.ends_at, timezone: value.existing_booking.timezone } : null,
+    ...(value.scheduling_url ? { schedulingUrl: value.scheduling_url } : {}),
+  } };
+}
+
+/**
+ * Perform the single pre-Calendly-handoff email-correlation write:
+ * `POST {apiBase}/public/schedule/handoff-intent` with `{ email }` -- Bearer
+ * auth, `credentials:'omit'`, never a `tenant_id`/`visitor_id` (established
+ * server-side from the session, SR-6 decision 5a). Never throws; every
+ * failure path returns a typed ScheduleError. The widget MUST call this
+ * (and get `ok: true`) before revealing the Calendly link-out button --
+ * never open the link without recording the intent (SR-6 scope item 12).
+ */
+export async function postHandoffIntent(
+  config: WidgetConfig,
+  input: { email: string },
+): Promise<PostHandoffIntentResult> {
+  const auth = authHeader();
+  if (!auth) {
+    return { ok: false, error: noSessionError("record the handoff intent") };
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${config.apiBase}/public/schedule/handoff-intent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...auth },
+      credentials: "omit",
+      body: JSON.stringify({ email: input.email }),
+    });
+  } catch (err) {
+    return { ok: false, error: networkError(err) };
+  }
+
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    body = null;
+  }
+
+  if (!response.ok) {
+    const { errorCode, message, correlationId } = parseErrorEnvelope(body, "Failed to record handoff intent.");
+    return {
+      ok: false,
+      error: {
+        type: "SCHEDULE_ERROR",
+        errorCode: response.status === 429 ? "RATE_LIMITED" : errorCode,
+        message,
+        correlationId,
+        status: response.status,
+        retryAfterSeconds: parseRetryAfterSeconds(response),
+      },
+    };
+  }
+
+  const parsed = HandoffIntentResponseSchema.safeParse(body);
+  if (!parsed.success || !parsed.data.recorded) {
+    return {
+      ok: false,
+      error: {
+        type: "SCHEDULE_ERROR",
+        errorCode: "INVALID_RESPONSE_SHAPE",
+        message: "Handoff intent response failed validation.",
+        correlationId: null,
+        status: response.status,
+        retryAfterSeconds: null,
+      },
+    };
+  }
+
+  return { ok: true, recorded: true };
+}
+
 /**
  * Perform the single booking attempt:
  * `POST {apiBase}/public/schedule/book` with
@@ -265,6 +391,8 @@ export async function bookSlot(config: WidgetConfig, input: BookSlotInput): Prom
         timezone: input.timezone,
         consent: input.consent,
         ...(input.leadId ? { lead_id: input.leadId } : {}),
+        ...(input.email ? { email: input.email } : {}),
+        ...(input.name ? { name: input.name } : {}),
       }),
     });
   } catch (err) {

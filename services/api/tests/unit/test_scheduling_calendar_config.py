@@ -171,6 +171,7 @@ async def test_get_calendar_config_decrypts_and_filters_by_tenant() -> None:
         "credentials_ciphertext": box.encrypt(_PLACEHOLDER_TOKEN),
         "busy": [{"start": "2026-07-15T14:00:00Z", "end": "2026-07-15T14:30:00Z"}],
         "enabled": True,
+        "scheduling_url": None,
     }
     db = _RecordingDatabase(rows=[row])
     claims = _claims("tenant-a", Role.CLIENT_ADMIN)
@@ -294,6 +295,116 @@ async def test_route_tenant_scoped_carries_tenant_id() -> None:
         )
 
     assert db.last_params[0] == _TENANT_ID
+
+
+# ==============================================================================
+# SR-6: scheduling_url + claims-less webhook loader
+# ==============================================================================
+
+
+async def test_upsert_stores_scheduling_url() -> None:
+    db = _RecordingDatabase()
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    await upsert_calendar_config(
+        db, claims, provider="calendly", calendar_id=None,
+        credentials=_PLACEHOLDER_TOKEN, busy=[], enabled=True,
+        scheduling_url="https://calendly.com/acme/intro",
+    )
+
+    assert db.last_params[6] == "https://calendly.com/acme/intro"
+    assert "scheduling_url" in db.last_sql.lower()
+
+
+async def test_get_calendar_config_round_trips_scheduling_url() -> None:
+    box = SecretBox(get_api_settings().secret_encryption_key)
+    row = {
+        "provider": "calendly",
+        "calendar_id": None,
+        "credentials_ciphertext": box.encrypt(_PLACEHOLDER_TOKEN),
+        "busy": [],
+        "enabled": True,
+        "scheduling_url": "https://calendly.com/acme/intro",
+    }
+    db = _RecordingDatabase(rows=[row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    config = await get_calendar_config(db, claims)
+
+    assert config is not None
+    assert config.scheduling_url == "https://calendly.com/acme/intro"
+
+
+async def test_get_calendar_config_scheduling_url_none_when_unset() -> None:
+    box = SecretBox(get_api_settings().secret_encryption_key)
+    row = {
+        "provider": "stub",
+        "calendar_id": "dev",
+        "credentials_ciphertext": box.encrypt(_PLACEHOLDER_TOKEN),
+        "busy": [],
+        "enabled": True,
+        "scheduling_url": None,
+    }
+    db = _RecordingDatabase(rows=[row])
+    claims = _claims("tenant-a", Role.CLIENT_ADMIN)
+
+    config = await get_calendar_config(db, claims)
+
+    assert config is not None
+    assert config.scheduling_url is None
+
+
+async def test_get_calendar_config_by_tenant_id_no_claims_required() -> None:
+    """The webhook's claims-less loader decrypts + scopes by raw tenant_id."""
+    from api.scheduling.calendar_config_repository import get_calendar_config_by_tenant_id
+
+    box = SecretBox(get_api_settings().secret_encryption_key)
+    row = {
+        "provider": "calendly",
+        "calendar_id": None,
+        "credentials_ciphertext": box.encrypt(_PLACEHOLDER_TOKEN),
+        "busy": [],
+        "enabled": True,
+        "scheduling_url": "https://calendly.com/acme/intro",
+    }
+    db = _RecordingDatabase(rows=[row])
+
+    config = await get_calendar_config_by_tenant_id(db, "tenant-a")
+
+    assert config is not None
+    assert config.provider == "calendly"
+    assert config.credentials == _PLACEHOLDER_TOKEN
+    assert db.last_params[0] == "tenant-a"
+
+
+async def test_get_calendar_config_by_tenant_id_none_when_no_row() -> None:
+    from api.scheduling.calendar_config_repository import get_calendar_config_by_tenant_id
+
+    db = _RecordingDatabase(rows=[])
+
+    config = await get_calendar_config_by_tenant_id(db, "tenant-a")
+
+    assert config is None
+
+
+async def test_route_scheduling_url_echoed_not_credentials() -> None:
+    db = _RecordingDatabase()
+    app = _build_app(db)
+    token = _mint_cookie(role=Role.CLIENT_ADMIN)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.put(
+            "/admin/schedule/calendar",
+            json=_config_body(
+                provider="calendly", scheduling_url="https://calendly.com/acme/intro"
+            ),
+            cookies={"access_token": token},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["scheduling_url"] == "https://calendly.com/acme/intro"
+    assert "credentials" not in body
 
 
 async def test_route_global_caller_rejected() -> None:

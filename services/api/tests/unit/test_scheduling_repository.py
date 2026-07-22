@@ -86,10 +86,10 @@ class _StubDatabase:
                 exc = self.raise_on_insert_event
                 self.raise_on_insert_event = None
                 raise exc
-            # args: tenant_id, event_id, lead_id, visitor_id, starts_at, ends_at,
-            #       timezone, status, calendar_ref, consent
-            (tenant_id, event_id, lead_id, visitor_id, starts_at, ends_at,
-             timezone, status, calendar_ref, consent) = args
+            # args: tenant_id, event_id, lead_id, visitor_id, email, name, starts_at,
+            #       ends_at, timezone, status, calendar_ref, consent, source
+            (tenant_id, event_id, lead_id, visitor_id, email, name, starts_at, ends_at,
+             timezone, status, calendar_ref, consent, source) = args
             key = (tenant_id, event_id)
             for (t_id, _e_id), existing in self._events.items():
                 if (
@@ -97,6 +97,8 @@ class _StubDatabase:
                     and existing["starts_at"] == starts_at
                     and existing["status"] == "booked"
                     and status == "booked"
+                    and source == "native"
+                    and existing.get("source", "native") == "native"
                 ):
                     raise asyncpg.UniqueViolationError("duplicate key value violates unique constraint")
             self._events[key] = {
@@ -104,6 +106,8 @@ class _StubDatabase:
                 "event_id": event_id,
                 "lead_id": lead_id,
                 "visitor_id": visitor_id,
+                "email": email,
+                "name": name,
                 "starts_at": starts_at,
                 "ends_at": ends_at,
                 "timezone": timezone,
@@ -111,8 +115,20 @@ class _StubDatabase:
                 "calendar_ref": calendar_ref,
                 "consent": consent,
                 "created_at": _NOW,
+                "source": source,
             }
             return "INSERT 0 1"
+
+        if q.startswith("UPDATE SCHEDULE_EVENTS SET STATUS = 'CANCELLED'"):
+            tenant_id, calendar_ref = args
+            for (t_id, _e_id), existing in self._events.items():
+                if (
+                    t_id == tenant_id
+                    and existing["calendar_ref"] == calendar_ref
+                    and existing.get("source") == "calendly"
+                ):
+                    existing["status"] = "cancelled"
+            return "UPDATE 1"
 
         return "OK"
 
@@ -120,11 +136,47 @@ class _StubDatabase:
         self.fetchrow_calls.append((query, args))
         q = query.strip().upper()
 
+        if q.startswith("INSERT INTO SCHEDULE_EVENTS"):
+            # ingest_calendly_event: INSERT ... ON CONFLICT ... DO UPDATE ... RETURNING
+            (tenant_id, event_id, lead_id, visitor_id, email, name, starts_at, ends_at,
+             timezone, status, calendar_ref, consent, source) = args
+            existing_key = next(
+                (
+                    key for key, row in self._events.items()
+                    if key[0] == tenant_id and row["calendar_ref"] == calendar_ref and row.get("source") == "calendly"
+                ),
+                None,
+            )
+            if existing_key is not None:
+                row = self._events[existing_key]
+                row["starts_at"] = starts_at
+                row["ends_at"] = ends_at
+                row["timezone"] = timezone
+                row["email"] = email
+                row["name"] = name
+                row["status"] = "booked"
+                if row.get("visitor_id") is None:
+                    row["visitor_id"] = visitor_id
+                return dict(row)
+            new_row = {
+                "tenant_id": tenant_id, "event_id": event_id, "lead_id": lead_id,
+                "visitor_id": visitor_id, "email": email, "name": name,
+                "starts_at": starts_at, "ends_at": ends_at, "timezone": timezone,
+                "status": status, "calendar_ref": calendar_ref, "consent": consent,
+                "created_at": _NOW, "source": source,
+            }
+            self._events[(tenant_id, event_id)] = new_row
+            return dict(new_row)
+
         if "FROM AVAILABILITY" in q:
             tenant_id = args[0]
             return self._availability.get(tenant_id)
 
         if "FROM SCHEDULE_EVENTS" in q:
+            if "VISITOR_ID = $2" in q:
+                tenant_id, visitor_id, now = args
+                rows = [row for row in self._events.values() if row["tenant_id"] == tenant_id and row["visitor_id"] == visitor_id and row["status"] == "booked" and row["starts_at"] > now]
+                return min(rows, key=lambda row: row["starts_at"]) if rows else None
             tenant_id, event_id = args
             return self._events.get((tenant_id, event_id))
 
@@ -541,3 +593,325 @@ async def test_get_event_contact_rejects_global_caller(stub_db: _StubDatabase) -
 
         with pytest.raises(ValidationError):
             await get_event_contact(stub_db, global_claims, "event-1")
+
+
+# ---------------------------------------------------------------------------
+# get_upcoming_booking (SR-5, decision 7 — booking-awareness)
+# ---------------------------------------------------------------------------
+
+
+async def test_get_upcoming_booking_returns_soonest_future_booked_event(stub_db: _StubDatabase) -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import ScheduleEvent, create_event, get_upcoming_booking
+
+        claims = _claims(tenant_id="tenant-abc")
+        consent = {"granted": True, "purpose": "booking", "text": "OK", "captured_at": "x"}
+        later = await create_event(
+            stub_db, claims,
+            starts_at=datetime(2099, 6, 1, 14, 0, tzinfo=UTC), ends_at=datetime(2099, 6, 1, 14, 30, tzinfo=UTC),
+            timezone="UTC", visitor_id="visitor-1", lead_id=None, consent=consent,
+        )
+        sooner = await create_event(
+            stub_db, claims,
+            starts_at=datetime(2099, 3, 1, 14, 0, tzinfo=UTC), ends_at=datetime(2099, 3, 1, 14, 30, tzinfo=UTC),
+            timezone="UTC", visitor_id="visitor-1", lead_id=None, consent=consent,
+        )
+
+        result = await get_upcoming_booking(stub_db, claims, "visitor-1")
+
+        assert isinstance(result, ScheduleEvent)
+        assert result.event_id == sooner.event_id
+        assert result.event_id != later.event_id
+
+
+async def test_get_upcoming_booking_ignores_past_events(stub_db: _StubDatabase) -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import create_event, get_upcoming_booking
+
+        claims = _claims(tenant_id="tenant-abc")
+        await create_event(
+            stub_db, claims,
+            starts_at=datetime(2020, 1, 1, 14, 0, tzinfo=UTC), ends_at=datetime(2020, 1, 1, 14, 30, tzinfo=UTC),
+            timezone="UTC", visitor_id="visitor-1", lead_id=None,
+            consent={"granted": True, "purpose": "booking", "text": "OK", "captured_at": "x"},
+        )
+
+        result = await get_upcoming_booking(stub_db, claims, "visitor-1")
+
+        assert result is None
+
+
+async def test_get_upcoming_booking_ignores_cancelled_events(stub_db: _StubDatabase) -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import create_event, get_upcoming_booking
+
+        claims = _claims(tenant_id="tenant-abc")
+        event = await create_event(
+            stub_db, claims,
+            starts_at=datetime(2099, 6, 1, 14, 0, tzinfo=UTC), ends_at=datetime(2099, 6, 1, 14, 30, tzinfo=UTC),
+            timezone="UTC", visitor_id="visitor-1", lead_id=None,
+            consent={"granted": True, "purpose": "booking", "text": "OK", "captured_at": "x"},
+        )
+        stub_db._events[("tenant-abc", event.event_id)]["status"] = "cancelled"
+
+        result = await get_upcoming_booking(stub_db, claims, "visitor-1")
+
+        assert result is None
+
+
+async def test_get_upcoming_booking_returns_none_when_no_booking(stub_db: _StubDatabase) -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import get_upcoming_booking
+
+        claims = _claims(tenant_id="tenant-abc")
+        result = await get_upcoming_booking(stub_db, claims, "visitor-1")
+
+        assert result is None
+
+
+async def test_get_upcoming_booking_tenant_isolation(stub_db: _StubDatabase) -> None:
+    """A booking under a different tenant (same visitor_id string) is never returned."""
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import create_event, get_upcoming_booking
+
+        claims_a = _claims(tenant_id="tenant-a")
+        claims_b = _claims(tenant_id="tenant-b")
+        await create_event(
+            stub_db, claims_a,
+            starts_at=datetime(2099, 6, 1, 14, 0, tzinfo=UTC), ends_at=datetime(2099, 6, 1, 14, 30, tzinfo=UTC),
+            timezone="UTC", visitor_id="visitor-1", lead_id=None,
+            consent={"granted": True, "purpose": "booking", "text": "OK", "captured_at": "x"},
+        )
+
+        result = await get_upcoming_booking(stub_db, claims_b, "visitor-1")
+
+        assert result is None
+
+
+async def test_get_upcoming_booking_visitor_isolation(stub_db: _StubDatabase) -> None:
+    """A booking under the same tenant but a different visitor_id is never returned."""
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import create_event, get_upcoming_booking
+
+        claims = _claims(tenant_id="tenant-abc")
+        await create_event(
+            stub_db, claims,
+            starts_at=datetime(2099, 6, 1, 14, 0, tzinfo=UTC), ends_at=datetime(2099, 6, 1, 14, 30, tzinfo=UTC),
+            timezone="UTC", visitor_id="visitor-1", lead_id=None,
+            consent={"granted": True, "purpose": "booking", "text": "OK", "captured_at": "x"},
+        )
+
+        result = await get_upcoming_booking(stub_db, claims, "visitor-2")
+
+        assert result is None
+
+
+async def test_get_upcoming_booking_uses_positional_placeholders_with_tenant_and_visitor(
+    stub_db: _StubDatabase,
+) -> None:
+    """MANDATORY: the query must filter tenant_id AND visitor_id together, never visitor_id alone."""
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import get_upcoming_booking
+
+        claims = _claims(tenant_id="tenant-abc")
+        await get_upcoming_booking(stub_db, claims, "visitor-1")
+
+        query, args = stub_db.fetchrow_calls[-1]
+        assert "tenant_id = $1" in query.lower()
+        assert "visitor_id = $2" in query.lower()
+        assert "status = 'booked'" in query.lower()
+        assert "starts_at > $3" in query.lower()
+        assert ":" not in query
+        assert args[0] == "tenant-abc"
+        assert args[1] == "visitor-1"
+
+
+async def test_get_upcoming_booking_rejects_global_caller(stub_db: _StubDatabase) -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import get_upcoming_booking
+
+        global_claims = AuthClaims(subject="admin-1", role=Role.PLATFORM_ADMIN, tenant_id=None)
+
+        with pytest.raises(ValidationError):
+            await get_upcoming_booking(stub_db, global_claims, "visitor-1")
+
+        assert stub_db.fetchrow_calls == []
+
+
+# ---------------------------------------------------------------------------
+# SR-6: create_event source='native', ingest_calendly_event, cancel_calendly_event
+# ---------------------------------------------------------------------------
+
+
+async def test_create_event_sets_source_native(stub_db: _StubDatabase) -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import create_event
+
+        claims = _claims(tenant_id="tenant-abc")
+        event = await create_event(
+            stub_db, claims,
+            starts_at=datetime(2026, 1, 5, 14, 0, tzinfo=UTC),
+            ends_at=datetime(2026, 1, 5, 14, 30, tzinfo=UTC),
+            timezone="UTC", visitor_id="visitor-1", lead_id=None,
+            consent={"granted": True, "purpose": "booking", "text": "OK", "captured_at": "x"},
+        )
+
+        assert event.source == "native"
+        assert stub_db._events[("tenant-abc", event.event_id)]["source"] == "native"
+
+
+async def test_ingest_calendly_event_sets_source_calendly(stub_db: _StubDatabase) -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import ingest_calendly_event
+
+        event = await ingest_calendly_event(
+            stub_db, "tenant-abc",
+            calendly_uuid="uuid-1",
+            starts_at=datetime(2026, 1, 5, 14, 0, tzinfo=UTC),
+            ends_at=datetime(2026, 1, 5, 14, 30, tzinfo=UTC),
+            timezone="UTC", email="a@example.com", name="A", visitor_id="visitor-1",
+        )
+
+        assert event.source == "calendly"
+        assert event.status == "booked"
+        assert event.calendar_ref == "calendly:uuid-1"
+        assert event.visitor_id == "visitor-1"
+        assert event.lead_id is None  # Calendly bookings never create a CRM lead
+
+
+async def test_ingest_calendly_event_reingest_same_uuid_updates_in_place(stub_db: _StubDatabase) -> None:
+    """Idempotent re-delivery: same Calendly UUID -> exactly ONE row, updated in place."""
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import ingest_calendly_event
+
+        first = await ingest_calendly_event(
+            stub_db, "tenant-abc",
+            calendly_uuid="uuid-1",
+            starts_at=datetime(2026, 1, 5, 14, 0, tzinfo=UTC),
+            ends_at=datetime(2026, 1, 5, 14, 30, tzinfo=UTC),
+            timezone="UTC", email="a@example.com", name="A", visitor_id="visitor-1",
+        )
+        second = await ingest_calendly_event(
+            stub_db, "tenant-abc",
+            calendly_uuid="uuid-1",
+            starts_at=datetime(2026, 1, 5, 14, 0, tzinfo=UTC),
+            ends_at=datetime(2026, 1, 5, 14, 30, tzinfo=UTC),
+            timezone="UTC", email="a@example.com", name="A", visitor_id=None,
+        )
+
+        assert first.event_id == second.event_id
+        rows = [
+            row for row in stub_db._events.values()
+            if row["tenant_id"] == "tenant-abc" and row["calendar_ref"] == "calendly:uuid-1"
+        ]
+        assert len(rows) == 1
+        # visitor_id preserved from the first ingest, never overwritten by a
+        # later None (COALESCE semantics in the real SQL).
+        assert second.visitor_id == "visitor-1"
+
+
+async def test_ingest_calendly_event_no_correlation_visitor_id_null(stub_db: _StubDatabase) -> None:
+    """Honest no-match (decision 5b): booking still ingested, visitor_id=NULL."""
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import ingest_calendly_event
+
+        event = await ingest_calendly_event(
+            stub_db, "tenant-abc",
+            calendly_uuid="uuid-no-match",
+            starts_at=datetime(2026, 1, 5, 14, 0, tzinfo=UTC),
+            ends_at=datetime(2026, 1, 5, 14, 30, tzinfo=UTC),
+            timezone="UTC", email="nobody@example.com", name=None, visitor_id=None,
+        )
+
+        assert event.visitor_id is None
+        assert event.status == "booked"  # never dropped
+
+
+async def test_cancel_calendly_event_flips_status(stub_db: _StubDatabase) -> None:
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import cancel_calendly_event, ingest_calendly_event
+
+        await ingest_calendly_event(
+            stub_db, "tenant-abc",
+            calendly_uuid="uuid-1",
+            starts_at=datetime(2026, 1, 5, 14, 0, tzinfo=UTC),
+            ends_at=datetime(2026, 1, 5, 14, 30, tzinfo=UTC),
+            timezone="UTC", email="a@example.com", name="A", visitor_id="visitor-1",
+        )
+
+        await cancel_calendly_event(stub_db, "tenant-abc", "uuid-1")
+
+        row = next(iter(stub_db._events.values()))
+        assert row["status"] == "cancelled"
+
+
+async def test_cancel_calendly_event_unknown_uuid_is_noop_success(stub_db: _StubDatabase) -> None:
+    """A cancel for an unknown UUID is a no-op success -- never an error, never a fabricated row."""
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import cancel_calendly_event
+
+        await cancel_calendly_event(stub_db, "tenant-abc", "uuid-does-not-exist")
+
+        assert stub_db._events == {}
+
+
+async def test_get_upcoming_booking_returns_calendly_booking_with_visitor_id(
+    stub_db: _StubDatabase,
+) -> None:
+    """A Calendly-sourced booking with a backfilled visitor_id is recognized
+    by get_upcoming_booking for free -- the method itself is unchanged."""
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import get_upcoming_booking, ingest_calendly_event
+
+        await ingest_calendly_event(
+            stub_db, "tenant-abc",
+            calendly_uuid="uuid-1",
+            starts_at=datetime(2099, 6, 1, 14, 0, tzinfo=UTC),
+            ends_at=datetime(2099, 6, 1, 14, 30, tzinfo=UTC),
+            timezone="UTC", email="a@example.com", name="A", visitor_id="visitor-1",
+        )
+
+        claims = _claims(tenant_id="tenant-abc")
+        result = await get_upcoming_booking(stub_db, claims, "visitor-1")
+
+        assert result is not None
+        assert result.calendar_ref == "calendly:uuid-1"
+
+
+async def test_get_upcoming_booking_calendly_row_visitor_id_null_not_returned(
+    stub_db: _StubDatabase,
+) -> None:
+    """A Calendly row with visitor_id=NULL (no correlation match) is NOT
+    returned by get_upcoming_booking for any visitor -- tenant+visitor
+    isolation reasserted (MANDATORY)."""
+    with patch.dict("os.environ", _TEST_ENV, clear=False):
+        _reset_settings()
+        from api.scheduling.repository import get_upcoming_booking, ingest_calendly_event
+
+        await ingest_calendly_event(
+            stub_db, "tenant-abc",
+            calendly_uuid="uuid-1",
+            starts_at=datetime(2099, 6, 1, 14, 0, tzinfo=UTC),
+            ends_at=datetime(2099, 6, 1, 14, 30, tzinfo=UTC),
+            timezone="UTC", email="a@example.com", name="A", visitor_id=None,
+        )
+
+        claims = _claims(tenant_id="tenant-abc")
+        result = await get_upcoming_booking(stub_db, claims, "visitor-1")
+
+        assert result is None

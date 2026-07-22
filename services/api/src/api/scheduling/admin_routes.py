@@ -120,6 +120,9 @@ class CalendarConfigRequest(BaseModel):
     credentials: str
     enabled: bool = False
     busy: list[BusyIntervalPayload] = Field(default_factory=list)
+    # SR-6: the tenant's Calendly hosted-scheduling page (link-out target).
+    # Only meaningful for provider="calendly"; not a secret.
+    scheduling_url: str | None = None
 
 
 class CalendarConfigResponse(BaseModel):
@@ -128,6 +131,8 @@ class CalendarConfigResponse(BaseModel):
     provider: str
     calendar_id: str | None
     enabled: bool
+    # scheduling_url is NOT a secret (SR-6) -- safe to echo, unlike credentials.
+    scheduling_url: str | None = None
 
 
 @router.put("/calendar")
@@ -150,6 +155,7 @@ async def put_calendar_config(
         credentials=body.credentials,
         busy=[interval.model_dump() for interval in body.busy],
         enabled=body.enabled,
+        scheduling_url=body.scheduling_url,
     )
 
     _log.info(
@@ -166,4 +172,5 @@ async def put_calendar_config(
         provider=body.provider,
         calendar_id=body.calendar_id,
         enabled=body.enabled,
+        scheduling_url=body.scheduling_url,
     )

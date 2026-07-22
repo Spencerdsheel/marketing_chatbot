@@ -202,6 +202,19 @@ class ApiSettings(Settings):
     analytics_default_window_days: int = 30
     analytics_max_window_days: int = 366
 
+    # Calendly hosted handoff (SR-6).
+    # calendly_webhook_tolerance_seconds: replay-protection window (decision
+    #   4c) -- abs(now - t) must be within this many seconds of the webhook
+    #   signature's timestamp, or the request is rejected (401
+    #   CALENDLY_SIGNATURE_INVALID). Security-driven; stays tight.
+    # calendly_handoff_intent_ttl_seconds: how long a pre-handoff email
+    #   correlation record (calendly_handoff_intents) stays eligible for the
+    #   webhook's find_handoff_visitor lookup (decision 5c). A visitor may
+    #   take longer than the default hour on Calendly's own page -- override
+    #   per-deploy if so.
+    calendly_webhook_tolerance_seconds: int = 300
+    calendly_handoff_intent_ttl_seconds: int = 3600
+
 
 @lru_cache(maxsize=1)
 def get_api_settings() -> ApiSettings:

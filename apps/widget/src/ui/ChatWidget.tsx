@@ -48,6 +48,7 @@ import { sendTurn, type TurnResult } from "../turn";
 import { clearResumeRecord, touchResumeRecord } from "../resume";
 import { isResumeEnabled, mintVisitorSession } from "../session";
 import { withRetry } from "../retry";
+import { fetchAvailabilitySummary } from "../schedule";
 import * as tts from "../tts";
 import type { ChatMessage } from "./Bubble";
 import { MessageList } from "./MessageList";
@@ -120,6 +121,8 @@ export function ChatWidget({ config, expiresAt, resumeConversationId = null }: C
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputValue, setInputValue] = useState("");
   const [pending, setPending] = useState(false);
+  const [schedulePending, setSchedulePending] = useState(false);
+  const [scheduleError, setScheduleError] = useState(false);
   // In-memory only (S14.2 decision 4) — never persisted here (SR-3's
   // sessionStorage mirror, when opted in, lives in resume.ts, not this
   // ref). Seeded from resumeConversationId when a resume is in play (SR-3
@@ -418,6 +421,65 @@ export function ChatWidget({ config, expiresAt, resumeConversationId = null }: C
     await sendMessage(message);
   }, [sendMessage]);
 
+  /**
+   * The persistent "Connect with a sales rep" CTA (SR-5 decisions 4/5): a
+   * pure client gesture, no `/public/chat/message` turn (no classify/
+   * generate/cost). Appends a user bubble, then calls the new
+   * server-authoritative availability-summary endpoint, then appends ONE
+   * bot bubble carrying the fixed transition copy + the schedule action
+   * (`schedule_cta` -> the staged in-thread picker via `<ScheduleCta>`;
+   * `lead_form` -> the existing consent-gated lead form) -- both render
+   * through `Bubble.tsx`'s existing action-dispatch, exactly like an
+   * orchestrator-driven escalate, so the flow stays part of the scrollable
+   * thread rather than a separate panel element (spec decision 5 / DoD).
+   */
+  const startScheduling = useCallback(async () => {
+    if (pending || schedulePending) return;
+    setScheduleError(false);
+    setSchedulePending(true);
+    setMessages((prev) => [...prev, { id: nextLocalId(), role: "user", text: "Connect with a sales rep" }]);
+
+    let result = await fetchAvailabilitySummary(config);
+    if (unmountedRef.current) return;
+
+    // Bounded expired-session reconnect (mirrors runSend's decision 5): a
+    // 401/403 on the CTA click gets the SAME one-shot re-mint-and-retry as
+    // an ordinary turn, instead of surfacing an honest failure for a merely
+    // stale token. Never an unbounded loop -- attemptSessionReconnect itself
+    // caps at REMINT_MAX_ATTEMPTS.
+    if (!result.ok && (result.error.status === 401 || result.error.status === 403)) {
+      const reconnected = await attemptSessionReconnect();
+      if (unmountedRef.current) return;
+      if (reconnected) {
+        setConnectionState({ kind: "online" });
+        result = await fetchAvailabilitySummary(config);
+        if (unmountedRef.current) return;
+      } else {
+        setConnectionState({ kind: "session-expired" });
+      }
+    }
+
+    setSchedulePending(false);
+    if (!result.ok) {
+      const { errorCode, correlationId, status } = result.error;
+      console.error(
+        `${LOG_PREFIX} fetchAvailabilitySummary failed: ${errorCode} (status=${status ?? "n/a"}, correlation_id=${correlationId ?? "n/a"})`,
+      );
+      setScheduleError(true);
+      return;
+    }
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: nextLocalId(),
+        role: "bot",
+        text: result.summary.transitionMessage,
+        action: result.summary.action,
+        scheduleSummary: result.summary,
+      },
+    ]);
+  }, [config, pending, schedulePending, attemptSessionReconnect]);
+
   /** Manual Retry (decision 4/6): replay the last failed send without a new optimistic bubble. */
   const handleManualRetry = useCallback(async () => {
     const last = lastFailedSendRef.current;
@@ -473,6 +535,19 @@ export function ChatWidget({ config, expiresAt, resumeConversationId = null }: C
           </div>
           <ConnectionStatus state={connectionState} onRetry={() => void handleManualRetry()} />
           <MessageList messages={messages} pending={pending} config={config} onSuggestion={(message) => void handleSuggestion(message)} />
+          {scheduleError && (
+            <div className="cw-sched-error" role="alert">
+              We couldn&rsquo;t check appointment availability. <button type="button" className="cw-sched-retry" onClick={() => void startScheduling()}>Retry</button>
+            </div>
+          )}
+          <button
+            type="button"
+            className="cw-connect-sales-button"
+            disabled={pending || schedulePending}
+            onClick={() => void startScheduling()}
+          >
+            {schedulePending ? "Connecting…" : "Connect with a sales rep"}
+          </button>
           <div className="cw-input-row">
             <input
               ref={inputRef}

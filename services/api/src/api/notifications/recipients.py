@@ -1,6 +1,6 @@
 """Recipient resolution for scheduled events (S9.2, Scope §2 / Decision 3).
 
-``schedule_events`` carries ``lead_id?``/``visitor_id?`` but no email;
+``schedule_events`` may carry an invite email alongside ``lead_id?``/``visitor_id?``.
 ``leads`` carries the visitor's ``email``. ``resolve_event_recipient`` reads
 the event's contact fields via ``scheduling.repository.get_event_contact``
 and resolves an email via the ``leads`` repository -- never reaching into
@@ -31,11 +31,12 @@ async def resolve_event_recipient(db: Database, claims: AuthClaims, event_id: st
 
     Resolution order (Decision 3):
     1. event missing -> ``None``.
-    2. ``lead_id`` set -> ``leads.get_lead(...).email`` (``None`` if the lead
+    2. event invite email set -> that address.
+    3. ``lead_id`` set -> ``leads.get_lead(...).email`` (``None`` if the lead
        is missing).
-    3. else ``visitor_id`` set -> ``leads.get_lead_email_by_visitor_id(...)``
+    4. else ``visitor_id`` set -> ``leads.get_lead_email_by_visitor_id(...)``
        (most-recent lead for that visitor).
-    4. else -> ``None``.
+    5. else -> ``None``.
 
     Tenant-scoped throughout -- every underlying read rejects a global caller
     (``_reject_global``), so this raises ``ValidationError`` for
@@ -44,6 +45,9 @@ async def resolve_event_recipient(db: Database, claims: AuthClaims, event_id: st
     contact = await get_event_contact(db, claims, event_id)
     if contact is None:
         return None
+
+    if contact.email is not None:
+        return contact.email
 
     if contact.lead_id is not None:
         lead = await get_lead(db, claims, contact.lead_id)
